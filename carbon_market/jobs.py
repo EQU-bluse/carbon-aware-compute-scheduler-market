@@ -9,6 +9,8 @@ import tempfile
 import threading
 from typing import Any
 
+from ._jsonio import strict_loads
+
 __all__ = ["register"]
 
 _VERSION = 1
@@ -148,8 +150,8 @@ def _load(realpath: str) -> tuple[dict[str, dict[str, Any]], dict[str, str]]:
         return {}, {}
 
     try:
-        data = json.loads(text)
-    except (json.JSONDecodeError, UnicodeDecodeError) as exc:
+        data = strict_loads(text)
+    except ValueError as exc:
         raise ValueError(f"registry file {realpath!r} is not valid JSON") from exc
     return _validate_structure(data)
 
