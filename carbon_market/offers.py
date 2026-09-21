@@ -110,7 +110,9 @@ def _validate_structure(
         if (not _is_plain_int(record["carbon_intensity"])
                 or record["carbon_intensity"] < 0):
             raise ValueError("invalid carbon_intensity")
-        offers[name] = dict(record)
+        # Rebuild in canonical field order so that replays and rewrites of
+        # records stored out of order still follow _OFFER_FIELDS.
+        offers[name] = {field: record[field] for field in _OFFER_FIELDS}
 
     idempotency: dict[str, dict[str, str]] = {}
     referenced: set[str] = set()
