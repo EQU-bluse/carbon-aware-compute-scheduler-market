@@ -339,6 +339,32 @@ class RegisterTest(unittest.TestCase):
         raw = json.loads(Path(self.path).read_text(encoding="utf-8"))
         self.assertEqual(list(raw.keys()), ["version", "offers", "idempotency"])
 
+    def test_shuffled_old_record_is_replayed_and_rewritten_in_field_order(self) -> None:
+        seed = {
+            "version": 1,
+            "offers": {
+                "a": {"carbon_intensity": 0, "unit_cost": 0,
+                      "capacity_wh": 1, "region": "r1", "resource_id": "a"},
+            },
+            "idempotency": {"k-a": {"resource_id": "a"}},
+        }
+        Path(self.path).write_text(json.dumps(seed), encoding="utf-8")
+        replay, created = register(
+            self.path,
+            {"resource_id": "a", "region": "r1", "capacity_wh": 1,
+             "unit_cost": 0, "carbon_intensity": 0}, "k-a")
+        self.assertFalse(created)
+        self.assertEqual(list(replay.keys()),
+                         ["resource_id", "region", "capacity_wh",
+                          "unit_cost", "carbon_intensity"])
+        # A new registration rewrites the whole file canonically, including
+        # the previously shuffled record.
+        register(self.path, _offer(resource_id="b"), "k-b")
+        raw = json.loads(Path(self.path).read_text(encoding="utf-8"))
+        self.assertEqual(list(raw["offers"]["a"].keys()),
+                         ["resource_id", "region", "capacity_wh",
+                          "unit_cost", "carbon_intensity"])
+
     def test_returned_record_is_a_copy(self) -> None:
         record, _ = register(self.path, _offer(), "k")
         record["unit_cost"] = 999
