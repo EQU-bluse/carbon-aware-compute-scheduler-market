@@ -32,8 +32,13 @@ order-preserving deep copy of the object at that moment. The history
 write always precedes the coordination write, so a failed snapshot
 leaves the previous coordination state untouched and unadvanced; a
 re-entry recomputes whatever a crashed attempt had not yet recorded and
-skips the duplicate when it recomputes an already-recorded state. The
-history file shares the coordination file's version, encoding and
+skips the duplicate when it recomputes an already-recorded state. A
+terminal coordination object whose history is missing -- or never
+recorded its terminal state, whether because it was removed, restored
+from an older copy, or an interrupted write never landed -- gets that
+one terminal snapshot appended on the next replay, again without
+touching the coordination file. The history file
+shares the coordination file's version, encoding and
 atomic-synchronization behaviour.
 """
 
@@ -273,8 +278,10 @@ def _append_snapshot(realpath: str, coord_obj: dict[str, Any]) -> None:
     # persisted. The history is always written before the coordination
     # file itself, so a failure here leaves the previous coordination
     # state untouched and the caller must not advance it. A re-entry that
-    # recomputes the exact state a crashed attempt already recorded finds
-    # it as the last snapshot and skips the duplicate.
+    # recomputes a state a crashed attempt already recorded finds that
+    # state among the snapshots and skips the duplicate; membership (not
+    # just the last entry) also lets a terminal replay backfill the final
+    # state into a history that lost it without ever duplicating one.
     history = _load_history(realpath + ".history")
     snapshot = [_status_of(coord_obj["items"]), copy.deepcopy(coord_obj)]
     if history is None:
@@ -283,7 +290,7 @@ def _append_snapshot(realpath: str, coord_obj: dict[str, Any]) -> None:
     elif history["key"] != coord_obj["key"]:
         raise ValueError("coordination key was already used with a "
                          "different recovery batch")
-    if history["snapshots"] and history["snapshots"][-1] == snapshot:
+    if snapshot in history["snapshots"]:
         return
     history["snapshots"].append(snapshot)
     _atomic_write(realpath + ".history", history)
@@ -315,7 +322,10 @@ def run(
     the lease is refreshed to ``now + ttl``. Creation, each takeover and
     each item settlement first append one ``[status, coord]`` snapshot
     to the history file ``coord + ".history"``; a failed snapshot
-    leaves the previous coordination state unadvanced.
+    leaves the previous coordination state unadvanced. A terminal
+    coordination object whose history is missing or lacks the terminal
+    snapshot gets that one snapshot appended on replay, without
+    modifying the coordination file.
     """
     for value in (jobs, offers, matches, reserves, state, coord, owner, key):
         if not isinstance(value, str) or not value:
@@ -369,6 +379,15 @@ def run(
                                      "a different recovery batch")
                 if not any(pair[0] is None and pair[1] is None
                            for pair in coord_obj["items"].values()):
+                    # The batch has terminated: replay the object without
+                    # renewing its lease. The history can still be
+                    # missing the terminal state -- it was removed or
+                    # restored from an older copy, or an interrupted
+                    # attempt's history write never landed -- so append
+                    # that one snapshot now. An already-recorded
+                    # terminal state is skipped inside _append_snapshot,
+                    # so replays and re-entries never duplicate it.
+                    _append_snapshot(store.realpath, coord_obj)
                     return coord_obj, False
                 if coord_obj["owner"] != owner and now <= coord_obj["until"]:
                     raise PermissionError(
