@@ -20,10 +20,16 @@ point, each recorded status is the one derived from its coord's items
 recorded, completed otherwise), no ``[status, coord]`` snapshot is
 repeated in full, and no snapshot follows a terminal one.
 
-The queries never write. Because the history file is only ever replaced
-atomically, a read racing a write observes either the complete snapshot
-list from before the write or the one from after it -- never a partial
-file.
+The queries never write. Each one takes a shared hold on the history
+file's companion lock (``path + ".lock"``) before opening the file and
+releases it only after the file has been fully read and closed, while
+:func:`carbon_market.recover_all.run` validates, appends, atomically
+replaces and directory-syncs the history under the same lock held
+exclusively. A read racing a write therefore observes either the
+complete snapshot list from before the write or the one from after it
+-- never a truncated, mixed or half-replaced file. The kernel releases
+the flock automatically when a process exits, so a leftover lock file
+never blocks a later query.
 """
 
 from __future__ import annotations
@@ -87,8 +93,18 @@ def _load(path: str, key: str) -> dict[str, object]:
     _validate_path_key(path, key)
 
     realpath = os.path.realpath(path)
-    with open(realpath, encoding="utf-8") as handle:
-        text = handle.read()
+    # Hold the history's companion lock shared from before the file is
+    # opened until it has been fully read and closed, so a concurrent
+    # recover_all.run (which holds the same lock exclusively around the
+    # validate/append/replace/sync sequence) can never expose a truncated
+    # or half-replaced history. Parsing and validation happen only after
+    # the lock is released: the bytes in memory are already one complete
+    # pre- or post-update snapshot. Lock, open and read failures surface
+    # unchanged -- OSError, including FileNotFoundError for a missing
+    # history.
+    with _recover_all._history_file_lock(realpath, shared=True):
+        with open(realpath, encoding="utf-8") as handle:
+            text = handle.read()
     try:
         data = strict_loads(text)
     except ValueError as exc:
