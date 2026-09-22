@@ -189,12 +189,11 @@ def _atomic_write(realpath: str, events: dict[str, dict[str, Any]]) -> None:
             os.unlink(tmp_path)
         raise
 
-    with contextlib.suppress(OSError):
-        dir_fd = os.open(directory, os.O_RDONLY)
-        try:
-            os.fsync(dir_fd)
-        finally:
-            os.close(dir_fd)
+    dir_fd = os.open(directory, os.O_RDONLY)
+    try:
+        os.fsync(dir_fd)
+    finally:
+        os.close(dir_fd)
 
 
 def run(
