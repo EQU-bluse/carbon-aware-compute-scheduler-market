@@ -1,11 +1,14 @@
 from __future__ import annotations
 
+import errno
 import json
 import os
+import stat
 import time
 import unittest
 from multiprocessing import Process, Queue
 from tempfile import TemporaryDirectory
+from unittest import mock
 
 from carbon_market import history, history_copy
 from carbon_market.jobs import register as register_job
@@ -299,6 +302,347 @@ class HistoryCopyTest(unittest.TestCase):
         history_copy.run(source, target, "batch-key", overwrite=True)
         self.assertGreaterEqual(time.monotonic() - start, 1.2)
         self.assertEqual(open(target, "rb").read(), open(source, "rb").read())
+
+
+def _io_error(message: str) -> OSError:
+    return OSError(errno.EIO, message)
+
+
+def _fsync_wrapper(fail_on):
+    """Patch ``os.fsync`` classifying each call as file or directory fsync.
+
+    ``fail_on(kind, ordinal)`` returns an ``OSError`` to raise, or ``None``.
+    File fsyncs and directory fsyncs are counted independently, in call
+    order, so callers can target e.g. the 2nd directory fsync (the
+    post-replace commit sync) without tracking fragile fd numbers.
+    """
+    real_fsync = os.fsync
+    counts = {"file": 0, "dir": 0}
+
+    def fsync(fd):
+        mode = os.fstat(fd).st_mode
+        kind = "dir" if stat.S_ISDIR(mode) else "file"
+        counts[kind] += 1
+        failure = fail_on(kind, counts[kind])
+        if failure is not None:
+            raise failure
+        return real_fsync(fd)
+
+    return fsync
+
+
+def _open_wrapper(directory, fail_on_open_ordinal, failure):
+    """Patch ``os.open``; raise ``failure`` on the nth open of the dir itself."""
+    real_open = os.open
+    state = {"dir_opens": 0}
+
+    def open_(path, flags, *args, **kwargs):
+        if path == directory:
+            state["dir_opens"] += 1
+            if state["dir_opens"] == fail_on_open_ordinal:
+                raise failure
+        return real_open(path, flags, *args, **kwargs)
+
+    return open_
+
+
+class HistoryCopyCrashSafetyTest(unittest.TestCase):
+    """Fault-injection coverage for the overwrite rollback protocol."""
+
+    def setUp(self) -> None:
+        self.tmp = TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.directory = self.tmp.name
+
+    def _write(self, doc: dict[str, object], name: str) -> str:
+        path = os.path.join(self.directory, name)
+        with open(path, "w", encoding="utf-8") as handle:
+            handle.write(json.dumps(doc) + "\n")
+        return path
+
+    def _old_target(self, name: str = "target.history") -> tuple[str, bytes]:
+        """A pre-existing, self-consistent one-snapshot target history."""
+        doc = _history_doc(snapshots=[
+            ["pending", _coord(items={"j-1": [None, None]})],
+        ])
+        path = os.path.join(self.directory, name)
+        raw = (json.dumps(doc) + "\n").encode("utf-8")
+        with open(path, "wb") as handle:
+            handle.write(raw)
+        return path, raw
+
+    def _attempt_files(self) -> list[str]:
+        return sorted(
+            name for name in os.listdir(self.directory)
+            if name.startswith(".history-copy")
+        )
+
+    def _assert_reads_complete_old_version(
+        self, target: str, old_raw: bytes
+    ) -> None:
+        # Raw bytes and the locked read path must both show the complete
+        # previous version only.
+        self.assertEqual(open(target, "rb").read(), old_raw)
+        summary = history.verify(target, "batch-key")
+        self.assertEqual(summary, {"key": "batch-key", "count": 1,
+                                   "statuses": ["pending"], "terminal": False})
+        paged = history.get(target, "batch-key")
+        self.assertEqual(len(paged["snapshots"]), 1)
+        self.assertEqual(paged["snapshots"][0][1], "pending")
+
+    # -- failures before the replace leave the old target in place ------
+
+    def test_backup_file_fsync_failure_leaves_old_target_clean(self) -> None:
+        source = self._write(_history_doc(), "source.history")
+        target, old_raw = self._old_target()
+        failure = _io_error("backup fsync failed")
+        wrapper = _fsync_wrapper(
+            lambda kind, n: failure if (kind, n) == ("file", 1) else None)
+        with mock.patch("carbon_market.history_copy.os.fsync",
+                        side_effect=wrapper):
+            with self.assertRaises(OSError) as ctx:
+                history_copy.run(source, target, "batch-key", overwrite=True)
+        self.assertIs(ctx.exception, failure)
+        self.assertIsNone(ctx.exception.__cause__)
+        self._assert_reads_complete_old_version(target, old_raw)
+        self.assertEqual(self._attempt_files(), [])
+
+    def test_backup_directory_fsync_failure_leaves_old_target_clean(self) -> None:
+        source = self._write(_history_doc(), "source.history")
+        target, old_raw = self._old_target()
+        failure = _io_error("backup directory fsync failed")
+        wrapper = _fsync_wrapper(
+            lambda kind, n: failure if (kind, n) == ("dir", 1) else None)
+        with mock.patch("carbon_market.history_copy.os.fsync",
+                        side_effect=wrapper):
+            with self.assertRaises(OSError) as ctx:
+                history_copy.run(source, target, "batch-key", overwrite=True)
+        self.assertIs(ctx.exception, failure)
+        self._assert_reads_complete_old_version(target, old_raw)
+        self.assertEqual(self._attempt_files(), [])
+
+    def test_new_temp_fsync_failure_leaves_old_target_clean(self) -> None:
+        source = self._write(_history_doc(), "source.history")
+        target, old_raw = self._old_target()
+        failure = _io_error("new temp fsync failed")
+        wrapper = _fsync_wrapper(
+            lambda kind, n: failure if (kind, n) == ("file", 2) else None)
+        with mock.patch("carbon_market.history_copy.os.fsync",
+                        side_effect=wrapper):
+            with self.assertRaises(OSError) as ctx:
+                history_copy.run(source, target, "batch-key", overwrite=True)
+        self.assertIs(ctx.exception, failure)
+        self._assert_reads_complete_old_version(target, old_raw)
+        self.assertEqual(self._attempt_files(), [])
+
+    def test_replace_failure_leaves_old_target_clean(self) -> None:
+        source = self._write(_history_doc(), "source.history")
+        target, old_raw = self._old_target()
+        failure = _io_error("replace failed")
+        real_replace = os.replace
+
+        def replace(src, dst):
+            # Fail the commit replace only; a rollback restore replace
+            # (".history-copy-restore-") must still be allowed.
+            base = os.path.basename(src)
+            if (base.startswith(".history-copy-")
+                    and not base.startswith(".history-copy-restore-")):
+                raise failure
+            return real_replace(src, dst)
+
+        with mock.patch("carbon_market.history_copy.os.replace",
+                        side_effect=replace):
+            with self.assertRaises(OSError) as ctx:
+                history_copy.run(source, target, "batch-key", overwrite=True)
+        self.assertIs(ctx.exception, failure)
+        self._assert_reads_complete_old_version(target, old_raw)
+        self.assertEqual(self._attempt_files(), [])
+
+    # -- failures after the replace restore the old bytes ---------------
+
+    def test_commit_directory_open_failure_restores_old_bytes(self) -> None:
+        source = self._write(_history_doc(), "source.history")
+        target, old_raw = self._old_target()
+        new_raw = open(source, "rb").read()
+        failure = _io_error("commit directory open failed")
+        wrapper = _open_wrapper(self.directory, 2, failure)
+        with mock.patch("carbon_market.history_copy.os.open",
+                        side_effect=wrapper):
+            with self.assertRaises(OSError) as ctx:
+                history_copy.run(source, target, "batch-key", overwrite=True)
+        self.assertIs(ctx.exception, failure)
+        self.assertIsNone(ctx.exception.__cause__)
+        self.assertNotEqual(new_raw, old_raw)
+        self._assert_reads_complete_old_version(target, old_raw)
+        self.assertEqual(self._attempt_files(), [])
+
+    def test_commit_directory_fsync_failure_restores_old_bytes(self) -> None:
+        source = self._write(_history_doc(), "source.history")
+        target, old_raw = self._old_target()
+        failure = _io_error("commit directory fsync failed")
+        wrapper = _fsync_wrapper(
+            lambda kind, n: failure if (kind, n) == ("dir", 2) else None)
+        with mock.patch("carbon_market.history_copy.os.fsync",
+                        side_effect=wrapper):
+            with self.assertRaises(OSError) as ctx:
+                history_copy.run(source, target, "batch-key", overwrite=True)
+        self.assertIs(ctx.exception, failure)
+        self.assertIsNone(ctx.exception.__cause__)
+        self._assert_reads_complete_old_version(target, old_raw)
+        self.assertEqual(self._attempt_files(), [])
+        # The target lock was released after rollback: a later overwrite
+        # on the same target succeeds.
+        history_copy.run(source, target, "batch-key", overwrite=True)
+        self.assertEqual(open(target, "rb").read(), open(source, "rb").read())
+
+    def test_backup_unlink_failure_restores_target_and_keeps_backup(self) -> None:
+        source = self._write(_history_doc(), "source.history")
+        target, old_raw = self._old_target()
+        first = _io_error("backup unlink failed #1")
+        second = _io_error("backup unlink failed #2")
+        failures = [first, second]
+        real_unlink = os.unlink
+
+        def unlink(path):
+            if os.path.basename(path).startswith(".history-copy-backup-"):
+                raise failures.pop(0)
+            return real_unlink(path)
+
+        with mock.patch("carbon_market.history_copy.os.unlink",
+                        side_effect=unlink):
+            with self.assertRaises(OSError) as ctx:
+                history_copy.run(source, target, "batch-key", overwrite=True)
+        # The original error is the first unlink failure; rollback
+        # restored the old bytes and then failed re-deleting the backup,
+        # so the second OSError is raised chained from the first.
+        self.assertIs(ctx.exception, second)
+        self.assertIs(ctx.exception.__cause__, first)
+        self.assertEqual(ctx.exception.errno, errno.EIO)
+        self._assert_reads_complete_old_version(target, old_raw)
+        leftovers = self._attempt_files()
+        backups = [n for n in leftovers
+                   if n.startswith(".history-copy-backup-")]
+        self.assertEqual(len(backups), 1)
+        self.assertEqual(len(leftovers), 1)
+        backup_path = os.path.join(self.directory, backups[0])
+        self.assertEqual(open(backup_path, "rb").read(), old_raw)
+        # The retained backup is a directly recoverable old-bytes copy.
+        recovered = target + ".recovered"
+        os.replace(backup_path, recovered)
+        self.assertEqual(open(recovered, "rb").read(), old_raw)
+
+    # -- rollback failures chain from the first error -------------------
+
+    def test_restore_replace_failure_chains_and_keeps_backup(self) -> None:
+        source = self._write(_history_doc(), "source.history")
+        target, old_raw = self._old_target()
+        first = _io_error("commit directory fsync failed")
+        rollback_failure = _io_error("restore replace failed")
+        fsync_wrapper = _fsync_wrapper(
+            lambda kind, n: first if (kind, n) == ("dir", 2) else None)
+        real_replace = os.replace
+
+        def replace(src, dst):
+            if os.path.basename(src).startswith(".history-copy-restore-"):
+                raise rollback_failure
+            return real_replace(src, dst)
+
+        with mock.patch("carbon_market.history_copy.os.fsync",
+                        side_effect=fsync_wrapper), \
+             mock.patch("carbon_market.history_copy.os.replace",
+                        side_effect=replace):
+            with self.assertRaises(OSError) as ctx:
+                history_copy.run(source, target, "batch-key", overwrite=True)
+        self.assertIs(ctx.exception, rollback_failure)
+        self.assertIs(ctx.exception.__cause__, first)
+        # Restore could not happen: the target holds the new bytes, but
+        # the synced old-bytes backup survives for manual recovery.
+        self.assertEqual(open(target, "rb").read(), open(source, "rb").read())
+        backups = [n for n in self._attempt_files()
+                   if n.startswith(".history-copy-backup-")]
+        self.assertEqual(len(backups), 1)
+        self.assertEqual(
+            open(os.path.join(self.directory, backups[0]), "rb").read(),
+            old_raw)
+
+    def test_rollback_directory_fsync_failure_chains_from_first(self) -> None:
+        source = self._write(_history_doc(), "source.history")
+        target, old_raw = self._old_target()
+        first = _io_error("commit directory fsync failed")
+        rollback_failure = _io_error("rollback directory fsync failed")
+
+        def fail_on(kind, n):
+            if kind != "dir":
+                return None
+            # 1 backup durability; 2 commit (first failure); 3 restore
+            # durability during rollback; 4 cleanup sync during rollback.
+            if n == 2:
+                return first
+            if n == 4:
+                return rollback_failure
+            return None
+
+        with mock.patch("carbon_market.history_copy.os.fsync",
+                        side_effect=_fsync_wrapper(fail_on)):
+            with self.assertRaises(OSError) as ctx:
+                history_copy.run(source, target, "batch-key", overwrite=True)
+        self.assertIs(ctx.exception, rollback_failure)
+        self.assertIs(ctx.exception.__cause__, first)
+        # The restore itself (3rd directory fsync) had completed, so the
+        # target holds the complete old bytes.
+        self._assert_reads_complete_old_version(target, old_raw)
+
+    # -- original target absent: failure removes the new target ---------
+
+    def test_commit_failure_with_no_prior_target_removes_new_target(self) -> None:
+        source = self._write(_history_doc(), "source.history")
+        target = os.path.join(self.directory, "fresh.history")
+        failure = _io_error("commit directory fsync failed")
+        wrapper = _fsync_wrapper(
+            lambda kind, n: failure if (kind, n) == ("dir", 1) else None)
+        with mock.patch("carbon_market.history_copy.os.fsync",
+                        side_effect=wrapper):
+            with self.assertRaises(OSError) as ctx:
+                history_copy.run(source, target, "batch-key", overwrite=True)
+        self.assertIs(ctx.exception, failure)
+        self.assertFalse(os.path.exists(target))
+        self.assertEqual(self._attempt_files(), [])
+
+    def test_temp_failure_with_no_prior_target_leaves_nothing(self) -> None:
+        source = self._write(_history_doc(), "source.history")
+        target = os.path.join(self.directory, "fresh.history")
+        failure = _io_error("new temp fsync failed")
+        wrapper = _fsync_wrapper(
+            lambda kind, n: failure if (kind, n) == ("file", 1) else None)
+        with mock.patch("carbon_market.history_copy.os.fsync",
+                        side_effect=wrapper):
+            with self.assertRaises(OSError) as ctx:
+                history_copy.run(source, target, "batch-key", overwrite=True)
+        self.assertIs(ctx.exception, failure)
+        self.assertFalse(os.path.exists(target))
+        self.assertEqual(self._attempt_files(), [])
+
+    # -- overwrite=False and success contracts ---------------------------
+
+    def test_overwrite_false_still_raises_and_writes_nothing(self) -> None:
+        source = self._write(_history_doc(), "source.history")
+        target = os.path.join(self.directory, "target.history")
+        with open(target, "wb") as handle:
+            handle.write(b"old version")
+        with self.assertRaises(FileExistsError):
+            history_copy.run(source, target, "batch-key", overwrite=False)
+        self.assertEqual(open(target, "rb").read(), b"old version")
+        self.assertEqual(self._attempt_files(), [])
+
+    def test_successful_overwrite_leaves_no_backup_or_temp(self) -> None:
+        source = self._write(_history_doc(), "source.history")
+        target, _old_raw = self._old_target()
+        result = history_copy.run(source, target, "batch-key", overwrite=True)
+        self.assertEqual(open(target, "rb").read(), open(source, "rb").read())
+        self.assertEqual(result, history.verify(source, "batch-key"))
+        self.assertEqual(list(result.keys()),
+                         ["key", "count", "statuses", "terminal"])
+        self.assertEqual(self._attempt_files(), [])
 
 
 if __name__ == "__main__":
