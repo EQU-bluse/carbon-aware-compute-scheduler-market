@@ -9,8 +9,12 @@ up at creation -- ``[null, null]`` while pending, ``[event, null]`` once
 recovered and ``[null, error]`` when the recovery attempt raised.
 
 The coordination file is created on demand and guarded by a per-realpath
-lock that excludes both threads of this process and other processes. A
-batch with pending items may only be continued by its owner; another
+lock that excludes both threads of this process and other processes. The
+cross-process half is a kernel exclusive lock (``flock``) on
+``coord + ".lock"``: waiters block until the holder releases it, and the
+kernel releases the lock automatically when the holder process exits --
+even after a crash -- so a ``.lock`` file left behind on disk never blocks
+the next batch. A batch with pending items may only be continued by its owner; another
 owner must wait out the lease (``now`` later than ``until``) before
 taking over, and whoever runs refreshes the lease to ``now + ttl``. Each
 pending item is recovered through :func:`carbon_market.recover.run`
@@ -26,11 +30,11 @@ failed write never damages the previous coordination file.
 from __future__ import annotations
 
 import contextlib
+import fcntl
 import json
 import os
 import tempfile
 import threading
-import time
 from typing import Any, Iterator
 
 from . import jobs as _jobs
@@ -70,22 +74,26 @@ def _get_store(path: str) -> _Store:
 
 @contextlib.contextmanager
 def _file_lock(realpath: str) -> Iterator[None]:
-    # Cross-process mutual exclusion: the lock file is created atomically
-    # and removed by its holder on release, so no file is left behind once
-    # every holder exits its critical section normally.
+    # Cross-process mutual exclusion uses the kernel's advisory flock on
+    # coord + ".lock". Unlike an O_CREAT|O_EXCL marker, the lock itself is
+    # kernel state: a blocked holder waits here instead of polling, and the
+    # kernel releases it the moment the holder process exits (crash or
+    # kill included), so a stale .lock file on disk can never block a
+    # later batch permanently. The file is created if missing but never
+    # removed -- the inode, not the directory entry, carries the lock.
     lock_path = realpath + ".lock"
-    while True:
-        try:
-            fd = os.open(lock_path, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
-            break
-        except FileExistsError:
-            time.sleep(0.01)
+    # Failures at open or flock are OSError and propagate to the caller.
+    fd = os.open(lock_path, os.O_CREAT | os.O_CLOEXEC | os.O_RDWR, 0o600)
     try:
-        yield
+        fcntl.flock(fd, fcntl.LOCK_EX)
+        try:
+            yield
+        finally:
+            with contextlib.suppress(OSError):
+                fcntl.flock(fd, fcntl.LOCK_UN)
     finally:
-        os.close(fd)
         with contextlib.suppress(OSError):
-            os.unlink(lock_path)
+            os.close(fd)
 
 
 def _is_plain_int(value: object) -> bool:
