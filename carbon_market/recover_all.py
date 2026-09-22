@@ -26,11 +26,11 @@ failed write never damages the previous coordination file.
 from __future__ import annotations
 
 import contextlib
+import fcntl
 import json
 import os
 import tempfile
 import threading
-import time
 from typing import Any, Iterator
 
 from . import jobs as _jobs
@@ -70,22 +70,23 @@ def _get_store(path: str) -> _Store:
 
 @contextlib.contextmanager
 def _file_lock(realpath: str) -> Iterator[None]:
-    # Cross-process mutual exclusion: the lock file is created atomically
-    # and removed by its holder on release, so no file is left behind once
-    # every holder exits its critical section normally.
+    # Cross-process mutual exclusion via a kernel exclusive lock: flock
+    # serializes holders of the same lock file across processes, and the
+    # kernel releases it automatically when the holding process exits --
+    # even on a crash -- so a leftover lock file never blocks anyone. The
+    # file itself is deliberately never unlinked: removing it while another
+    # process waits on the old inode would split the lock domain. Any
+    # failure to open or lock surfaces as OSError.
     lock_path = realpath + ".lock"
-    while True:
-        try:
-            fd = os.open(lock_path, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
-            break
-        except FileExistsError:
-            time.sleep(0.01)
+    fd = os.open(lock_path, os.O_CREAT | os.O_RDWR, 0o666)
     try:
-        yield
+        fcntl.flock(fd, fcntl.LOCK_EX)
+        try:
+            yield
+        finally:
+            fcntl.flock(fd, fcntl.LOCK_UN)
     finally:
         os.close(fd)
-        with contextlib.suppress(OSError):
-            os.unlink(lock_path)
 
 
 def _is_plain_int(value: object) -> bool:
