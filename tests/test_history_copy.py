@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import contextlib
 import json
 import os
 import time
@@ -299,6 +300,242 @@ class HistoryCopyTest(unittest.TestCase):
         history_copy.run(source, target, "batch-key", overwrite=True)
         self.assertGreaterEqual(time.monotonic() - start, 1.2)
         self.assertEqual(open(target, "rb").read(), open(source, "rb").read())
+
+
+# -- fault injection -------------------------------------------------------
+
+def _io_error(stage: str) -> OSError:
+    return OSError(5, f"injected I/O failure at {stage}")
+
+
+@contextlib.contextmanager
+def _fault_at(*stages: str):
+    # Fail the first occurrence of each named protocol stage; every later
+    # occurrence (and every other stage) proceeds normally.
+    failing = set(stages)
+    original = history_copy._fault
+
+    def inject(stage: str) -> None:
+        if stage in failing:
+            failing.discard(stage)
+            raise _io_error(stage)
+
+    history_copy._fault = inject
+    try:
+        yield
+    finally:
+        history_copy._fault = original
+
+
+class HistoryCopyFaultInjectionTest(unittest.TestCase):
+    def setUp(self) -> None:
+        self.tmp = TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        # Two distinct, individually valid histories: the source has two
+        # snapshots, the pre-call target has one. After any failed
+        # overwrite history.verify must report the old one-snapshot file.
+        self.source = os.path.join(self.tmp.name, "source.history")
+        with open(self.source, "w", encoding="utf-8") as handle:
+            handle.write(json.dumps(_history_doc()) + "\n")
+        self.old_doc = _history_doc(snapshots=[
+            ["pending", _coord(items={"j-1": [None, None]})],
+        ])
+        self.target = os.path.join(self.tmp.name, "target.history")
+        self.old_bytes = json.dumps(self.old_doc).encode("utf-8") + b"\n"
+        with open(self.target, "wb") as handle:
+            handle.write(self.old_bytes)
+        self.new_bytes = open(self.source, "rb").read()
+        self.assertNotEqual(self.old_bytes, self.new_bytes)
+
+    def _leftovers(self) -> list[str]:
+        return [name for name in os.listdir(self.tmp.name)
+                if name.startswith(".history-copy")]
+
+    def _assert_old_version_readable(self) -> None:
+        # get/verify take the shared target lock and read: they must see
+        # only the complete pre-call version.
+        self.assertEqual(open(self.target, "rb").read(), self.old_bytes)
+        summary = history.verify(self.target, "batch-key")
+        self.assertEqual(summary["count"], 1)
+        self.assertEqual(summary["statuses"], ["pending"])
+        page = history.get(self.target, "batch-key")
+        self.assertEqual([row[1] for row in page["snapshots"]], ["pending"])
+
+    def _assert_target_lock_is_free(self) -> None:
+        import fcntl
+        fd = os.open(self.target + ".lock", os.O_CREAT | os.O_RDWR, 0o666)
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            fcntl.flock(fd, fcntl.LOCK_UN)
+        finally:
+            os.close(fd)
+
+    def test_backup_fsync_failure_leaves_old_target(self) -> None:
+        with _fault_at("backup_fsync"):
+            with self.assertRaises(OSError) as ctx:
+                history_copy.run(self.source, self.target, "batch-key",
+                                 overwrite=True)
+        self.assertIsNone(ctx.exception.__cause__)
+        self._assert_old_version_readable()
+        self.assertEqual(self._leftovers(), [])
+        self._assert_target_lock_is_free()
+
+    def test_backup_dir_sync_failures_leave_old_target(self) -> None:
+        for stage in ("backup_dir_open", "backup_dir_fsync"):
+            with self.subTest(stage=stage):
+                with open(self.target, "wb") as handle:
+                    handle.write(self.old_bytes)
+                with _fault_at(stage):
+                    with self.assertRaises(OSError):
+                        history_copy.run(self.source, self.target,
+                                         "batch-key", overwrite=True)
+                self._assert_old_version_readable()
+                self.assertEqual(self._leftovers(), [])
+
+    def test_temp_stage_failures_leave_old_target(self) -> None:
+        for stage in ("temp_fsync", "replace"):
+            with self.subTest(stage=stage):
+                with open(self.target, "wb") as handle:
+                    handle.write(self.old_bytes)
+                with _fault_at(stage):
+                    with self.assertRaises(OSError):
+                        history_copy.run(self.source, self.target,
+                                         "batch-key", overwrite=True)
+                self._assert_old_version_readable()
+                self.assertEqual(self._leftovers(), [])
+
+    def test_post_replace_dir_failures_roll_back_old_bytes(self) -> None:
+        for stage in ("commit_dir_open", "commit_dir_fsync"):
+            with self.subTest(stage=stage):
+                with open(self.target, "wb") as handle:
+                    handle.write(self.old_bytes)
+                with _fault_at(stage):
+                    with self.assertRaises(OSError) as ctx:
+                        history_copy.run(self.source, self.target,
+                                         "batch-key", overwrite=True)
+                self.assertIsNone(ctx.exception.__cause__)
+                self._assert_old_version_readable()
+                self.assertEqual(self._leftovers(), [])
+                self._assert_target_lock_is_free()
+
+    def test_backup_cleanup_failures_roll_back_old_bytes(self) -> None:
+        # The replace is durable and the backup unlink is what fails: the
+        # backup is moved back over the new target.
+        with _fault_at("cleanup_unlink"):
+            with self.assertRaises(OSError):
+                history_copy.run(self.source, self.target, "batch-key",
+                                 overwrite=True)
+        self._assert_old_version_readable()
+        self.assertEqual(self._leftovers(), [])
+
+    def test_final_dir_sync_failures_restore_from_memory(self) -> None:
+        # The backup has already been removed; the old bytes must still be
+        # reconstructed from the in-memory copy.
+        for stage in ("final_dir_open", "final_dir_fsync"):
+            with self.subTest(stage=stage):
+                with open(self.target, "wb") as handle:
+                    handle.write(self.old_bytes)
+                with _fault_at(stage):
+                    with self.assertRaises(OSError):
+                        history_copy.run(self.source, self.target,
+                                         "batch-key", overwrite=True)
+                self._assert_old_version_readable()
+                self.assertEqual(self._leftovers(), [])
+
+    def test_rollback_replace_failure_chains_and_keeps_backup(self) -> None:
+        # Post-replace directory sync fails, then moving the backup back
+        # fails too: the rollback OSError is raised chained after the first
+        # one and the .old backup stays on disk, still carrying the old
+        # bytes for manual recovery.
+        with _fault_at("commit_dir_fsync", "rollback_replace"):
+            with self.assertRaises(OSError) as ctx:
+                history_copy.run(self.source, self.target, "batch-key",
+                                 overwrite=True)
+        self.assertIsNotNone(ctx.exception.__cause__)
+        self.assertIn("commit_dir_fsync", str(ctx.exception.__cause__))
+        backups = [name for name in os.listdir(self.tmp.name)
+                   if name.startswith(".history-copy-backup-")]
+        self.assertEqual(len(backups), 1)
+        with open(os.path.join(self.tmp.name, backups[0]), "rb") as handle:
+            self.assertEqual(handle.read(), self.old_bytes)
+        self._assert_target_lock_is_free()
+
+    def test_rollback_dir_sync_failure_chains_after_restore(self) -> None:
+        # The old bytes make it back onto the target, but syncing the
+        # rollback itself fails: still a chained OSError, with the target
+        # holding the old bytes.
+        with _fault_at("commit_dir_fsync", "rollback_dir_fsync"):
+            with self.assertRaises(OSError) as ctx:
+                history_copy.run(self.source, self.target, "batch-key",
+                                 overwrite=True)
+        self.assertIsNotNone(ctx.exception.__cause__)
+        self.assertEqual(open(self.target, "rb").read(), self.old_bytes)
+
+    def test_new_target_post_replace_failure_deletes_new_file(self) -> None:
+        target = os.path.join(self.tmp.name, "fresh.history")
+        with _fault_at("commit_dir_fsync"):
+            with self.assertRaises(OSError):
+                history_copy.run(self.source, target, "batch-key")
+        self.assertFalse(os.path.exists(target))
+        self.assertEqual([name for name in os.listdir(self.tmp.name)
+                          if name.startswith(".history-copy")], [])
+        with self.assertRaises(FileNotFoundError):
+            history.verify(target, "batch-key")
+
+    def test_new_target_rollback_unlink_failure_chains(self) -> None:
+        target = os.path.join(self.tmp.name, "fresh.history")
+        with _fault_at("commit_dir_fsync", "rollback_unlink"):
+            with self.assertRaises(OSError) as ctx:
+                history_copy.run(self.source, target, "batch-key")
+        self.assertIsNotNone(ctx.exception.__cause__)
+        # The new file the rollback could not remove is the only leftover.
+        self.assertEqual(open(target, "rb").read(), self.new_bytes)
+        self.assertEqual([name for name in os.listdir(self.tmp.name)
+                          if name.startswith(".history-copy-")
+                          and name.endswith(".tmp")], [])
+
+    def test_target_lock_failure_raises_oserror_and_writes_nothing(self) -> None:
+        import fcntl
+        real_lock = history_copy._recover_all._history_file_lock
+
+        def locked_out(realpath, *, shared=False):
+            if not shared:
+                raise OSError(77, "injected target lock failure")
+            return real_lock(realpath, shared=True)
+
+        history_copy._recover_all._history_file_lock = locked_out
+        try:
+            with self.assertRaises(OSError):
+                history_copy.run(self.source, self.target, "batch-key",
+                                 overwrite=True)
+        finally:
+            history_copy._recover_all._history_file_lock = real_lock
+        # Nothing beyond the pre-call target was created in the directory
+        # (the source-side shared lock path was untouched).
+        self.assertEqual(open(self.target, "rb").read(), self.old_bytes)
+        self.assertEqual(self._leftovers(), [])
+        # Locking was never actually taken, so the companion lock is free.
+        fd = os.open(self.target + ".lock", os.O_CREAT | os.O_RDWR, 0o666)
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            fcntl.flock(fd, fcntl.LOCK_UN)
+        finally:
+            os.close(fd)
+
+    def test_successful_overwrite_clears_every_temp(self) -> None:
+        seen: list[str] = []
+        history_copy._fault = seen.append
+        try:
+            result = history_copy.run(self.source, self.target,
+                                      "batch-key", overwrite=True)
+        finally:
+            history_copy._fault = None
+        self.assertEqual(result, history.verify(self.target, "batch-key"))
+        self.assertEqual(open(self.target, "rb").read(), self.new_bytes)
+        self.assertEqual(self._leftovers(), [])
+        self.assertIn("backup_fsync", seen)
+        self.assertIn("commit_dir_fsync", seen)
+        self.assertIn("final_dir_fsync", seen)
 
 
 if __name__ == "__main__":
