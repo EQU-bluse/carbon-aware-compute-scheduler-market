@@ -33,7 +33,11 @@ batch's termination -- one snapshot ``[status, coord]`` is first
 appended to a history file next to it (``coord + ".history"``), inside
 the same lock. The status follows the rules of
 :mod:`carbon_market.recovery_audit` and the coord is an
-order-preserving deep copy of the object at that moment. The history
+order-preserving deep copy of the object at that moment. Each history
+write -- validation, snapshot append, atomic replacement and directory
+sync -- additionally runs under an exclusive lock on the history file's
+own lock file (``coord + ".history.lock"``), so readers holding the
+shared lock never observe a half-updated history. The history
 write always precedes the coordination write, so a failed snapshot
 leaves the previous coordination state untouched and unadvanced; a
 re-entry recomputes whatever a crashed attempt had not yet recorded and
@@ -91,18 +95,19 @@ def _get_store(path: str) -> _Store:
 
 
 @contextlib.contextmanager
-def _file_lock(realpath: str) -> Iterator[None]:
-    # Cross-process mutual exclusion via a kernel exclusive lock: flock
-    # serializes holders of the same lock file across processes, and the
-    # kernel releases it automatically when the holding process exits --
-    # even on a crash -- so a leftover lock file never blocks anyone. The
-    # file itself is deliberately never unlinked: removing it while another
-    # process waits on the old inode would split the lock domain. Any
-    # failure to open or lock surfaces as OSError.
+def _file_lock(realpath: str, exclusive: bool = True) -> Iterator[None]:
+    # Cross-process mutual exclusion via a kernel lock: flock serializes
+    # holders of the same lock file across processes -- shared holders
+    # coexist with one another but never with an exclusive holder -- and
+    # the kernel releases the lock automatically when the holding process
+    # exits, even on a crash, so a leftover lock file never blocks anyone.
+    # The file itself is deliberately never unlinked: removing it while
+    # another process waits on the old inode would split the lock domain.
+    # Any failure to open or lock surfaces as OSError.
     lock_path = realpath + ".lock"
     fd = os.open(lock_path, os.O_CREAT | os.O_RDWR, 0o666)
     try:
-        fcntl.flock(fd, fcntl.LOCK_EX)
+        fcntl.flock(fd, fcntl.LOCK_EX if exclusive else fcntl.LOCK_SH)
         try:
             yield
         finally:
@@ -282,18 +287,27 @@ def _ensure_snapshot(realpath: str, coord_obj: dict[str, Any]) -> None:
     # the immediately previous one, e.g. a missing history next to a
     # terminal coordination file -- finds it among the snapshots and
     # records no duplicate.
-    history = _load_history(realpath + ".history")
-    snapshot = [_status_of(coord_obj["items"]), copy.deepcopy(coord_obj)]
-    if history is None:
-        history = {"version": _VERSION, "key": coord_obj["key"],
-                   "snapshots": []}
-    elif history["key"] != coord_obj["key"]:
-        raise ValueError("coordination key was already used with a "
-                         "different recovery batch")
-    if snapshot in history["snapshots"]:
-        return
-    history["snapshots"].append(snapshot)
-    _atomic_write(realpath + ".history", history)
+    #
+    # The whole cycle -- loading and validating the current history,
+    # appending the snapshot, atomically replacing the file and syncing
+    # the directory -- runs under one exclusive lock on the history
+    # file's own lock file, so a concurrent reader holding the shared
+    # lock (carbon_market.history.get / verify) only ever observes the
+    # complete history from before the write or the one from after it.
+    history_real = os.path.realpath(realpath + ".history")
+    with _file_lock(history_real):
+        history = _load_history(history_real)
+        snapshot = [_status_of(coord_obj["items"]), copy.deepcopy(coord_obj)]
+        if history is None:
+            history = {"version": _VERSION, "key": coord_obj["key"],
+                       "snapshots": []}
+        elif history["key"] != coord_obj["key"]:
+            raise ValueError("coordination key was already used with a "
+                             "different recovery batch")
+        if snapshot in history["snapshots"]:
+            return
+        history["snapshots"].append(snapshot)
+        _atomic_write(history_real, history)
 
 
 def run(

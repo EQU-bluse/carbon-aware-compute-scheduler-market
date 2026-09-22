@@ -20,10 +20,15 @@ point, each recorded status is the one derived from its coord's items
 recorded, completed otherwise), no ``[status, coord]`` snapshot is
 repeated in full, and no snapshot follows a terminal one.
 
-The queries never write. Because the history file is only ever replaced
-atomically, a read racing a write observes either the complete snapshot
-list from before the write or the one from after it -- never a partial
-file.
+The queries never modify the history file. Each read is taken under a
+shared lock on the history file's lock file (``path + ".lock"``), held
+from before the file is opened until the read completes and the file is
+closed, while :mod:`carbon_market.recover_all` writes under the matching
+exclusive lock. A read racing a write therefore observes either the
+complete snapshot list from before the write or the one from after it --
+never a partial file. The lock is a kernel lock released automatically
+when the holding process exits, so a leftover lock file never blocks
+anyone.
 """
 
 from __future__ import annotations
@@ -87,8 +92,16 @@ def _load(path: str, key: str) -> dict[str, object]:
     _validate_path_key(path, key)
 
     realpath = os.path.realpath(path)
-    with open(realpath, encoding="utf-8") as handle:
-        text = handle.read()
+    # The shared lock on ``path + ".lock"`` is taken before the file is
+    # opened and held until the read completes and the file is closed, so
+    # a racing recover_all.run -- which writes under the matching
+    # exclusive lock -- cannot change the file mid-read. The kernel
+    # releases the lock if this process dies, so a leftover lock file
+    # never blocks anyone. Lock, open and read failures surface as
+    # OSError (a missing history file as FileNotFoundError).
+    with _recover_all._file_lock(realpath, exclusive=False):
+        with open(realpath, encoding="utf-8") as handle:
+            text = handle.read()
     try:
         data = strict_loads(text)
     except ValueError as exc:
