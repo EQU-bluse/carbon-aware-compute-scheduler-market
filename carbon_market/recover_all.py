@@ -21,11 +21,26 @@ are all resolved replays its original coordination object for the same
 key; a different key is a conflict. Encoding, atomic synchronization and
 file-error behaviour follow :func:`carbon_market.recover.run`, and a
 failed write never damages the previous coordination file.
+
+Every time the coordination object is created, taken over by a new
+owner, or has one of its items settle -- the last settlement being the
+batch's termination -- one snapshot ``[status, coord]`` is first
+appended to a history file next to it (``coord + ".history"``), inside
+the same lock. The status follows the rules of
+:mod:`carbon_market.recovery_audit` and the coord is an
+order-preserving deep copy of the object at that moment. The history
+write always precedes the coordination write, so a failed snapshot
+leaves the previous coordination state untouched and unadvanced; a
+re-entry recomputes whatever a crashed attempt had not yet recorded and
+skips the duplicate when it recomputes an already-recorded state. The
+history file shares the coordination file's version, encoding and
+atomic-synchronization behaviour.
 """
 
 from __future__ import annotations
 
 import contextlib
+import copy
 import fcntl
 import json
 import os
@@ -46,6 +61,8 @@ _VERSION = 1
 _ROOT_FIELDS = ("version", "key", "owner", "until", "items")
 _EVENT_FIELDS = ("job_id", "source_id", "target_id", "op", "now")
 _OPS = ("commit", "abort")
+_HISTORY_FIELDS = ("version", "key", "snapshots")
+_STATUSES = ("pending", "failed", "completed")
 
 
 class _Store:
@@ -170,6 +187,62 @@ def _load_coord(realpath: str) -> dict[str, Any] | None:
     return _validate_coord(data)
 
 
+def _status_of(items: dict[str, list[Any]]) -> str:
+    # The status rules are the ones recovery_audit.get reports: pending
+    # while any item is still [None, None], failed when nothing is
+    # pending but at least one error is recorded, completed otherwise.
+    if any(pair[0] is None and pair[1] is None for pair in items.values()):
+        return "pending"
+    if any(pair[1] is not None for pair in items.values()):
+        return "failed"
+    return "completed"
+
+
+def _validate_history(data: object) -> dict[str, Any]:
+    if not isinstance(data, dict) or set(data.keys()) != set(_HISTORY_FIELDS):
+        raise ValueError("history root must be an object with keys "
+                         "version, key and snapshots")
+
+    version = data["version"]
+    if not _is_plain_int(version) or version != _VERSION:
+        raise ValueError("unsupported history version")
+
+    key = data["key"]
+    if not isinstance(key, str) or not key:
+        raise ValueError("key must be a non-empty string")
+
+    snapshots_raw = data["snapshots"]
+    if not isinstance(snapshots_raw, list):
+        raise ValueError("snapshots must be an array")
+    snapshots: list[list[Any]] = []
+    for entry in snapshots_raw:
+        if not isinstance(entry, list) or len(entry) != 2:
+            raise ValueError("snapshot entries must be [status, coord] pairs")
+        status, coord_raw = entry
+        if status not in _STATUSES:
+            raise ValueError("status must be pending, failed or completed")
+        snapshots.append([status, _validate_coord(coord_raw)])
+
+    return {"version": _VERSION, "key": key, "snapshots": snapshots}
+
+
+def _load_history(realpath: str) -> dict[str, Any] | None:
+    # Like the coordination file, the history file is created on demand,
+    # so a missing file simply means no snapshot has been recorded yet.
+    try:
+        with open(realpath, encoding="utf-8") as handle:
+            text = handle.read()
+    except FileNotFoundError:
+        return None
+
+    try:
+        data = strict_loads(text)
+    except ValueError as exc:
+        raise ValueError(
+            f"history file {realpath!r} is not valid JSON") from exc
+    return _validate_history(data)
+
+
 def _atomic_write(realpath: str, coord: dict[str, Any]) -> None:
     text = json.dumps(coord, ensure_ascii=False, separators=(",", ":"),
                       allow_nan=False) + "\n"
@@ -195,6 +268,27 @@ def _atomic_write(realpath: str, coord: dict[str, Any]) -> None:
         os.close(dir_fd)
 
 
+def _append_snapshot(realpath: str, coord_obj: dict[str, Any]) -> None:
+    # Record one snapshot of the coordination object as it is about to be
+    # persisted. The history is always written before the coordination
+    # file itself, so a failure here leaves the previous coordination
+    # state untouched and the caller must not advance it. A re-entry that
+    # recomputes the exact state a crashed attempt already recorded finds
+    # it as the last snapshot and skips the duplicate.
+    history = _load_history(realpath + ".history")
+    snapshot = [_status_of(coord_obj["items"]), copy.deepcopy(coord_obj)]
+    if history is None:
+        history = {"version": _VERSION, "key": coord_obj["key"],
+                   "snapshots": []}
+    elif history["key"] != coord_obj["key"]:
+        raise ValueError("coordination key was already used with a "
+                         "different recovery batch")
+    if history["snapshots"] and history["snapshots"][-1] == snapshot:
+        return
+    history["snapshots"].append(snapshot)
+    _atomic_write(realpath + ".history", history)
+
+
 def run(
     jobs: str,
     offers: str,
@@ -218,7 +312,10 @@ def run(
     key raises ``ValueError``. While items are pending only the recorded
     owner may continue; another owner must wait until ``now`` is past
     ``until`` to take over, otherwise ``PermissionError`` is raised, and
-    the lease is refreshed to ``now + ttl``.
+    the lease is refreshed to ``now + ttl``. Creation, each takeover and
+    each item settlement first append one ``[status, coord]`` snapshot
+    to the history file ``coord + ".history"``; a failed snapshot
+    leaves the previous coordination state unadvanced.
     """
     for value in (jobs, offers, matches, reserves, state, coord, owner, key):
         if not isinstance(value, str) or not value:
@@ -264,6 +361,7 @@ def run(
                     "items": {job_id: [None, None] for job_id in snapshot},
                 }
                 created = True
+                _append_snapshot(store.realpath, coord_obj)
                 _atomic_write(store.realpath, coord_obj)
             else:
                 if coord_obj["key"] != key:
@@ -276,8 +374,11 @@ def run(
                     raise PermissionError(
                         "recovery batch is owned by another owner until "
                         f"{coord_obj['until']}")
+                takeover = coord_obj["owner"] != owner
                 coord_obj["owner"] = owner
                 coord_obj["until"] = now + ttl
+                if takeover:
+                    _append_snapshot(store.realpath, coord_obj)
                 _atomic_write(store.realpath, coord_obj)
 
             for job_id, pair in coord_obj["items"].items():
@@ -291,5 +392,6 @@ def run(
                     pair[0] = event
                 except Exception as exc:  # noqa: BLE001 - record and continue
                     pair[1] = type(exc).__name__
+                _append_snapshot(store.realpath, coord_obj)
                 _atomic_write(store.realpath, coord_obj)
             return coord_obj, created
