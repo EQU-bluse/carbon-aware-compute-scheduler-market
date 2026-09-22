@@ -18,7 +18,12 @@ under a subkey derived from the batch key, so an item interrupted by a
 crash is simply re-entered: the subkey replays whatever the interrupted
 attempt already recorded in the migration journal. A batch whose items
 are all resolved replays its original coordination object for the same
-key; a different key is a conflict. Encoding, atomic synchronization and
+key; a different key is a conflict. When an already terminal
+coordination file is re-entered and its history file is missing or was
+left without that terminal snapshot -- a crash, or the history being
+lost -- the one missing terminal snapshot is backfilled into the
+history, and a replay whose terminal state is already recorded writes
+nothing. Encoding, atomic synchronization and
 file-error behaviour follow :func:`carbon_market.recover.run`, and a
 failed write never damages the previous coordination file.
 
@@ -268,13 +273,15 @@ def _atomic_write(realpath: str, coord: dict[str, Any]) -> None:
         os.close(dir_fd)
 
 
-def _append_snapshot(realpath: str, coord_obj: dict[str, Any]) -> None:
+def _ensure_snapshot(realpath: str, coord_obj: dict[str, Any]) -> None:
     # Record one snapshot of the coordination object as it is about to be
     # persisted. The history is always written before the coordination
     # file itself, so a failure here leaves the previous coordination
     # state untouched and the caller must not advance it. A re-entry that
-    # recomputes the exact state a crashed attempt already recorded finds
-    # it as the last snapshot and skips the duplicate.
+    # recomputes a state a crashed attempt already recorded -- not just
+    # the immediately previous one, e.g. a missing history next to a
+    # terminal coordination file -- finds it among the snapshots and
+    # records no duplicate.
     history = _load_history(realpath + ".history")
     snapshot = [_status_of(coord_obj["items"]), copy.deepcopy(coord_obj)]
     if history is None:
@@ -283,7 +290,7 @@ def _append_snapshot(realpath: str, coord_obj: dict[str, Any]) -> None:
     elif history["key"] != coord_obj["key"]:
         raise ValueError("coordination key was already used with a "
                          "different recovery batch")
-    if history["snapshots"] and history["snapshots"][-1] == snapshot:
+    if snapshot in history["snapshots"]:
         return
     history["snapshots"].append(snapshot)
     _atomic_write(realpath + ".history", history)
@@ -308,14 +315,19 @@ def run(
     items mapping each job_id (in code-point order) to its
     ``[event, error]`` outcome -- and ``created`` is ``True`` only when
     this call created the coordination file. A later call with the same
-    key and no pending items replays the original object; a different
-    key raises ``ValueError``. While items are pending only the recorded
-    owner may continue; another owner must wait until ``now`` is past
-    ``until`` to take over, otherwise ``PermissionError`` is raised, and
-    the lease is refreshed to ``now + ttl``. Creation, each takeover and
-    each item settlement first append one ``[status, coord]`` snapshot
-    to the history file ``coord + ".history"``; a failed snapshot
-    leaves the previous coordination state unadvanced.
+    key and no pending items replays the original object without
+    renewing the lease; when the history file is missing or has not
+    recorded that terminal state, the one missing terminal snapshot is
+    backfilled into it, and a re-entry that finds it already recorded
+    writes nothing. A different key raises ``ValueError``. While items
+    are pending only the recorded owner may continue; another owner
+    must wait until ``now`` is past ``until`` to take over, otherwise
+    ``PermissionError`` is raised, and the lease is refreshed to
+    ``now + ttl``. Creation, each takeover and each item settlement
+    first append one ``[status, coord]`` snapshot to the history file
+    ``coord + ".history"``; a failed snapshot leaves the previous
+    coordination state unadvanced, and no path ever appends the same
+    snapshot twice.
     """
     for value in (jobs, offers, matches, reserves, state, coord, owner, key):
         if not isinstance(value, str) or not value:
@@ -361,7 +373,7 @@ def run(
                     "items": {job_id: [None, None] for job_id in snapshot},
                 }
                 created = True
-                _append_snapshot(store.realpath, coord_obj)
+                _ensure_snapshot(store.realpath, coord_obj)
                 _atomic_write(store.realpath, coord_obj)
             else:
                 if coord_obj["key"] != key:
@@ -369,6 +381,13 @@ def run(
                                      "a different recovery batch")
                 if not any(pair[0] is None and pair[1] is None
                            for pair in coord_obj["items"].values()):
+                    # The batch is terminal. Re-entry must not renew the
+                    # lease, settle anything or replay a duplicate; but a
+                    # history missing the terminal snapshot (lost file, or
+                    # a crash after the final coordination write) is healed
+                    # with the one missing terminal snapshot. When it is
+                    # already recorded the history write is skipped too.
+                    _ensure_snapshot(store.realpath, coord_obj)
                     return coord_obj, False
                 if coord_obj["owner"] != owner and now <= coord_obj["until"]:
                     raise PermissionError(
@@ -378,7 +397,7 @@ def run(
                 coord_obj["owner"] = owner
                 coord_obj["until"] = now + ttl
                 if takeover:
-                    _append_snapshot(store.realpath, coord_obj)
+                    _ensure_snapshot(store.realpath, coord_obj)
                 _atomic_write(store.realpath, coord_obj)
 
             for job_id, pair in coord_obj["items"].items():
@@ -392,6 +411,6 @@ def run(
                     pair[0] = event
                 except Exception as exc:  # noqa: BLE001 - record and continue
                     pair[1] = type(exc).__name__
-                _append_snapshot(store.realpath, coord_obj)
+                _ensure_snapshot(store.realpath, coord_obj)
                 _atomic_write(store.realpath, coord_obj)
             return coord_obj, created
