@@ -351,6 +351,26 @@ class HistoryCopyFaultInjectionTest(unittest.TestCase):
         return [name for name in os.listdir(self.tmp.name)
                 if name.startswith(".history-copy")]
 
+    def _recovery_path(self) -> str:
+        return self.target + ".recovery"
+
+    def _assert_no_recovery_copy(self) -> None:
+        self.assertFalse(os.path.exists(self._recovery_path()))
+
+    def _assert_recovery_copy_holds_old_bytes(self) -> None:
+        # A retained fixed-path recovery copy must carry exactly the
+        # pre-call target bytes and itself verify as that old history.
+        path = self._recovery_path()
+        self.assertTrue(os.path.isfile(path))
+        with open(path, "rb") as handle:
+            self.assertEqual(handle.read(), self.old_bytes)
+        summary = history.verify(path, "batch-key")
+        self.assertEqual(summary["count"], 1)
+
+    def _remove_recovery_copy(self) -> None:
+        with contextlib.suppress(FileNotFoundError):
+            os.unlink(self._recovery_path())
+
     def _assert_old_version_readable(self) -> None:
         # get/verify take the shared target lock and read: they must see
         # only the complete pre-call version.
@@ -370,18 +390,19 @@ class HistoryCopyFaultInjectionTest(unittest.TestCase):
         finally:
             os.close(fd)
 
-    def test_backup_fsync_failure_leaves_old_target(self) -> None:
-        with _fault_at("backup_fsync"):
+    def test_recovery_fsync_failure_leaves_old_target(self) -> None:
+        with _fault_at("recovery_fsync"):
             with self.assertRaises(OSError) as ctx:
                 history_copy.run(self.source, self.target, "batch-key",
                                  overwrite=True)
         self.assertIsNone(ctx.exception.__cause__)
         self._assert_old_version_readable()
         self.assertEqual(self._leftovers(), [])
+        self._assert_no_recovery_copy()
         self._assert_target_lock_is_free()
 
-    def test_backup_dir_sync_failures_leave_old_target(self) -> None:
-        for stage in ("backup_dir_open", "backup_dir_fsync"):
+    def test_recovery_dir_sync_failures_keep_recovery_copy(self) -> None:
+        for stage in ("recovery_dir_open", "recovery_dir_fsync"):
             with self.subTest(stage=stage):
                 with open(self.target, "wb") as handle:
                     handle.write(self.old_bytes)
@@ -391,8 +412,10 @@ class HistoryCopyFaultInjectionTest(unittest.TestCase):
                                          "batch-key", overwrite=True)
                 self._assert_old_version_readable()
                 self.assertEqual(self._leftovers(), [])
+                self._assert_recovery_copy_holds_old_bytes()
+                self._remove_recovery_copy()
 
-    def test_temp_stage_failures_leave_old_target(self) -> None:
+    def test_temp_stage_failures_leave_old_target_and_copy(self) -> None:
         for stage in ("temp_fsync", "replace"):
             with self.subTest(stage=stage):
                 with open(self.target, "wb") as handle:
@@ -403,6 +426,8 @@ class HistoryCopyFaultInjectionTest(unittest.TestCase):
                                          "batch-key", overwrite=True)
                 self._assert_old_version_readable()
                 self.assertEqual(self._leftovers(), [])
+                self._assert_recovery_copy_holds_old_bytes()
+                self._remove_recovery_copy()
 
     def test_post_replace_dir_failures_roll_back_old_bytes(self) -> None:
         for stage in ("commit_dir_open", "commit_dir_fsync"):
@@ -417,20 +442,25 @@ class HistoryCopyFaultInjectionTest(unittest.TestCase):
                 self._assert_old_version_readable()
                 self.assertEqual(self._leftovers(), [])
                 self._assert_target_lock_is_free()
+                # The rollback moved the recovery copy back over the
+                # target (the original contract), so no copy is left.
+                self._assert_no_recovery_copy()
 
     def test_backup_cleanup_failures_roll_back_old_bytes(self) -> None:
-        # The replace is durable and the backup unlink is what fails: the
-        # backup is moved back over the new target.
+        # The replace is durable and the recovery-copy unlink is what
+        # fails: the copy is moved back over the new target, restoring
+        # the pre-call bytes (and consuming the copy).
         with _fault_at("cleanup_unlink"):
             with self.assertRaises(OSError):
                 history_copy.run(self.source, self.target, "batch-key",
                                  overwrite=True)
         self._assert_old_version_readable()
         self.assertEqual(self._leftovers(), [])
+        self._assert_no_recovery_copy()
 
     def test_final_dir_sync_failures_restore_from_memory(self) -> None:
-        # The backup has already been removed; the old bytes must still be
-        # reconstructed from the in-memory copy.
+        # The recovery copy has already been removed; the old bytes must
+        # still be reconstructed from the in-memory copy.
         for stage in ("final_dir_open", "final_dir_fsync"):
             with self.subTest(stage=stage):
                 with open(self.target, "wb") as handle:
@@ -441,23 +471,51 @@ class HistoryCopyFaultInjectionTest(unittest.TestCase):
                                          "batch-key", overwrite=True)
                 self._assert_old_version_readable()
                 self.assertEqual(self._leftovers(), [])
+                self._assert_no_recovery_copy()
 
-    def test_rollback_replace_failure_chains_and_keeps_backup(self) -> None:
-        # Post-replace directory sync fails, then moving the backup back
-        # fails too: the rollback OSError is raised chained after the first
-        # one and the .old backup stays on disk, still carrying the old
-        # bytes for manual recovery.
+    def test_existing_recovery_copy_raises_file_exists_error(self) -> None:
+        with open(self._recovery_path(), "wb") as handle:
+            handle.write(b"a stale recovery copy")
+        with self.assertRaises(FileExistsError):
+            history_copy.run(self.source, self.target, "batch-key",
+                             overwrite=True)
+        self._assert_old_version_readable()
+        # Neither target nor the pre-existing recovery copy was touched.
+        with open(self._recovery_path(), "rb") as handle:
+            self.assertEqual(handle.read(), b"a stale recovery copy")
+        self.assertEqual(self._leftovers(), [])
+
+    def test_failed_overwrite_then_retry_is_refused_until_copy_cleared(self) -> None:
+        # A failure before the replace leaves the target untouched and
+        # retains the recovery copy; the copy then blocks a blind retry.
+        with _fault_at("temp_fsync"):
+            with self.assertRaises(OSError):
+                history_copy.run(self.source, self.target, "batch-key",
+                                 overwrite=True)
+        self._assert_old_version_readable()
+        self._assert_recovery_copy_holds_old_bytes()
+        with self.assertRaises(FileExistsError):
+            history_copy.run(self.source, self.target, "batch-key",
+                             overwrite=True)
+        self._remove_recovery_copy()
+        result = history_copy.run(self.source, self.target, "batch-key",
+                                  overwrite=True)
+        self.assertEqual(result["count"], 2)
+        self.assertEqual(open(self.target, "rb").read(), self.new_bytes)
+        self._assert_no_recovery_copy()
+
+    def test_rollback_replace_failure_chains_and_keeps_copy(self) -> None:
+        # Post-replace directory sync fails, then moving the recovery
+        # copy back fails too: the rollback OSError is raised chained
+        # after the first one and the fixed-path recovery copy stays on
+        # disk, still carrying the old bytes for manual recovery.
         with _fault_at("commit_dir_fsync", "rollback_replace"):
             with self.assertRaises(OSError) as ctx:
                 history_copy.run(self.source, self.target, "batch-key",
                                  overwrite=True)
         self.assertIsNotNone(ctx.exception.__cause__)
         self.assertIn("commit_dir_fsync", str(ctx.exception.__cause__))
-        backups = [name for name in os.listdir(self.tmp.name)
-                   if name.startswith(".history-copy-backup-")]
-        self.assertEqual(len(backups), 1)
-        with open(os.path.join(self.tmp.name, backups[0]), "rb") as handle:
-            self.assertEqual(handle.read(), self.old_bytes)
+        self._assert_recovery_copy_holds_old_bytes()
         self._assert_target_lock_is_free()
 
     def test_rollback_dir_sync_failure_chains_after_restore(self) -> None:
@@ -470,6 +528,9 @@ class HistoryCopyFaultInjectionTest(unittest.TestCase):
                                  overwrite=True)
         self.assertIsNotNone(ctx.exception.__cause__)
         self.assertEqual(open(self.target, "rb").read(), self.old_bytes)
+        # Moving the copy back already consumed it; only the final
+        # directory sync failed.
+        self._assert_no_recovery_copy()
 
     def test_new_target_post_replace_failure_deletes_new_file(self) -> None:
         target = os.path.join(self.tmp.name, "fresh.history")
@@ -477,6 +538,7 @@ class HistoryCopyFaultInjectionTest(unittest.TestCase):
             with self.assertRaises(OSError):
                 history_copy.run(self.source, target, "batch-key")
         self.assertFalse(os.path.exists(target))
+        self.assertFalse(os.path.exists(target + ".recovery"))
         self.assertEqual([name for name in os.listdir(self.tmp.name)
                           if name.startswith(".history-copy")], [])
         with self.assertRaises(FileNotFoundError):
@@ -514,6 +576,7 @@ class HistoryCopyFaultInjectionTest(unittest.TestCase):
         # (the source-side shared lock path was untouched).
         self.assertEqual(open(self.target, "rb").read(), self.old_bytes)
         self.assertEqual(self._leftovers(), [])
+        self._assert_no_recovery_copy()
         # Locking was never actually taken, so the companion lock is free.
         fd = os.open(self.target + ".lock", os.O_CREAT | os.O_RDWR, 0o666)
         try:
@@ -533,7 +596,8 @@ class HistoryCopyFaultInjectionTest(unittest.TestCase):
         self.assertEqual(result, history.verify(self.target, "batch-key"))
         self.assertEqual(open(self.target, "rb").read(), self.new_bytes)
         self.assertEqual(self._leftovers(), [])
-        self.assertIn("backup_fsync", seen)
+        self._assert_no_recovery_copy()
+        self.assertIn("recovery_fsync", seen)
         self.assertIn("commit_dir_fsync", seen)
         self.assertIn("final_dir_fsync", seen)
 
