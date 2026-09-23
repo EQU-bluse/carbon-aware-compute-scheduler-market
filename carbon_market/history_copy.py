@@ -20,20 +20,32 @@ whitespace and key order included.
 
 When an existing target is overwritten, the commit is crash-safe as well
 as atomic for readers: before the target is touched, its previous bytes
-are copied into a backup temporary file in the same directory and that
-file and the directory are fsynced; only then are the new bytes written,
-fsynced, moved over the target with :func:`os.replace` and followed by a
-directory fsync; the backup is deleted (with one more directory fsync)
-only after every one of those steps succeeded. If any step fails --
-including the directory open or fsync that follows the replace -- the
-previous bytes are moved back over the target with
-:func:`os.replace` and the directory synced again, all before the target
-lock is released, so a shared-lock reader can only ever observe the
-complete pre-call target or the complete new one. When the pre-call
-target did not exist, a failed commit deletes the new target instead.
-Should the rollback itself fail, that ``OSError`` is raised chained after
-the first error and whatever still holds the old bytes (the backup, or
-the restored target) is left in place for manual recovery.
+are written byte for byte to a fixed recovery file next to the target
+(``target + ".recovery"``), created exclusively, and that file and the
+directory are fsynced; only then are the new bytes written, fsynced,
+moved over the target with :func:`os.replace` and followed by a
+directory fsync. The recovery file is deleted (with one more directory
+fsync) only after every one of those steps succeeded. A failure between
+the synced recovery file and the atomic replace leaves the recovery file
+in place beside the still-untouched target; a failure after the replace
+-- the directory open or fsync that follows it, or the recovery unlink /
+final directory sync -- puts the previous bytes back over the target:
+the recovery file is moved back over it with :func:`os.replace` when it
+is still there (the move consumes the copy, the bytes being back in
+their original place), or re-staged from the in-memory copy when the
+recovery file was already removed; the directory is synced again, all
+before the target lock is released. A shared-lock reader can therefore
+only ever observe the complete pre-call target or the complete new one.
+When the pre-call target did not exist, a failed commit deletes the new
+target instead. A leftover recovery file from a failure that never
+reached the replace is itself a valid history and is consumed by
+:func:`carbon_market.history_recovery.restore`. Should the rollback
+itself fail, that ``OSError`` is raised with the first error chained as
+its ``__cause__``, and whatever still holds the old bytes -- the recovery
+file when the move back failed, or a recovery temporary -- is left in
+place. A recovery file already present when a copy begins -- in any
+overwrite mode -- makes the copy raise ``FileExistsError`` before
+writing anything, so recovery bytes can never be silently overwritten.
 
 Both locks are kernel flocks: they block other processes (and other
 opens of the same lock file in this process), and the kernel releases
@@ -66,14 +78,6 @@ def _maybe_fault(stage: str) -> None:
         fault(stage)
 
 
-def _fsync_dir_plain(directory: str) -> None:
-    dir_fd = os.open(directory, os.O_RDONLY)
-    try:
-        os.fsync(dir_fd)
-    finally:
-        os.close(dir_fd)
-
-
 def _fsync_dir(directory: str, open_stage: str, fsync_stage: str) -> None:
     _maybe_fault(open_stage)
     dir_fd = os.open(directory, os.O_RDONLY)
@@ -87,6 +91,18 @@ def _fsync_dir(directory: str, open_stage: str, fsync_stage: str) -> None:
 def _unlink_quiet(path: str) -> None:
     with contextlib.suppress(OSError):
         os.unlink(path)
+
+
+def _unlink_or_chain(path: str, first: BaseException) -> None:
+    # Remove a throwaway temporary after an earlier failure; a second
+    # OSError here is raised chained after the first one instead of being
+    # swallowed or replacing it.
+    try:
+        os.unlink(path)
+    except FileNotFoundError:
+        pass
+    except OSError as cleanup:
+        raise cleanup from first
 
 
 def _stage_over(target_real: str, directory: str, payload: bytes,
@@ -110,80 +126,98 @@ def _stage_over(target_real: str, directory: str, payload: bytes,
         raise
 
 
-def _restore_old(target_real: str, directory: str, existed: bool,
-                 old_bytes: bytes, backup_path: str | None,
-                 first: BaseException) -> None:
-    # Restore the bytes the target held when the copy started, while the
-    # target lock is still held exclusively: move the backup back over
-    # the target when it still exists; if it was already removed (the
-    # only failure left was the directory fsync after its unlink), re-
-    # stage the pre-call bytes from the copy held in memory; when the
-    # target did not exist beforehand, remove what this call created.
-    # Any failure of this recovery is raised chained after the first
-    # error, and whatever still carries the old bytes (the backup, or a
-    # recovery temporary) is left in place for manual recovery.
+def _rollback(target_real: str, directory: str, existed: bool,
+              old_bytes: bytes, recovery_path: str,
+              first: BaseException) -> None:
+    # Restore the bytes (or nonexistence) the target held when the copy
+    # started, while the target lock is still held exclusively: when the
+    # recovery file still exists, move it back over the target -- the move
+    # consumes the copy, the old bytes being back in their original place;
+    # if it was already removed (the only failure left was the directory
+    # fsync after its unlink), re-stage the pre-call bytes from the copy
+    # held in memory; when the target did not exist beforehand, remove
+    # what this call created. Any failure of this recovery is raised
+    # chained after the first error, and whatever still carries the old
+    # bytes at that point -- the recovery file when the move back failed,
+    # or a recovery temporary -- is left in place for
+    # history_recovery.restore.
     try:
-        if backup_path is not None and os.path.exists(backup_path):
-            _maybe_fault("rollback_replace")
-            os.replace(backup_path, target_real)
-        elif existed:
-            _stage_over(target_real, directory, old_bytes,
-                        prefix=".history-copy-restore-",
-                        retain_on_failure=True)
+        if existed:
+            if os.path.exists(recovery_path):
+                _maybe_fault("rollback_replace")
+                os.replace(recovery_path, target_real)
+            else:
+                _stage_over(target_real, directory, old_bytes,
+                            prefix=".history-copy-restore-",
+                            retain_on_failure=True)
+            _fsync_dir(directory, "rollback_dir_open", "rollback_dir_fsync")
         else:
             _maybe_fault("rollback_unlink")
             try:
                 os.unlink(target_real)
             except FileNotFoundError:
                 pass
-        _fsync_dir(directory, "rollback_dir_open", "rollback_dir_fsync")
+            _fsync_dir(directory, "rollback_dir_open", "rollback_dir_fsync")
     except OSError as recovery:
         raise recovery from first
 
 
 def _commit_copy(target_real: str, directory: str, raw: bytes,
                  overwrite: bool) -> None:
+    recovery_path = target_real + ".recovery"
+
+    # Both existence decisions are made under the exclusive target lock
+    # before anything is written. A leftover recovery file always blocks
+    # the call, no matter the overwrite mode: it carries bytes of unknown
+    # provenance and must never be silently replaced.
+    if os.path.exists(recovery_path):
+        raise FileExistsError(
+            f"history recovery file already exists: {recovery_path!r}")
     existed = os.path.exists(target_real)
     if existed and not overwrite:
         raise FileExistsError(
             f"history file already exists: {target_real!r}")
 
     # The target's pre-call bytes, kept in memory so the recovery can
-    # rebuild them even when the on-disk backup has already been removed.
+    # rebuild them even when the on-disk recovery file has already been
+    # removed.
     old_bytes = b""
     if existed:
         with open(target_real, "rb") as old:
             old_bytes = old.read()
 
     # Phase 1: when overwriting, first persist an fsynced byte-for-byte
-    # backup of the target's pre-call bytes, plus a directory fsync so the
-    # backup itself is crash-durable. The target is not modified yet, so a
-    # failure here only has to discard the partial backup.
-    backup_path: str | None = None
+    # recovery file at the fixed target+".recovery" path, created
+    # exclusively (the existence check above runs under the same lock),
+    # plus a directory fsync so the recovery file itself is crash-durable.
+    # The target is not modified yet. A failure while writing our own
+    # recovery file only discards the partial file this call created; once
+    # the recovery file is complete and synced it is removed only when the
+    # whole copy succeeds, so a failure from the directory sync onward
+    # leaves it in place.
     if existed:
-        backup_fd, backup_path = tempfile.mkstemp(
-            dir=directory, prefix=".history-copy-backup-", suffix=".old")
+        # O_EXCL makes the create exclusive: the existence check above and
+        # this open run in one exclusive-lock critical section, so a
+        # FileExistsError here means another writer raced the lock and is
+        # surfaced unchanged without writing anything.
+        recovery_fd = os.open(
+            recovery_path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o666)
         try:
-            with os.fdopen(backup_fd, "wb") as backup:
-                backup.write(old_bytes)
-                backup.flush()
+            with os.fdopen(recovery_fd, "wb") as recovery:
+                recovery.write(old_bytes)
+                recovery.flush()
                 _maybe_fault("backup_fsync")
-                os.fsync(backup.fileno())
-        except BaseException:
-            _unlink_quiet(backup_path)
+                os.fsync(recovery.fileno())
+        except BaseException as first:
+            _unlink_or_chain(recovery_path, first)
             raise
-        try:
-            _fsync_dir(directory, "backup_dir_open", "backup_dir_fsync")
-        except BaseException:
-            _unlink_quiet(backup_path)
-            raise
+        _fsync_dir(directory, "backup_dir_open", "backup_dir_fsync")
 
     # Phase 2: stage the new bytes in a same-directory temporary, fsync
     # them, then atomically move them over the target. Until the replace
     # succeeds the target still holds the pre-call bytes, so a failure
-    # only needs this attempt's temps removed; when a backup was made its
-    # removal is a cleanup whose own failure is chained after the first
-    # (the backup is left behind, carrying the old bytes).
+    # only removes this attempt's temporary; the recovery file (if any)
+    # is deliberately retained -- it is deleted only on full success.
     tmp_fd, tmp_path = tempfile.mkstemp(
         dir=directory, prefix=".history-copy-", suffix=".tmp")
     try:
@@ -195,13 +229,7 @@ def _commit_copy(target_real: str, directory: str, raw: bytes,
         _maybe_fault("replace")
         os.replace(tmp_path, target_real)
     except BaseException as first:
-        _unlink_quiet(tmp_path)
-        if backup_path is not None:
-            try:
-                os.unlink(backup_path)
-                _fsync_dir_plain(directory)
-            except OSError as cleanup:
-                raise cleanup from first
+        _unlink_or_chain(tmp_path, first)
         raise
 
     # Phase 3: persist the replace. Failure here -- opening or fsyncing
@@ -210,23 +238,27 @@ def _commit_copy(target_real: str, directory: str, raw: bytes,
     try:
         _fsync_dir(directory, "commit_dir_open", "commit_dir_fsync")
     except BaseException as first:
-        _restore_old(target_real, directory, existed, old_bytes,
-                     backup_path, first)
+        _rollback(target_real, directory, existed, old_bytes,
+                 recovery_path, first)
         raise
 
     # Phase 4: the new target is complete and durable; only now drop the
-    # backup and sync its removal. Any failure restores the pre-call
-    # bytes (the backup is moved back; if it is already gone, the bytes
-    # are re-staged from memory) before the lock is released, so a failed
-    # call never leaves the new version readable.
-    if backup_path is not None:
+    # recovery file and sync its removal. A failure here restores the
+    # pre-call target bytes before the lock is released -- the recovery
+    # file is moved back over it when still present, or the bytes are
+    # re-staged from memory when it was already removed -- so a failed
+    # call never leaves the new version readable. Only when that rollback
+    # itself fails is a recovery copy left on disk (carried by the
+    # recovery file or a recovery temporary), for
+    # history_recovery.restore to consume.
+    if existed:
         try:
             _maybe_fault("cleanup_unlink")
-            os.unlink(backup_path)
+            os.unlink(recovery_path)
             _fsync_dir(directory, "final_dir_open", "final_dir_fsync")
         except BaseException as first:
-            _restore_old(target_real, directory, existed, old_bytes,
-                         backup_path, first)
+            _rollback(target_real, directory, existed, old_bytes,
+                     recovery_path, first)
             raise
 
 
@@ -253,20 +285,24 @@ def run(
     committed to the target while holding ``target + ".lock"`` exclusive.
     If the target already exists, ``overwrite=False`` raises
     ``FileExistsError`` and writes nothing, while ``overwrite=True``
-    replaces it atomically: the old target bytes are first saved to an
-    fsynced backup temporary in the target's directory (with a directory
-    fsync), the new bytes are written to a temporary file and fsynced,
-    moved over the target with :func:`os.replace` and followed by a
-    directory fsync, and the backup is deleted with one more directory
-    fsync only once all of that succeeded. A failure at any of those
-    steps -- the post-replace directory open/fsync included -- restores
-    the target's pre-call bytes (or deletes the new target when none
-    existed) and removes this attempt's temporary files before the target
-    lock is released; if the rollback or cleanup itself fails, that
-    ``OSError`` is raised chained after the first error and a recoverable
-    copy of the old bytes is retained. After a failed overwrite a
-    history query (``get``/``verify``) therefore only ever reads the
-    complete old version.
+    replaces it atomically: the old target bytes are first written to the
+    fixed recovery file ``target + ".recovery"`` (created exclusively and
+    fsynced together with its directory); a recovery file already present
+    makes the call raise ``FileExistsError`` without writing anything.
+    The new bytes are then written to a temporary file and fsynced, moved
+    over the target with :func:`os.replace` and followed by a directory
+    fsync, and the recovery file is deleted with one more directory fsync
+    only once all of that succeeded. A failure at any of those steps --
+    the post-replace directory open/fsync included -- restores the
+    target's pre-call bytes (or deletes the new target when none existed)
+    before the target lock is released and leaves the recovery file in
+    place with the pre-call bytes; if the rollback or a cleanup itself
+    fails, that ``OSError`` is raised with the first error chained as its
+    ``__cause__`` and a recoverable copy of the old bytes is retained.
+    After a failed overwrite a history query (``get``/``verify``)
+    therefore only ever reads the complete old version, and
+    :func:`carbon_market.history_recovery.restore` consumes a leftover
+    recovery file.
 
     On success the result carries keys key, count, statuses and terminal,
     in that order, with the values :func:`carbon_market.history.verify`
@@ -315,11 +351,11 @@ def run(
 
     # Commit under the target's own exclusive lock: the existence decision,
     # the byte-for-byte write, the atomic replace, the directory sync and
-    # (on overwrite) the backup and the rollback are all one critical
-    # section, so a shared-lock history query on the target sees either the
-    # complete old file or the complete copy. The original bytes are
-    # written verbatim -- never re-serialized -- so the target is
-    # byte-identical to the source that was validated.
+    # (on overwrite) the recovery file and the rollback are all one
+    # critical section, so a shared-lock history query on the target sees
+    # either the complete old file or the complete copy. The original
+    # bytes are written verbatim -- never re-serialized -- so the target
+    # is byte-identical to the source that was validated.
     with _recover_all._history_file_lock(target_real):
         _commit_copy(target_real, directory, raw, overwrite)
 
