@@ -59,6 +59,19 @@ returns the proof's original search result together with its generation
 and closed state. Any change to the embedded log bytes, parameters, page
 content, cursor or any digest raises ``ValueError``.
 
+:func:`verify_bundle` is the offline entry for a downloaded pair: it
+takes the checkpoint file, the saved proof file and the strong entity
+tag the download carried, recomputes the tag from the checkpoint's raw
+bytes before anything else, and then applies the same checkpoint and
+proof validation as :func:`verify` against the single locked snapshot
+it read, so a racing same-directory replacement can only yield a
+self-consistent old or new combination. Structural failures (encoding,
+JSON grammar, field shapes) raise plain ``ValueError`` while every
+tag, digest-chain, generation, anchor, closed-state or page mismatch
+raises ``_MismatchError``, a ``ValueError`` subclass that lets the
+command-line entry tell a malformed bundle apart from a failed
+verification.
+
 Exports only accept a complete version 2 journal: a version 1 journal,
 a broken digest chain or a malformed checkpoint structure raises
 ``ValueError``. Invalid argument types, an empty generation name, a
@@ -86,14 +99,15 @@ import fcntl
 import hashlib
 import json
 import os
+import re
 import tempfile
 import threading
 from typing import Any, Iterator
 
 from . import audit
-from ._jsonio import strict_loads
+from ._jsonio import finite_loads, strict_loads
 
-__all__ = ["export", "verify", "read_snapshot"]
+__all__ = ["export", "verify", "verify_bundle", "read_snapshot"]
 
 _VERSION = 1
 _ROOT_FIELDS = ("version", "generations")
@@ -104,6 +118,24 @@ _PROOF_FIELDS = ("version", "generation", "params", "result", "log_bytes",
                  "log_digest", "head", "closed", "anchor_digest")
 _PARAM_FIELDS = ("cursor", "limit", "op", "stage", "key")
 _HEXADECIMAL = frozenset("0123456789abcdef")
+# A downloaded checkpoint is identified by exactly one strong entity
+# tag: one double-quoted string of 64 lowercase hexadecimal digits, the
+# SHA-256 of the complete checkpoint bytes -- the same shape the
+# conditional download accepts and serves.
+_ETAG_RE = re.compile(r'"[0-9a-f]{64}"')
+
+
+class _MismatchError(ValueError):
+    """A digest-chain or cross-reference mismatch, not a format error.
+
+    Both downloaded files failing their *structural* checks (encoding,
+    JSON grammar, field shapes) raise plain ``ValueError`` like before;
+    a tag, digest chain, generation, anchor, closed-state or page
+    mismatch raises this subclass instead, so the offline bundle
+    verifier can tell a malformed bundle apart from a well-formed one
+    that does not check out. Every existing caller still sees a
+    ``ValueError``.
+    """
 
 
 class _CheckpointStore:
@@ -224,13 +256,13 @@ def _check_extension(old_manifest: list[list[Any]],
     # Equal manifests (re-query or byte-level log rotation with same
     # events) are permitted by the caller and never reach this check.
     if len(new_manifest) <= len(old_manifest):
-        raise ValueError("a generation only accepts snapshots that add new "
-                         "audit events")
+        raise _MismatchError("a generation only accepts snapshots that add "
+                             "new audit events")
     new_digests = {audit_key: digest for audit_key, digest in new_manifest}
     for audit_key, digest in old_manifest:
         if new_digests.get(audit_key) != digest:
-            raise ValueError("a generation cannot rewrite, delete or "
-                             "reorder an already anchored event")
+            raise _MismatchError("a generation cannot rewrite, delete or "
+                                 "reorder an already anchored event")
 
 
 def _validate_checkpoint(data: object) -> list[dict[str, Any]]:
@@ -296,8 +328,8 @@ def _validate_checkpoint(data: object) -> list[dict[str, Any]]:
                 raise ValueError("anchor previous digest must be a "
                                  "64-digit hexadecimal digest")
             if declared_previous != previous:
-                raise ValueError("anchor previous digest does not continue "
-                                 "the chain")
+                raise _MismatchError("anchor previous digest does not "
+                                     "continue the chain")
             if not isinstance(anchor_raw["closed"], bool):
                 raise ValueError("anchor closed must be a boolean")
             digest = anchor_raw["digest"]
@@ -307,13 +339,14 @@ def _validate_checkpoint(data: object) -> list[dict[str, Any]]:
             expected = _anchor_digest(manifest, anchor_raw["log_digest"],
                                       head, previous, anchor_raw["closed"])
             if digest != expected:
-                raise ValueError("anchor digest does not match its content")
+                raise _MismatchError("anchor digest does not match its "
+                                     "content")
 
             if anchors:
                 earlier = anchors[-1]
                 if earlier["closed"]:
-                    raise ValueError("a closed anchor cannot be followed "
-                                     "inside its generation")
+                    raise _MismatchError("a closed anchor cannot be followed "
+                                         "inside its generation")
                 # Consecutive anchors either pin the same manifest (a
                 # byte-level log rotation with the events intact, or the
                 # closing anchor flipping the closed flag) or extend it
@@ -321,17 +354,17 @@ def _validate_checkpoint(data: object) -> list[dict[str, Any]]:
                 # anchored pair survives; anything else is a rewrite.
                 if manifest == earlier["manifest"]:
                     if head != earlier["head"]:
-                        raise ValueError("a same-snapshot anchor cannot "
-                                         "move the root digest")
+                        raise _MismatchError("a same-snapshot anchor cannot "
+                                             "move the root digest")
                     if anchor_raw["log_digest"] == earlier["log_digest"] \
                             and anchor_raw["closed"] == earlier["closed"]:
-                        raise ValueError("a duplicate anchor changes "
-                                         "nothing")
+                        raise _MismatchError("a duplicate anchor changes "
+                                             "nothing")
                 else:
                     _check_extension(earlier["manifest"], manifest)
             if anchor_raw["closed"] and not is_last_anchor:
-                raise ValueError("only the last anchor of a generation "
-                                 "may be closed")
+                raise _MismatchError("only the last anchor of a generation "
+                                     "may be closed")
 
             anchor = {"manifest": manifest,
                       "log_digest": anchor_raw["log_digest"], "head": head,
@@ -343,8 +376,8 @@ def _validate_checkpoint(data: object) -> list[dict[str, Any]]:
         if not is_last_generation and not anchors[-1]["closed"]:
             # An open generation may only be the last one of the
             # checkpoint: any following generation proves it was closed.
-            raise ValueError("a new generation can only start after the "
-                             "previous one is closed")
+            raise _MismatchError("a new generation can only start after "
+                                 "the previous one is closed")
         generations.append({"name": name, "anchors": anchors})
     return generations
 
@@ -658,6 +691,63 @@ def _search_document(document: dict[str, Any], params: dict[str, Any]) \
     return {"events": matches, "next": None}
 
 
+def _verify_proof(generations: list[dict[str, Any]],
+                  clean: dict[str, Any],
+                  checkpoint_real: str) -> dict[str, Any]:
+    # The cross-checks every verified proof must pass against one
+    # checkpoint snapshot: the named generation and anchor must be
+    # recorded, the embedded log bytes must hash to the anchored log
+    # digest and reparse as a sealed version 2 journal whose manifest
+    # and root head the anchor pins, and the page must recompute from
+    # the embedded log and parameters. Every failure here is a
+    # mismatch, never a format error.
+    names = [item["name"] for item in generations]
+    if clean["generation"] not in names:
+        raise _MismatchError("proof generation is not recorded in the "
+                             "checkpoint")
+    generation = generations[names.index(clean["generation"])]
+    anchor = next((item for item in generation["anchors"]
+                   if item["digest"] == clean["anchor_digest"]), None)
+    if anchor is None:
+        raise _MismatchError("proof anchor is not recorded in the "
+                             "checkpoint")
+
+    params = clean["params"]
+    raw = clean["log_bytes"].encode("utf-8")
+    if hashlib.sha256(raw).hexdigest() != clean["log_digest"]:
+        raise _MismatchError("proof log bytes do not match their log "
+                             "digest")
+    if clean["log_digest"] != anchor["log_digest"]:
+        raise _MismatchError("proof log digest is not bound to the anchor")
+    try:
+        document = audit._parse_document(checkpoint_real, raw)
+        audit._ensure_chain(document)
+    except ValueError as exc:
+        raise _MismatchError(str(exc)) from exc
+    if document["version"] != 2:
+        raise _MismatchError("proof requires a sealed version 2 audit "
+                             "journal")
+    if clean["head"] != document["head"] \
+            or anchor["head"] != document["head"]:
+        raise _MismatchError("proof root digest does not match the "
+                             "journal")
+    if _manifest(document) != anchor["manifest"]:
+        raise _MismatchError("proof event manifest does not match the "
+                             "anchor")
+    if clean["closed"] != anchor["closed"]:
+        raise _MismatchError("proof closed state does not match the "
+                             "anchor")
+
+    recomputed = _search_document(document, params)
+    if recomputed != clean["result"]:
+        raise _MismatchError("proof result does not follow from the "
+                             "embedded log and parameters")
+    return {"events": clean["result"]["events"],
+            "next": clean["result"]["next"],
+            "generation": clean["generation"],
+            "closed": anchor["closed"]}
+
+
 def verify(checkpoint_path: str, proof: dict[str, Any]) -> dict[str, Any]:
     """Verify an exported proof solely against the checkpoint.
 
@@ -691,43 +781,79 @@ def verify(checkpoint_path: str, proof: dict[str, Any]) -> dict[str, Any]:
     if generations is None:
         raise FileNotFoundError(
             f"checkpoint file {checkpoint_real!r} does not exist")
+    return _verify_proof(generations, clean, checkpoint_real)
 
-    names = [item["name"] for item in generations]
-    if clean["generation"] not in names:
-        raise ValueError("proof generation is not recorded in the "
-                         "checkpoint")
-    generation = generations[names.index(clean["generation"])]
-    anchor = next((item for item in generation["anchors"]
-                   if item["digest"] == clean["anchor_digest"]), None)
-    if anchor is None:
-        raise ValueError("proof anchor is not recorded in the checkpoint")
 
-    params = clean["params"]
-    raw = clean["log_bytes"].encode("utf-8")
-    if hashlib.sha256(raw).hexdigest() != clean["log_digest"]:
-        raise ValueError("proof log bytes do not match their log digest")
-    if clean["log_digest"] != anchor["log_digest"]:
-        raise ValueError("proof log digest is not bound to the anchor")
-    document = audit._parse_document(checkpoint_real, raw)
-    audit._ensure_chain(document)
-    if document["version"] != 2:
-        raise ValueError("proof requires a sealed version 2 audit journal")
-    if clean["head"] != document["head"] \
-            or anchor["head"] != document["head"]:
-        raise ValueError("proof root digest does not match the journal")
-    if _manifest(document) != anchor["manifest"]:
-        raise ValueError("proof event manifest does not match the anchor")
-    if clean["closed"] != anchor["closed"]:
-        raise ValueError("proof closed state does not match the anchor")
+def _loads_bundle(raw: bytes) -> Any:
+    # Both downloaded files are UTF-8 JSON; a decoding failure, a
+    # negative-zero or non-finite number literal, or a JSON grammar
+    # error is a format error of the bundle, never a mismatch.
+    try:
+        text = raw.decode("utf-8")
+    except UnicodeDecodeError as exc:
+        raise ValueError("bundle file is not valid UTF-8") from exc
+    try:
+        return finite_loads(text)
+    except ValueError as exc:
+        raise ValueError("bundle file is not valid JSON") from exc
 
-    recomputed = _search_document(document, params)
-    if recomputed != clean["result"]:
-        raise ValueError("proof result does not follow from the embedded "
-                         "log and parameters")
-    return {"events": clean["result"]["events"],
-            "next": clean["result"]["next"],
-            "generation": clean["generation"],
-            "closed": anchor["closed"]}
+
+def verify_bundle(checkpoint_path: str, proof_path: str,
+                  etag: str) -> dict[str, Any]:
+    """Verify a downloaded checkpoint/proof pair entirely offline.
+
+    ``checkpoint_path`` and ``proof_path`` must be non-empty strings and
+    ``etag`` a single strong entity tag -- one double-quoted string of
+    64 lowercase hexadecimal digits, exactly as the checkpoint
+    download's ``ETag`` header carried it. Argument errors raise
+    ``ValueError`` before any file is read.
+
+    The checkpoint is opened, read, hashed, parsed and structurally
+    validated under the *same* shared kernel flock an export or a
+    download serializes against, and the whole verification runs on
+    that one snapshot: a same-directory atomic replacement racing the
+    read is observed as either the complete old combination or the
+    complete new one, never a mix of two versions. The tag is
+    recomputed from the raw checkpoint bytes first and a mismatch fails
+    immediately, before any further parsing. The proof file is then
+    read under the same lock and both files are checked as UTF-8 JSON
+    (negative-zero and non-finite number literals are format errors),
+    the checkpoint passes the complete anchor-chain validation, and the
+    proof passes the same offline checks :func:`verify` applies --
+    embedded log bytes, query parameters, recomputed page, cursor and
+    root digest, with the generation, anchor and closed state taken
+    from the checkpoint snapshot in hand. Nothing is rewritten.
+
+    Returns the same result dict as :func:`verify`. A missing file
+    raises ``FileNotFoundError``; an encoding, JSON or structural error
+    in either file raises ``ValueError``; a tag, digest-chain,
+    generation, anchor, closed-state or page mismatch raises
+    ``_MismatchError`` (also a ``ValueError``); every other locking or
+    I/O failure raises ``OSError``.
+    """
+    for value in (checkpoint_path, proof_path):
+        if not isinstance(value, str) or not value:
+            raise ValueError("checkpoint_path and proof_path must be "
+                             "non-empty strings")
+    if not isinstance(etag, str) or not _ETAG_RE.fullmatch(etag):
+        raise ValueError("etag must be a single strong tag: a quoted "
+                         "64-digit lowercase hexadecimal digest")
+
+    checkpoint_real = os.path.realpath(checkpoint_path)
+    proof_real = os.path.realpath(proof_path)
+    with _file_lock(checkpoint_real, shared=True):
+        # One locked section for the whole bundle: the bytes whose tag
+        # is recomputed are the bytes that are parsed, and the proof is
+        # checked against that same snapshot.
+        with open(checkpoint_real, "rb") as handle:
+            raw = handle.read()
+        if etag[1:-1] != hashlib.sha256(raw).hexdigest():
+            raise _MismatchError("checkpoint bytes do not match the etag")
+        generations = _validate_checkpoint(_loads_bundle(raw))
+        with open(proof_real, "rb") as handle:
+            proof_raw = handle.read()
+        clean = _validate_proof(_loads_bundle(proof_raw))
+        return _verify_proof(generations, clean, checkpoint_real)
 
 
 def read_snapshot(checkpoint_path: str) -> tuple[bytes, str]:

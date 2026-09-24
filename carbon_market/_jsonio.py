@@ -13,7 +13,7 @@ from __future__ import annotations
 
 import json
 
-__all__ = ["strict_loads"]
+__all__ = ["strict_loads", "finite_loads"]
 
 
 def _is_negative_zero(token: str) -> bool:
@@ -41,3 +41,15 @@ def _parse_float(token: str) -> float:
 def strict_loads(text: str) -> object:
     """Parse JSON, raising ValueError on negative-zero number literals."""
     return json.loads(text, parse_int=_parse_int, parse_float=_parse_float)
+
+
+def _reject_constant(token: str) -> float:
+    # Only NaN/Infinity/-Infinity reach the constant hook; they are not
+    # finite numbers and never valid in a verified document.
+    raise ValueError("non-finite number literal is not allowed")
+
+
+def finite_loads(text: str) -> object:
+    """Parse JSON like strict_loads, also rejecting non-finite literals."""
+    return json.loads(text, parse_int=_parse_int, parse_float=_parse_float,
+                      parse_constant=_reject_constant)

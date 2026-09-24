@@ -1,8 +1,10 @@
 from __future__ import annotations
 
 import argparse
+import json
+import sys
 
-from . import auth
+from . import audit_proof, auth
 from .server import serve
 
 
@@ -13,6 +15,14 @@ class _Once(argparse.Action):
         if getattr(namespace, self.dest, None) is not None:
             parser.error(f"{option_string} must not be given more than once")
         setattr(namespace, self.dest, values)
+
+
+class _UsageError(Exception):
+    """A verify-bundle usage error, reported as invalid_request."""
+
+
+def _raise_usage(message: str) -> None:
+    raise _UsageError(message)
 
 
 def parser() -> argparse.ArgumentParser:
@@ -35,12 +45,69 @@ def parser() -> argparse.ArgumentParser:
         "--checkpoint", action=_Once,
         help="proof checkpoint file to expose at GET /audit/proof, "
              "requires --audit")
+    bundle = subcommands.add_parser(
+        "verify-bundle",
+        help="verify a downloaded checkpoint/proof pair offline")
+    bundle.add_argument(
+        "--checkpoint", action=_Once, required=True,
+        help="downloaded checkpoint file")
+    bundle.add_argument(
+        "--proof", action=_Once, required=True,
+        help="downloaded proof file")
+    bundle.add_argument(
+        "--etag", action=_Once, required=True,
+        help="strong ETag the checkpoint download carried")
+    # Usage errors of this command surface as the compact invalid_request
+    # failure object on stderr, not as argparse's usage text.
+    bundle.error = _raise_usage
     return command
+
+
+def _fail(code: str, status: int) -> None:
+    # Failure objects are a single compact JSON line on stderr and never
+    # carry paths, system messages or input content; stdout stays empty.
+    sys.stderr.write(json.dumps({"error": code}, separators=(",", ":"))
+                     + "\n")
+    raise SystemExit(status)
+
+
+def _verify_bundle(args: argparse.Namespace) -> None:
+    # All three options are required and may appear at most once
+    # (argparse enforces both); an empty value or a tag that is not one
+    # quoted 64-digit lowercase digest is a usage error too, and no
+    # argument error may read the input files.
+    if not args.checkpoint or not args.proof or not args.etag \
+            or not audit_proof._ETAG_RE.fullmatch(args.etag):
+        _fail("invalid_request", 2)
+    try:
+        result = audit_proof.verify_bundle(
+            args.checkpoint, args.proof, args.etag)
+        payload = json.dumps(
+            {"valid": True, "etag": args.etag,
+             "generation": result["generation"],
+             "closed": result["closed"],
+             "events": result["events"], "next": result["next"]},
+            ensure_ascii=False, separators=(",", ":"), allow_nan=False)
+    except audit_proof._MismatchError:
+        _fail("verification_failed", 4)
+    except ValueError:
+        _fail("invalid_bundle", 3)
+    except OSError:
+        _fail("bundle_unavailable", 5)
+    # Success: one compact UTF-8 JSON line on stdout; stderr stays empty.
+    sys.stdout.write(payload + "\n")
 
 
 def main() -> None:
     command = parser()
-    args = command.parse_args()
+    try:
+        if sys.argv[1:2] == ["verify-bundle"]:
+            # Extras left over after the subcommand are reported by the
+            # top-level parser; route them to the same failure object.
+            command.error = _raise_usage
+        args = command.parse_args()
+    except _UsageError:
+        _fail("invalid_request", 2)
     if args.command == "serve":
         # --audit pairs with exactly one authorization method: the
         # single --token or the multi-token --auth file. Both omitted
@@ -75,6 +142,8 @@ def main() -> None:
                 command.error(f"invalid --auth file: {exc}")
         serve(args.host, args.port, audit_path=args.audit, token=args.token,
               auth=args.auth, checkpoint=args.checkpoint)
+    elif args.command == "verify-bundle":
+        _verify_bundle(args)
 
 
 if __name__ == "__main__":
