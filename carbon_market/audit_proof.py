@@ -93,7 +93,7 @@ from typing import Any, Iterator
 from . import audit
 from ._jsonio import strict_loads
 
-__all__ = ["export", "verify"]
+__all__ = ["export", "verify", "read_snapshot"]
 
 _VERSION = 1
 _ROOT_FIELDS = ("version", "generations")
@@ -728,3 +728,51 @@ def verify(checkpoint_path: str, proof: dict[str, Any]) -> dict[str, Any]:
             "next": clean["result"]["next"],
             "generation": clean["generation"],
             "closed": anchor["closed"]}
+
+
+def read_snapshot(checkpoint_path: str) -> tuple[bytes, str]:
+    """Read the fixed checkpoint for a conditional, read-only download.
+
+    The checkpoint is opened under the *same* shared kernel flock an
+    export uses, so a concurrent exporter serializes against the read
+    and the caller observes either the complete old file or the
+    complete new one, never a half-replaced document. The raw bytes are
+    read, decoded as UTF-8, parsed and structurally validated -- the
+    whole anchor/digest chain included -- and the SHA-256 of the exact
+    response bytes is computed, all while the shared lock is held. The
+    bytes themselves are returned untouched: the caller serves them
+    verbatim, never re-serialized.
+
+    ``checkpoint_path`` must be a non-empty string (a bad argument
+    raises ``ValueError`` before any file is read). A missing
+    checkpoint raises ``FileNotFoundError``; bytes that are not valid
+    UTF-8 or JSON, or a checkpoint whose version, field order,
+    generation names, anchors or digest chain do not validate, raise
+    ``ValueError``; every other locking or I/O failure raises
+    ``OSError``.
+    """
+    if not isinstance(checkpoint_path, str) or not checkpoint_path:
+        raise ValueError("checkpoint_path must be a non-empty string")
+
+    checkpoint_real = os.path.realpath(checkpoint_path)
+    with _file_lock(checkpoint_real, shared=True):
+        # Open, read, validate and hash under one shared lock: the
+        # bytes the ETag summarizes are the validated bytes and both
+        # come from the same complete file version.
+        with open(checkpoint_real, "rb") as handle:
+            raw = handle.read()
+        try:
+            text = raw.decode("utf-8")
+        except UnicodeDecodeError as exc:
+            raise ValueError(
+                f"checkpoint file {checkpoint_real!r} is not valid UTF-8"
+            ) from exc
+        try:
+            data = strict_loads(text)
+        except ValueError as exc:
+            raise ValueError(
+                f"checkpoint file {checkpoint_real!r} is not valid JSON"
+            ) from exc
+        _validate_checkpoint(data)
+        etag = hashlib.sha256(raw).hexdigest()
+    return raw, etag

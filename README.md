@@ -51,6 +51,17 @@ python -m carbon_market serve --host 127.0.0.1 --port 8000 --audit PATH --token 
 
 The same authorization as `GET /audit` applies, in the same order (401/403, 400 `invalid_request`, scoped filters 403, 503 `auth_unavailable`). The query takes a mandatory non-empty `generation` name, an optional `final` flag (exactly `true` or `false`, defaulting to `false`) and the usual `cursor`, `limit`, `op`, `stage` and `key` filters. A successful export answers 200 with the offline-savable proof object, its page computed from the same journal snapshot the proof seals. A missing journal or checkpoint parent directory gets 404 `proof_not_found` (the real paths never leak); an invalid chain, checkpoint, generation state or growth relation gets 409 `proof_invalid` and appends no anchor; locking or I/O failures get 503 `proof_unavailable` with the old checkpoint preserved.
 
+## Checkpoint snapshot endpoint
+
+With `--checkpoint` configured, `GET /audit/checkpoint` offers the fixed checkpoint file itself as a read-only, conditionally cached download. The endpoint takes no path or query parameters: the response always comes from the one `CPATH` fixed at startup, so a client can neither select nor probe a location.
+
+Authorization follows the same order as the other audit endpoints: a missing, blank or duplicated `X-Audit-Token` is 401 `unauthorized`; an unknown or expired token is 403 `forbidden`; an authorization configuration that cannot be read or validated at request time is 503 `auth_unavailable` with no configuration detail in the body. A multi-token record may download only when its operation, stage and history-key scopes are all `*`; any restricted scope gets 403.
+
+The optional `If-None-Match` header may be omitted or appear exactly once as a single strong tag — one double-quoted string of 64 lowercase hexadecimal digits. A blank, duplicated or malformed conditional header gets 400 `invalid_request` and never opens the checkpoint; the same goes for any query string. The response on success (200) is the checkpoint's original UTF-8 bytes, served verbatim with `Content-Type: application/json` — never re-serialized — and an `ETag` that is the lowercase SHA-256 of the complete response bytes in strong-tag form (`"<64 hex>"`). When the conditional value equals the current ETag the answer is 304 with an empty body and the same ETag; otherwise it is 200 with the full bytes, and both decisions are made from one validated snapshot.
+
+The bytes are read under the same checkpoint lock exports use (shared), held from open through validation and ETag computation, so a request racing an export observes only a complete old or complete new version. A missing checkpoint gets 404 `checkpoint_not_found`; bytes that are not valid UTF-8 or JSON, or a checkpoint with an illegal version, field order, anchor or digest chain, get 409 `checkpoint_invalid` with a body of only `{"error":...}`; other I/O failures get 503 `checkpoint_unavailable`. Real paths and system messages never appear in an error. Without `--checkpoint` the path remains a plain 404 like any other unknown path.
+
+
 ## Test
 
 ```bash

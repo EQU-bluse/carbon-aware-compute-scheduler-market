@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hmac
 import json
+import re
 import urllib.parse
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -17,6 +18,11 @@ _PROOF_PARAMS = ("generation", "final") + _AUDIT_PARAMS
 _OPS = ("copy", "restore")
 _STAGES = ("成功", "校验", "执行", "同步", "回滚")
 _MAX_LIMIT = 1000
+# A conditional download accepts exactly one strong entity tag: one
+# double-quoted string of 64 lowercase hexadecimal digits, the SHA-256
+# of the full validated response bytes. Weak tags, lists, wildcards and
+# surrounding whitespace are invalid requests.
+_ETAG_RE = re.compile(r'"[0-9a-f]{64}"')
 
 
 def _decode_component(text: str) -> str:
@@ -90,6 +96,12 @@ class Handler(BaseHTTPRequestHandler):
         if path == "/audit/proof" \
                 and getattr(self.server, "audit_checkpoint", None) is not None:
             self._proof(query)
+            return
+        if path == "/audit/checkpoint" \
+                and getattr(self.server, "audit_checkpoint", None) is not None:
+            # The endpoint takes no parameters: the snapshot is always
+            # the one checkpoint file fixed at startup.
+            self._checkpoint(query)
             return
         self._json(HTTPStatus.NOT_FOUND, {"error": "not_found"})
 
@@ -212,8 +224,79 @@ class Handler(BaseHTTPRequestHandler):
         else:
             self._json(HTTPStatus.OK, proof)
 
+    def _checkpoint(self, query: str) -> None:
+        authorized, record = self._authorize()
+        if not authorized:
+            return
+
+        # The snapshot entry takes no query parameters; any query string
+        # fails the same "unknown, repeated or empty parameter" parsing
+        # used by the other endpoints.
+        try:
+            _parse_query(query, ())
+        except ValueError:
+            self._json(HTTPStatus.BAD_REQUEST, {"error": "invalid_request"})
+            return
+
+        # The conditional header is validated before the checkpoint is
+        # ever opened: absent (allowed) or exactly one strong tag of the
+        # documented shape. A blank value, a repeated header, a weak tag,
+        # a list, a wildcard or any other shape is an invalid request.
+        conditions = self.headers.get_all("If-None-Match")
+        condition: str | None = None
+        if conditions is not None:
+            if len(conditions) != 1 or not _ETAG_RE.fullmatch(conditions[0]):
+                self._json(HTTPStatus.BAD_REQUEST,
+                           {"error": "invalid_request"})
+                return
+            condition = conditions[0][1:-1]
+
+        # A scoped token may only audit through its filters; downloading
+        # the whole snapshot requires unrestricted scope on every axis.
+        if record is not None and (record.ops is not None
+                                   or record.stages is not None
+                                   or record.keys is not None):
+            self._json(HTTPStatus.FORBIDDEN, {"error": "forbidden"})
+            return
+
+        try:
+            body, etag = audit_proof.read_snapshot(
+                getattr(self.server, "audit_checkpoint"))
+        except FileNotFoundError:
+            # Never leak the configured path or a system message.
+            self._json(HTTPStatus.NOT_FOUND,
+                       {"error": "checkpoint_not_found"})
+        except ValueError:
+            self._json(HTTPStatus.CONFLICT, {"error": "checkpoint_invalid"})
+        except OSError:
+            self._json(HTTPStatus.SERVICE_UNAVAILABLE,
+                       {"error": "checkpoint_unavailable"})
+        else:
+            # The 304 decision uses the ETag of the same validated bytes
+            # a 200 would serve, so a concurrent export can never mix an
+            # old tag with a new body.
+            if condition == etag:
+                self._raw(HTTPStatus.NOT_MODIFIED, b"", etag)
+            else:
+                self._raw(HTTPStatus.OK, body, etag)
+
+    def _raw(self, status: HTTPStatus, body: bytes, etag: str) -> None:
+        # The snapshot bytes are served verbatim -- the original UTF-8
+        # written by the exporter, with its field order intact -- and the
+        # tag is the strong SHA-256 of those exact bytes.
+        self.send_response(status)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("ETag", f'"{etag}"')
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        if body:
+            self.wfile.write(body)
+
     def _json(self, status: HTTPStatus, payload: object) -> None:
-        body = json.dumps(payload, separators=(",", ":")).encode("utf-8")
+        # Compact JSON with non-ASCII written through as direct UTF-8 and
+        # no trailing newline, matching the persistent files' convention.
+        body = json.dumps(payload, ensure_ascii=False,
+                          separators=(",", ":")).encode("utf-8")
         self.send_response(status)
         self.send_header("Content-Type", "application/json")
         self.send_header("Content-Length", str(len(body)))
