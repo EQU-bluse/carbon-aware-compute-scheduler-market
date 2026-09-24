@@ -192,7 +192,8 @@ class ProofHttpTest(_HttpFixture):
         self.assertEqual(list(body),
                          ["version", "generation", "params", "result",
                           "log_bytes", "log_digest", "head", "closed",
-                          "anchor_digest"])
+                          "anchor_digest", "checkpoint_etag"])
+        self.assertEqual(body["version"], 2)
         self.assertEqual(body["generation"], "g1")
         self.assertIs(body["closed"], False)
         self.assertEqual(body["params"],
@@ -202,8 +203,14 @@ class ProofHttpTest(_HttpFixture):
                          ["a", "b"])
         self.assertEqual(body["log_bytes"],
                          open(self.journal, encoding="utf-8").read())
-        # The checkpoint was created and the proof verifies offline.
+        # The checkpoint was created and the proof binds its snapshot:
+        # the strong tag of the exact checkpoint bytes, quoted exactly
+        # as the checkpoint download's ETag header carries it.
         self.assertEqual(len(self._anchors()), 1)
+        raw = open(self.checkpoint, "rb").read()
+        self.assertEqual(body["checkpoint_etag"],
+                         '"' + hashlib.sha256(raw).hexdigest() + '"')
+        # ... and the proof verifies offline.
         result = audit_proof.verify(self.checkpoint, body)
         self.assertEqual(result["generation"], "g1")
         self.assertEqual([key for key, _ in result["events"]], ["a", "b"])
@@ -237,6 +244,7 @@ class ProofHttpTest(_HttpFixture):
             "/audit/proof?generation=g1&final=true&limit=5")
         self.assertEqual(status, 200)
         self.assertEqual(again["anchor_digest"], body["anchor_digest"])
+        self.assertEqual(again["checkpoint_etag"], body["checkpoint_etag"])
         self.assertEqual(open(self.checkpoint, "rb").read(), before)
         # A closed generation rejects anything but the identical replay.
         status, body = self._auth_get("/audit/proof?generation=g1")
