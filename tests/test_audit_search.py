@@ -38,7 +38,7 @@ class RecordFieldOrderTest(unittest.TestCase):
         self.assertEqual(list(stored),
                          ["op", "target", "key", "changed", "error", "stage"])
         doc = json.loads(open(self.journal, encoding="utf-8").read())
-        self.assertEqual(list(doc["events"]["k"]),
+        self.assertEqual(list(doc["events"]["k"][0]),
                          ["op", "target", "key", "changed", "error", "stage"])
 
     def test_record_replay_matches_regardless_of_field_order(self) -> None:

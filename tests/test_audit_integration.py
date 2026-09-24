@@ -79,12 +79,15 @@ class AuditJournalOrderTest(unittest.TestCase):
         self.assertTrue(raw.endswith(b"\n"))
         self.assertFalse(raw.endswith(b"\n\n"))
         # Compact separators, non-ASCII written through, root field order.
-        self.assertIn(b'"version":1,"events"', raw)
+        self.assertIn(b'"version":2,"events"', raw)
         self.assertNotIn(b"\\u6821", raw)
         doc = json.loads(raw)
-        self.assertEqual(list(doc), ["version", "events"])
-        self.assertEqual(list(doc["events"]["z-key"]),
+        self.assertEqual(list(doc), ["version", "events", "head"])
+        sealed = doc["events"]["z-key"]
+        self.assertEqual(list(sealed[0]),
                          ["op", "target", "key", "changed", "error", "stage"])
+        self.assertIsNone(sealed[1])
+        self.assertEqual(doc["head"], sealed[2])
 
     def test_events_are_sorted_by_audit_key_code_point(self) -> None:
         audit.record(self.journal, "z", self.event)
@@ -443,9 +446,9 @@ class HistoryCopyAuditTest(_CopyFixture):
         keys = list(doc["events"])
         self.assertEqual(keys, sorted(keys))
         self.assertEqual(len(keys), 12)
-        for key, event in doc["events"].items():
-            self.assertEqual(event["error"], None)
-            self.assertIs(event["changed"], True)
+        for key, sealed in doc["events"].items():
+            self.assertEqual(sealed[0]["error"], None)
+            self.assertIs(sealed[0]["changed"], True)
 
 
 class _RestoreFixture(unittest.TestCase):
