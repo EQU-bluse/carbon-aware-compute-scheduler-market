@@ -10,6 +10,15 @@ both null, while a failed one names the exception class in ``error`` and
 the stage it failed at in ``stage`` -- one of ``"校验"``, ``"执行"``,
 ``"同步"`` and ``"回滚"``.
 
+Ordering is part of the on-disk contract, not just the serialization:
+when an existing journal is read (by :func:`record` before appending or
+by the strictly read-only :func:`get`), the two root fields must appear
+as version then events, the events member must list its keys in code
+point order, and each event must list its six fields in their canonical
+order. Any disorder is a malformed document and raises ``ValueError``;
+the reader never sorts an out-of-order document into acceptance, and the
+read-only query never rewrites the file to repair it.
+
 :func:`record` replays the event already stored under a key: the same
 key with the same event returns a copy of it together with ``False`` and
 writes nothing, while the same key with a different event is a conflict
@@ -104,10 +113,19 @@ def _file_lock(realpath: str, *, shared: bool = False) -> Iterator[None]:
         os.close(fd)
 
 
-def _validate_event(raw: object) -> dict[str, Any]:
+def _validate_event(raw: object, *, ordered: bool = False) -> dict[str, Any]:
+    # An event read from disk must carry its six fields in canonical
+    # order: json decodes objects into insertion-ordered dicts, so a
+    # reordered event on disk surfaces here as a disordered key list and
+    # is rejected rather than quietly rebuilt in order. An event handed to
+    # record() in memory is only required to carry the six fields exactly
+    # once; it is normalized into canonical order before being stored.
     if not isinstance(raw, dict) or set(raw.keys()) != set(_EVENT_FIELDS):
         raise ValueError("event must be an object with exactly op, target, "
                          "key, changed, error and stage")
+    if ordered and list(raw.keys()) != list(_EVENT_FIELDS):
+        raise ValueError("event fields must appear in order op, target, "
+                         "key, changed, error, stage")
     if raw["op"] not in _OPS:
         raise ValueError("event op must be copy or restore")
     for field in ("target", "key"):
@@ -132,10 +150,15 @@ def _validate_event(raw: object) -> dict[str, Any]:
     return {field: raw[field] for field in _EVENT_FIELDS}
 
 
-def _validate_document(data: object) -> dict[str, Any]:
+def _validate_document(data: object, *, ordered: bool = False) -> dict[str, Any]:
     if not isinstance(data, dict) or set(data.keys()) != set(_ROOT_FIELDS):
         raise ValueError("audit root must be an object with keys version "
                          "and events")
+    # A document read off disk must present its root fields version then
+    # events; the read never accepts a reordered file by sorting it first.
+    if ordered and list(data.keys()) != list(_ROOT_FIELDS):
+        raise ValueError("audit root fields must appear in order version, "
+                         "events")
 
     version = data["version"]
     # bool is a subclass of int and must be rejected as a version.
@@ -146,14 +169,20 @@ def _validate_document(data: object) -> dict[str, Any]:
     events_raw = data["events"]
     if not isinstance(events_raw, dict):
         raise ValueError("events must be an object")
+    # On disk the events member lists its keys in code-point order; any
+    # disorder is rejected rather than silently sorted into acceptance.
+    if ordered and list(events_raw.keys()) != sorted(events_raw):
+        raise ValueError("audit events must be ordered by key code point")
 
-    # The persisted form is keyed in code-point order; a document offered
-    # out of order is still semantically valid and is rebuilt sorted.
+    # New in-memory documents have no on-disk order to honor and are built
+    # sorted; a read document already proved its order above, so iterating
+    # in stored order either way yields the code-point order.
     events: dict[str, Any] = {}
-    for event_key in sorted(events_raw):
+    for event_key in events_raw:
         if not isinstance(event_key, str) or not event_key:
             raise ValueError("event keys must be non-empty strings")
-        events[event_key] = _validate_event(events_raw[event_key])
+        events[event_key] = _validate_event(
+            events_raw[event_key], ordered=ordered)
 
     return {"version": _VERSION, "events": events}
 
@@ -180,7 +209,7 @@ def _read_document(
     except ValueError as exc:
         raise ValueError(
             f"audit file {realpath!r} is not valid JSON") from exc
-    return _validate_document(data), raw
+    return _validate_document(data, ordered=True), raw
 
 
 def _serialize(events: dict[str, Any]) -> bytes:
@@ -375,9 +404,109 @@ def get(path: str, key: str) -> dict[str, Any]:
     except ValueError as exc:
         raise ValueError(
             f"audit file {realpath!r} is not valid JSON") from exc
-    document = _validate_document(data)
+    document = _validate_document(data, ordered=True)
 
     events = document["events"]
     if key not in events:
         raise KeyError(key)
     return dict(events[key])
+
+
+# -- integration with the history_copy / history_recovery entry points -----
+#
+# These helpers are the single bridge between an audited copy/restore and
+# the journal: they validate the optional (path, key) pair, snapshot the
+# target bytes so a failure event can report whether the target actually
+# moved, classify the stage an exception escaped from, and append the
+# outcome event. The entry points keep every one of their existing locks,
+# bytes and exceptions; the journal is a strictly separate file.
+
+def check_pair(
+    audit_path: object, audit_key: object
+) -> tuple[str, str] | None:
+    """Validate the optional audit ``(path, key)`` pair.
+
+    Both omitted (``None``) means auditing is disabled and returns ``None``
+    -- the operation then runs exactly as it does without audit support.
+    The pair must otherwise be given in full as two non-empty strings: a
+    single missing side, a non-string or an empty string is a caller error
+    raised before the operation begins.
+    """
+    if audit_path is None and audit_key is None:
+        return None
+    if (not isinstance(audit_path, str) or not audit_path
+            or not isinstance(audit_key, str) or not audit_key):
+        raise ValueError(
+            "audit_path and audit_key must be omitted together or both "
+            "given as non-empty strings")
+    return audit_path, audit_key
+
+
+def snapshot(path: str) -> bytes | None:
+    """Return a file's current bytes, or ``None`` when it does not exist.
+
+    A missing file is a state rather than an error here; ``None`` must
+    stay distinct from an empty file, so a failure event can tell a target
+    that was created (or deleted) by the operation from one that merely
+    changed content.
+    """
+    try:
+        with open(path, "rb") as handle:
+            return handle.read()
+    except FileNotFoundError:
+        return None
+
+
+def stage_for(exc: BaseException) -> str:
+    """Classify the stage an operation exception escaped from.
+
+    Argument, history-content, idempotency-key and recovery-copy failures,
+    including missing source/target/recovery files, are ``"校验"``; a
+    pre-existing target or a leftover recovery copy is ``"执行"``; the
+    first failure of a lock, temporary file, replace, unlink or fsync is
+    ``"同步"``; a compensation cleanup or rollback that then fails itself
+    -- always escaping chained after the first error -- is ``"回滚"``.
+
+    Validation ``ValueError``/``KeyError`` may legitimately carry a
+    ``__cause__`` (the underlying decode/parse error) and are classified
+    first; among ``OSError`` family, a chained exception is exactly the
+    "later error chained after the first" produced by a failed cleanup or
+    rollback, so it wins over the FileNotFound/FileExists buckets, which in
+    the copy/restore protocols are always raised unchained.
+    """
+    if isinstance(exc, (ValueError, KeyError)):
+        return "校验"
+    if isinstance(exc, OSError):
+        if exc.__cause__ is not None:
+            return "回滚"
+        if isinstance(exc, FileNotFoundError):
+            return "校验"
+        if isinstance(exc, FileExistsError):
+            return "执行"
+        return "同步"
+    # Every error the copy/restore entry points raise fits the buckets
+    # above; an unexpected one happened while the operation was executing.
+    return "执行"
+
+
+def emit(
+    audit_path: str,
+    audit_key: str,
+    *,
+    op: str,
+    target: str,
+    key: str,
+    changed: bool,
+    error: str | None,
+    stage: str | None,
+) -> None:
+    """Append one copy/restore outcome event under the audit key."""
+    event = {
+        "op": op,
+        "target": target,
+        "key": key,
+        "changed": changed,
+        "error": error,
+        "stage": stage,
+    }
+    record(audit_path, audit_key, event)

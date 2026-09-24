@@ -46,6 +46,7 @@ from __future__ import annotations
 import os
 import tempfile
 
+from . import audit as _audit
 from . import history as _history
 from . import recover_all as _recover_all
 from ._jsonio import strict_loads
@@ -166,6 +167,8 @@ def restore(
     target: str,
     key: str,
     fault: str | None = None,
+    audit_path: str | None = None,
+    audit_key: str | None = None,
 ) -> tuple[dict[str, object], bool]:
     """Restore the history at ``target`` from ``target + ".recovery"``.
 
@@ -202,7 +205,85 @@ def restore(
     that rollback itself fails, its ``OSError`` is raised with the first
     error as its ``__cause__``. Every other locking or I/O failure raises
     ``OSError``.
+
+    ``audit_path`` and ``audit_key`` are an optional pair, omitted together
+    or both given as non-empty strings (else ``ValueError`` before the
+    restore begins). When given, one result event keyed by ``audit_key`` is
+    appended to the audit journal before the call returns or re-raises:
+    success records op ``"restore"``, the target passed in, the history
+    ``key`` and the real change result (the returned ``changed``), with
+    error and stage null; failure records the final operation exception's
+    class name and its stage (``"校验"`` for parameter, history-content,
+    history-key, recovery-copy or missing-file failures, ``"执行"`` for a
+    leftover recovery-copy conflict, ``"同步"`` for the first
+    lock/temp/replace/unlink/fsync failure and ``"回滚"`` when a
+    compensation or rollback then fails), with ``changed`` computed from
+    whether the target bytes depart from their call-before state when the
+    exception leaves. The original exception and its chain leave unchanged
+    when the audit write succeeds; an audit failure of its own raises its
+    public exception, the history result retained, chained after the
+    operation error when the restore also failed. With the pair omitted the
+    restore behaves exactly as before.
     """
+    # The audit pair is checked before the operation begins: an unpaired
+    # side, a non-string or an empty value raises before any scalar
+    # validation or lock, and is not itself recorded.
+    audit = _audit.check_pair(audit_path, audit_key)
+    # A failure event carries the target and history key verbatim, so it
+    # can only be appended once those are valid non-empty strings; other
+    # parameter failures (a bad fault included) are recorded below as
+    # 校验 failures.
+    can_emit = (audit is not None
+                and isinstance(target, str) and bool(target)
+                and isinstance(key, str) and bool(key))
+
+    target_real = os.path.realpath(target) if can_emit else None
+    # Snapshot the target's call-before bytes (None when absent) so a
+    # failure event reports whether the target really departed from this
+    # state by the time the exception left.
+    before = _audit.snapshot(target_real) if can_emit else None
+
+    try:
+        summary, changed = _restore(target, key, fault)
+    except BaseException as exc:
+        if can_emit:
+            _record_failure(audit, target, key, target_real, before, exc)
+        raise
+    if can_emit:
+        _audit.emit(audit[0], audit[1], op="restore", target=target, key=key,
+                    changed=changed, error=None, stage=None)
+    return summary, changed
+
+
+def _record_failure(
+    audit: tuple[str, str],
+    target: str,
+    key: str,
+    target_real: str | None,
+    before: bytes | None,
+    exc: BaseException,
+) -> None:
+    # Append the failure outcome without altering the original exception:
+    # changed is whether the target bytes depart from the call-before
+    # snapshot by the time the exception leaves (a rolled-back failure
+    # therefore reports False). Should the audit write itself fail, its
+    # exception is raised chained after the operation error and whatever
+    # history result already formed stays on disk.
+    changed = (target_real is not None
+               and _audit.snapshot(target_real) != before)
+    try:
+        _audit.emit(audit[0], audit[1], op="restore", target=target, key=key,
+                    changed=changed, error=type(exc).__name__,
+                    stage=_audit.stage_for(exc))
+    except BaseException as audit_exc:
+        raise audit_exc from exc
+
+
+def _restore(
+    target: str,
+    key: str,
+    fault: str | None,
+) -> tuple[dict[str, object], bool]:
     if not isinstance(target, str) or not target:
         raise ValueError("target must be a non-empty string")
     if not isinstance(key, str) or not key:
