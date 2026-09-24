@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 
+from . import auth
 from .server import serve
 
 
@@ -26,6 +27,10 @@ def parser() -> argparse.ArgumentParser:
     server.add_argument(
         "--token", action=_Once,
         help="token clients must send in the X-Audit-Token header")
+    server.add_argument(
+        "--auth", action=_Once,
+        help="multi-token scoped authorization file for GET /audit, "
+             "exclusive with --token")
     return command
 
 
@@ -33,14 +38,34 @@ def main() -> None:
     command = parser()
     args = command.parse_args()
     if args.command == "serve":
-        # --audit and --token are a pair: both omitted keeps GET /audit a
-        # plain 404; only one, an empty value or a repeated option is a
-        # usage error and exits with argparse's status 2.
-        if (args.audit is None) != (args.token is None):
-            command.error("--audit and --token must be given together")
-        if args.audit is not None and (not args.audit or not args.token):
-            command.error("--audit and --token must be non-empty")
-        serve(args.host, args.port, audit_path=args.audit, token=args.token)
+        # --audit pairs with exactly one authorization method: the
+        # single --token or the multi-token --auth file. Both omitted
+        # keeps GET /audit a plain 404; --audit without a method, a
+        # method without --audit, both methods at once, an empty value
+        # or a repeated option is a usage error and exits with
+        # argparse's status 2.
+        if args.audit is None:
+            if args.token is not None or args.auth is not None:
+                command.error("--token and --auth require --audit")
+        else:
+            if not args.audit:
+                command.error("--audit must be non-empty")
+            if (args.token is None) == (args.auth is None):
+                command.error(
+                    "--audit requires exactly one of --token and --auth")
+            if args.token is not None and not args.token:
+                command.error("--token must be non-empty")
+            if args.auth is not None and not args.auth:
+                command.error("--auth must be non-empty")
+        if args.auth:
+            # The whole configuration is validated before the port is
+            # bound; any failure is a usage error with status 2.
+            try:
+                auth.load(args.auth)
+            except (OSError, ValueError) as exc:
+                command.error(f"invalid --auth file: {exc}")
+        serve(args.host, args.port, audit_path=args.audit, token=args.token,
+              auth=args.auth)
 
 
 if __name__ == "__main__":

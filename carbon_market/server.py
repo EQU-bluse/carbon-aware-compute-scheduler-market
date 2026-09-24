@@ -6,7 +6,7 @@ import urllib.parse
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
-from . import audit
+from . import audit, auth
 
 # Query parameters GET /audit accepts; anything else is an invalid request.
 _AUDIT_PARAMS = ("cursor", "limit", "op", "stage", "key")
@@ -72,15 +72,45 @@ class Handler(BaseHTTPRequestHandler):
         if tokens is None or len(tokens) != 1 or not tokens[0].strip():
             self._json(HTTPStatus.UNAUTHORIZED, {"error": "unauthorized"})
             return
-        expected = getattr(self.server, "audit_token").encode("utf-8")
-        if not hmac.compare_digest(tokens[0].encode("utf-8"), expected):
-            self._json(HTTPStatus.FORBIDDEN, {"error": "forbidden"})
-            return
+
+        record: auth.Record | None = None
+        auth_path = getattr(self.server, "audit_auth", None)
+        if auth_path is not None:
+            # Multi-token mode: the configuration is re-read on every
+            # request, so a same-directory atomic replacement rotates
+            # tokens without a restart and each request sees either the
+            # complete old or the complete new configuration. A file
+            # that can no longer be read or validated makes
+            # authorization itself unavailable.
+            try:
+                records = auth.load(auth_path)
+            except (OSError, ValueError):
+                self._json(HTTPStatus.SERVICE_UNAVAILABLE,
+                           {"error": "auth_unavailable"})
+                return
+            # An unknown digest and a token past its grace cutoff are
+            # indistinguishable: both are a plain 403.
+            record = auth.identify(records, tokens[0])
+            if record is None:
+                self._json(HTTPStatus.FORBIDDEN, {"error": "forbidden"})
+                return
+        else:
+            expected = getattr(self.server, "audit_token").encode("utf-8")
+            if not hmac.compare_digest(tokens[0].encode("utf-8"), expected):
+                self._json(HTTPStatus.FORBIDDEN, {"error": "forbidden"})
+                return
 
         try:
             params = _parse_audit_params(query)
         except ValueError:
             self._json(HTTPStatus.BAD_REQUEST, {"error": "invalid_request"})
+            return
+
+        # Scope checks follow parameter validation and precede any access
+        # to the journal: a forbidden request never opens the audit file
+        # and never learns about records, token names or the configuration.
+        if record is not None and not auth.scope_allows(record, params):
+            self._json(HTTPStatus.FORBIDDEN, {"error": "forbidden"})
             return
 
         kwargs: dict[str, object] = {}
@@ -116,8 +146,9 @@ class Handler(BaseHTTPRequestHandler):
 
 
 def serve(host: str, port: int, audit_path: str | None = None,
-          token: str | None = None) -> None:
+          token: str | None = None, auth: str | None = None) -> None:
     with ThreadingHTTPServer((host, port), Handler) as server:
         server.audit_path = audit_path  # type: ignore[attr-defined]
         server.audit_token = token  # type: ignore[attr-defined]
+        server.audit_auth = auth  # type: ignore[attr-defined]
         server.serve_forever()
