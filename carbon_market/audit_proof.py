@@ -40,8 +40,10 @@ generations, and a new generation can only be created once the previous
 one is closed. Within one generation every export must
 preserve the already anchored events key by key and digest by digest; a
 snapshot may keep the same manifest (a re-query, or a byte-preserving
-log rotation) or add new keys, but a deletion, a rewrite of a known
-event or a retreat raises ``ValueError`` and appends nothing. An export
+log rotation) or add new keys -- which may land anywhere in code-point
+order, since the anchored pairs are compared key by key, not by
+position -- but a deletion, a rewrite of a known event or a retreat
+raises ``ValueError`` and appends nothing. An export
 identical in manifest, log digest, head and closed state is a duplicate:
 it appends no anchor and returns a proof naming that same anchor, no
 matter which query it carried. Passing ``final=True`` closes the current
@@ -214,16 +216,19 @@ def _validate_manifest(raw: object) -> list[list[Any]]:
 
 def _check_extension(old_manifest: list[list[Any]],
                      new_manifest: list[list[Any]]) -> None:
-    # The old snapshot must survive item by item; only appended keys are
-    # allowed. Fewer entries (retreat), a changed [key, digest] pair
-    # (rewrite) or an inserted/reordered key all surface here. Equal
-    # manifests (re-query or byte-level log rotation with same events)
-    # are permitted by the caller and never reach this check.
+    # The old snapshot must survive key by key: every anchored key keeps
+    # its exact digest, while new keys may land anywhere in code-point
+    # order -- the manifests are compared as key/digest pairs, not by
+    # position. Fewer entries (retreat), a missing old key (deletion) or
+    # a changed digest under a known key (rewrite) all surface here.
+    # Equal manifests (re-query or byte-level log rotation with same
+    # events) are permitted by the caller and never reach this check.
     if len(new_manifest) <= len(old_manifest):
         raise ValueError("a generation only accepts snapshots that add new "
                          "audit events")
-    for index, item in enumerate(old_manifest):
-        if new_manifest[index] != item:
+    new_digests = {audit_key: digest for audit_key, digest in new_manifest}
+    for audit_key, digest in old_manifest:
+        if new_digests.get(audit_key) != digest:
             raise ValueError("a generation cannot rewrite, delete or "
                              "reorder an already anchored event")
 
@@ -311,8 +316,9 @@ def _validate_checkpoint(data: object) -> list[dict[str, Any]]:
                                      "inside its generation")
                 # Consecutive anchors either pin the same manifest (a
                 # byte-level log rotation with the events intact, or the
-                # closing anchor flipping the closed flag) or strictly
-                # extend it; anything else is a rewrite.
+                # closing anchor flipping the closed flag) or extend it
+                # with new keys anywhere in code-point order while every
+                # anchored pair survives; anything else is a rewrite.
                 if manifest == earlier["manifest"]:
                     if head != earlier["head"]:
                         raise ValueError("a same-snapshot anchor cannot "

@@ -41,6 +41,16 @@ python -m carbon_market serve --host 127.0.0.1 --port 8000 --audit PATH --auth C
 
 The whole file is validated at startup (any error exits with status 2 without listening) and re-read on every request, so a same-directory atomic replacement rotates tokens without a restart: add the new digest and set a grace cutoff on the old one. A configuration that cannot be read or validated after startup answers 503 `auth_unavailable`. Unknown or expired tokens get 403; a valid token whose request lacks a required in-scope filter gets 403 as well, after query-parameter validation (400) and before the audit file is ever opened.
 
+## Proof export endpoint
+
+```bash
+python -m carbon_market serve --host 127.0.0.1 --port 8000 --audit PATH --token TOKEN --checkpoint CPATH
+```
+
+`--checkpoint` enables `GET /audit/proof`, the online export of `audit_proof.export` against the fixed checkpoint `CPATH`; it may only be given together with `--audit` (alone, empty or repeated it is a usage error, exit status 2). Without it the proof path stays a plain 404 like any other unknown path. Clients can never select the audit or checkpoint file through the query.
+
+The same authorization as `GET /audit` applies, in the same order (401/403, 400 `invalid_request`, scoped filters 403, 503 `auth_unavailable`). The query takes a mandatory non-empty `generation` name, an optional `final` flag (exactly `true` or `false`, defaulting to `false`) and the usual `cursor`, `limit`, `op`, `stage` and `key` filters. A successful export answers 200 with the offline-savable proof object, its page computed from the same journal snapshot the proof seals. A missing journal or checkpoint parent directory gets 404 `proof_not_found` (the real paths never leak); an invalid chain, checkpoint, generation state or growth relation gets 409 `proof_invalid` and appends no anchor; locking or I/O failures get 503 `proof_unavailable` with the old checkpoint preserved.
+
 ## Test
 
 ```bash

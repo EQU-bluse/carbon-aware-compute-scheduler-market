@@ -235,6 +235,47 @@ class AppendAndGenerationTest(_Fixture):
         self._verify(p1)
         self._verify(p2)
 
+    def _extend_checkpoint(self, manifest: list) -> None:
+        # Append a hand-built second anchor carrying ``manifest`` to the
+        # single-anchor checkpoint, keeping the anchor chain intact.
+        doc = self._checkpoint()
+        anchor = doc["generations"][0]["anchors"][0]
+        following = dict(anchor, manifest=manifest,
+                         previous=anchor["digest"])
+        following["digest"] = audit_proof._anchor_digest(
+            manifest, anchor["log_digest"], anchor["head"],
+            anchor["digest"], False)
+        doc["generations"][0]["anchors"].append(following)
+        _write_bytes(self.checkpoint,
+                     (json.dumps(doc, ensure_ascii=False,
+                                 separators=(",", ":")) + "\n").encode())
+
+    def test_new_keys_may_land_anywhere_in_code_point_order(self) -> None:
+        # Growth is judged key by key: a checkpoint whose second anchor
+        # inserts "b" between the anchored "a" and "c" -- every old
+        # [key, digest] pair intact -- is a valid extension.
+        self._record_all("a", "c")
+        proof = self._export()
+        manifest = self._anchors()[0]["manifest"]
+        self._extend_checkpoint(
+            [manifest[0], ["b", "0" * 64], manifest[1]])
+        # The extended checkpoint validates, so the old proof verifies.
+        self.assertEqual(
+            [item[0] for item in self._verify(proof)["events"]], ["a", "c"])
+
+    def test_inserted_key_cannot_rewrite_a_known_digest(self) -> None:
+        self._record_all("a", "c")
+        proof = self._export()
+        manifest = self._anchors()[0]["manifest"]
+        # "c" keeps its key but its digest changed: a rewrite, not growth.
+        self._extend_checkpoint(
+            [manifest[0], ["b", "0" * 64], ["c", "1" * 64]])
+        with self.assertRaises(ValueError):
+            self._export()
+        # The malformed checkpoint fails verification as well.
+        with self.assertRaises(ValueError):
+            self._verify(proof)
+
 
 class FinalCloseTest(_Fixture):
     def test_final_appends_closing_anchor_pinning_same_snapshot(self) -> None:
