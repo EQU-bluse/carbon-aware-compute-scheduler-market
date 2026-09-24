@@ -6,10 +6,13 @@ import urllib.parse
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
-from . import audit, auth
+from . import audit, audit_proof, auth
 
 # Query parameters GET /audit accepts; anything else is an invalid request.
 _AUDIT_PARAMS = ("cursor", "limit", "op", "stage", "key")
+# GET /audit/proof additionally takes the mandatory generation name and
+# the optional closing flag; clients never pass file paths.
+_PROOF_PARAMS = ("generation", "final") + _AUDIT_PARAMS
 _OPS = ("copy", "restore")
 _STAGES = ("成功", "校验", "执行", "同步", "回滚")
 _MAX_LIMIT = 1000
@@ -24,7 +27,7 @@ def _decode_component(text: str) -> str:
         raise ValueError("query component is not valid UTF-8") from exc
 
 
-def _parse_audit_params(query: str) -> dict[str, str]:
+def _parse_query(query: str, allowed: tuple[str, ...]) -> dict[str, str]:
     # Every parameter must be one of the allowed names, appear at most once
     # and carry a non-empty value; anything else is an invalid request.
     params: dict[str, str] = {}
@@ -34,12 +37,15 @@ def _parse_audit_params(query: str) -> dict[str, str]:
         name, _, value = piece.partition("=")
         name = _decode_component(name)
         value = _decode_component(value)
-        if name not in _AUDIT_PARAMS or name in params or not value:
+        if name not in allowed or name in params or not value:
             raise ValueError(f"invalid query parameter: {name!r}")
         params[name] = value
+    return params
 
-    limit = params.get("limit")
-    if limit is not None:
+
+def _check_filters(params: dict[str, str]) -> None:
+    if "limit" in params:
+        limit = params["limit"]
         if not all("0" <= char <= "9" for char in limit):
             raise ValueError("limit must be a decimal integer")
         if not 1 <= int(limit) <= _MAX_LIMIT:
@@ -48,6 +54,23 @@ def _parse_audit_params(query: str) -> dict[str, str]:
         raise ValueError('op must be "copy" or "restore"')
     if "stage" in params and params["stage"] not in _STAGES:
         raise ValueError("stage must be one of 成功, 校验, 执行, 同步, 回滚")
+
+
+def _parse_audit_params(query: str) -> dict[str, str]:
+    params = _parse_query(query, _AUDIT_PARAMS)
+    _check_filters(params)
+    return params
+
+
+def _parse_proof_params(query: str) -> dict[str, str]:
+    # The generation name is mandatory; the closing flag accepts exactly
+    # "true" or "false" and defaults to false when omitted.
+    params = _parse_query(query, _PROOF_PARAMS)
+    if "generation" not in params:
+        raise ValueError("generation is required")
+    if "final" in params and params["final"] not in ("true", "false"):
+        raise ValueError('final must be "true" or "false"')
+    _check_filters(params)
     return params
 
 
@@ -59,21 +82,26 @@ class Handler(BaseHTTPRequestHandler):
             self._json(HTTPStatus.OK, {"status": "ok"})
             return
         path, _, query = self.path.partition("?")
-        if path == "/audit" \
-                and getattr(self.server, "audit_path", None) is not None:
-            self._audit(query)
-            return
+        if getattr(self.server, "audit_path", None) is not None:
+            if path == "/audit":
+                self._audit(query)
+                return
+            if path == "/audit/proof" \
+                    and getattr(self.server, "audit_checkpoint", None) \
+                    is not None:
+                self._proof(query)
+                return
         self._json(HTTPStatus.NOT_FOUND, {"error": "not_found"})
 
-    def _audit(self, query: str) -> None:
+    def _authorize(self) -> tuple[bool, "auth.Record | None"]:
         # Authorization comes first: an unauthorized request learns nothing
-        # about the query, the configured path or the journal's state.
+        # about the query, the configured paths or the journal's state.
+        # Returns False once an error response was sent.
         tokens = self.headers.get_all("X-Audit-Token")
         if tokens is None or len(tokens) != 1 or not tokens[0].strip():
             self._json(HTTPStatus.UNAUTHORIZED, {"error": "unauthorized"})
-            return
+            return False, None
 
-        record: auth.Record | None = None
         auth_path = getattr(self.server, "audit_auth", None)
         if auth_path is not None:
             # Multi-token mode: the configuration is re-read on every
@@ -87,18 +115,35 @@ class Handler(BaseHTTPRequestHandler):
             except (OSError, ValueError):
                 self._json(HTTPStatus.SERVICE_UNAVAILABLE,
                            {"error": "auth_unavailable"})
-                return
+                return False, None
             # An unknown digest and a token past its grace cutoff are
             # indistinguishable: both are a plain 403.
             record = auth.identify(records, tokens[0])
             if record is None:
                 self._json(HTTPStatus.FORBIDDEN, {"error": "forbidden"})
-                return
-        else:
-            expected = getattr(self.server, "audit_token").encode("utf-8")
-            if not hmac.compare_digest(tokens[0].encode("utf-8"), expected):
-                self._json(HTTPStatus.FORBIDDEN, {"error": "forbidden"})
-                return
+                return False, None
+            return True, record
+
+        expected = getattr(self.server, "audit_token").encode("utf-8")
+        if not hmac.compare_digest(tokens[0].encode("utf-8"), expected):
+            self._json(HTTPStatus.FORBIDDEN, {"error": "forbidden"})
+            return False, None
+        return True, None
+
+    @staticmethod
+    def _search_kwargs(params: dict[str, str]) -> dict[str, object]:
+        kwargs: dict[str, object] = {}
+        for name in ("cursor", "op", "stage", "key"):
+            if name in params:
+                kwargs[name] = params[name]
+        if "limit" in params:
+            kwargs["limit"] = int(params["limit"])
+        return kwargs
+
+    def _audit(self, query: str) -> None:
+        ok, record = self._authorize()
+        if not ok:
+            return
 
         try:
             params = _parse_audit_params(query)
@@ -113,15 +158,9 @@ class Handler(BaseHTTPRequestHandler):
             self._json(HTTPStatus.FORBIDDEN, {"error": "forbidden"})
             return
 
-        kwargs: dict[str, object] = {}
-        for name in ("cursor", "op", "stage", "key"):
-            if name in params:
-                kwargs[name] = params[name]
-        if "limit" in params:
-            kwargs["limit"] = int(params["limit"])
-
         try:
-            result = audit.search(getattr(self.server, "audit_path"), **kwargs)
+            result = audit.search(getattr(self.server, "audit_path"),
+                                  **self._search_kwargs(params))
         except FileNotFoundError:
             # Never leak the configured path or the system message.
             self._json(HTTPStatus.NOT_FOUND, {"error": "audit_not_found"})
@@ -132,6 +171,40 @@ class Handler(BaseHTTPRequestHandler):
                        {"error": "audit_unavailable"})
         else:
             self._json(HTTPStatus.OK, result)
+
+    def _proof(self, query: str) -> None:
+        # Same authorization, parameter and scope order as GET /audit;
+        # the export itself never reveals the configured paths.
+        ok, record = self._authorize()
+        if not ok:
+            return
+
+        try:
+            params = _parse_proof_params(query)
+        except ValueError:
+            self._json(HTTPStatus.BAD_REQUEST, {"error": "invalid_request"})
+            return
+
+        if record is not None and not auth.scope_allows(record, params):
+            self._json(HTTPStatus.FORBIDDEN, {"error": "forbidden"})
+            return
+
+        try:
+            proof = audit_proof.export(
+                getattr(self.server, "audit_path"),
+                getattr(self.server, "audit_checkpoint"),
+                params["generation"],
+                final=params.get("final") == "true",
+                **self._search_kwargs(params))
+        except FileNotFoundError:
+            self._json(HTTPStatus.NOT_FOUND, {"error": "proof_not_found"})
+        except ValueError:
+            self._json(HTTPStatus.CONFLICT, {"error": "proof_invalid"})
+        except OSError:
+            self._json(HTTPStatus.SERVICE_UNAVAILABLE,
+                       {"error": "proof_unavailable"})
+        else:
+            self._json(HTTPStatus.OK, proof)
 
     def _json(self, status: HTTPStatus, payload: object) -> None:
         body = json.dumps(payload, separators=(",", ":")).encode("utf-8")
@@ -146,9 +219,11 @@ class Handler(BaseHTTPRequestHandler):
 
 
 def serve(host: str, port: int, audit_path: str | None = None,
-          token: str | None = None, auth: str | None = None) -> None:
+          token: str | None = None, auth: str | None = None,
+          checkpoint: str | None = None) -> None:
     with ThreadingHTTPServer((host, port), Handler) as server:
         server.audit_path = audit_path  # type: ignore[attr-defined]
         server.audit_token = token  # type: ignore[attr-defined]
         server.audit_auth = auth  # type: ignore[attr-defined]
+        server.audit_checkpoint = checkpoint  # type: ignore[attr-defined]
         server.serve_forever()

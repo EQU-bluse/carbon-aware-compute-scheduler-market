@@ -40,7 +40,8 @@ generations, and a new generation can only be created once the previous
 one is closed. Within one generation every export must
 preserve the already anchored events key by key and digest by digest; a
 snapshot may keep the same manifest (a re-query, or a byte-preserving
-log rotation) or add new keys, but a deletion, a rewrite of a known
+log rotation) or add new keys at any position of the code-point order,
+but a deletion, a rewrite of a known
 event or a retreat raises ``ValueError`` and appends nothing. An export
 identical in manifest, log digest, head and closed state is a duplicate:
 it appends no anchor and returns a proof naming that same anchor, no
@@ -214,18 +215,25 @@ def _validate_manifest(raw: object) -> list[list[Any]]:
 
 def _check_extension(old_manifest: list[list[Any]],
                      new_manifest: list[list[Any]]) -> None:
-    # The old snapshot must survive item by item; only appended keys are
-    # allowed. Fewer entries (retreat), a changed [key, digest] pair
-    # (rewrite) or an inserted/reordered key all surface here. Equal
-    # manifests (re-query or byte-level log rotation with same events)
-    # are permitted by the caller and never reach this check.
+    # The old snapshot must survive key by key and digest by digest; new
+    # keys may be inserted at any position of the code-point order. Both
+    # manifests are validated to be sorted without repeats, so the old
+    # one must appear as a subsequence of the new one: a missing key
+    # (deletion), a changed digest (rewrite) or a reordered pair all
+    # surface as a non-match, and fewer or equal entries (a retreat) can
+    # never contain the old keys. Equal manifests (re-query or
+    # byte-level log rotation with same events) are permitted by the
+    # caller and never reach this check.
     if len(new_manifest) <= len(old_manifest):
         raise ValueError("a generation only accepts snapshots that add new "
                          "audit events")
-    for index, item in enumerate(old_manifest):
-        if new_manifest[index] != item:
-            raise ValueError("a generation cannot rewrite, delete or "
-                             "reorder an already anchored event")
+    position = 0
+    for item in new_manifest:
+        if position < len(old_manifest) and item == old_manifest[position]:
+            position += 1
+    if position != len(old_manifest):
+        raise ValueError("a generation cannot rewrite, delete or "
+                         "reorder an already anchored event")
 
 
 def _validate_checkpoint(data: object) -> list[dict[str, Any]]:
