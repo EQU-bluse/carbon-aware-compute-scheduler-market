@@ -39,6 +39,18 @@ lock file never blocks a later restore or query. The recovery file is
 itself a complete history, so it can also be previewed directly with
 :func:`carbon_market.history.verify` before a restore -- that preview
 takes the recovery file's own companion lock, not the target's.
+
+A restore given the optional ``audit_path``/``audit_key`` pair -- both
+non-empty strings, always together -- appends one result event, keyed by
+``audit_key`` in the :mod:`carbon_market.audit` journal, before it
+returns or raises: a success event records op ``"restore"``, the target
+as passed, the history key and the real byte-change result (error and
+stage null); a failure event names the final exception's class,
+classifies its stage and sets ``changed`` from whether the target bytes
+at exception departure differ from those before the call. The
+operation's exception and chain leave exactly as without auditing; only
+a failure of the audit record itself surfaces its own exception,
+chained after the operation exception when the operation also failed.
 """
 
 from __future__ import annotations
@@ -46,6 +58,7 @@ from __future__ import annotations
 import os
 import tempfile
 
+from . import audit as _audit
 from . import history as _history
 from . import recover_all as _recover_all
 from ._jsonio import strict_loads
@@ -111,6 +124,22 @@ def _read_existing(path: str) -> bytes | None:
         return None
 
 
+def _departure_bytes(path: str) -> tuple[bytes | None, bool]:
+    # Snapshot the target at the moment an operation exception leaves, for
+    # the failure event's changed flag. The read is deliberately
+    # best-effort: it must never mask or replace the operation's own
+    # exception, so any read failure other than the file being absent is
+    # reported as "unknown" and the caller records the conservative
+    # no-deviation value.
+    try:
+        with open(path, "rb") as handle:
+            return handle.read(), True
+    except FileNotFoundError:
+        return None, True
+    except OSError:
+        return None, False
+
+
 def _stage_over(path: str, directory: str, payload: bytes) -> None:
     # Write payload to an fsynced same-directory temporary and move it over
     # path atomically; a failure removes this attempt's temporary.
@@ -166,6 +195,8 @@ def restore(
     target: str,
     key: str,
     fault: str | None = None,
+    audit_path: str | None = None,
+    audit_key: str | None = None,
 ) -> tuple[dict[str, object], bool]:
     """Restore the history at ``target`` from ``target + ".recovery"``.
 
@@ -202,59 +233,129 @@ def restore(
     that rollback itself fails, its ``OSError`` is raised with the first
     error as its ``__cause__``. Every other locking or I/O failure raises
     ``OSError``.
+
+    ``audit_path`` and ``audit_key`` are optional and must be given
+    together as non-empty strings, else ``ValueError`` before the
+    operation starts; with both omitted the restore behaves exactly as
+    without auditing. With them given, one result event keyed by
+    ``audit_key`` is appended via :func:`carbon_market.audit.record`
+    before the call returns or raises its operation exception: success
+    records op ``"restore"``, the target as passed, the history key and
+    the real byte-change result with error and stage null; failure
+    records the final exception's class name, the stage it left at
+    (``"校验"``, ``"执行"``, ``"同步"`` or ``"回滚"``) and whether the
+    target bytes at departure differ from those before the call. The
+    operation exception and its chain leave unchanged; should the audit
+    record itself fail, its exception is raised -- chained after the
+    operation exception when the operation also failed.
     """
-    if not isinstance(target, str) or not target:
-        raise ValueError("target must be a non-empty string")
-    if not isinstance(key, str) or not key:
-        raise ValueError("key must be a non-empty string")
-    if fault not in _FAULTS:
-        raise ValueError(
-            "fault must be None, 'after_replace' or 'after_unlink'")
+    auditing = _audit.check_pair(audit_path, audit_key)
 
-    target_real = os.path.realpath(target)
-    recovery_path = target_real + ".recovery"
-    directory = os.path.dirname(target_real) or "."
+    # Populated only when a failure leaves the target-lock critical
+    # section: (section-entry bytes, departure bytes, departure known).
+    departure: tuple[bytes | None, bytes | None, bool] | None = None
+    summary: dict[str, object]
+    changed = False
 
-    with _recover_all._history_file_lock(target_real):
-        # The existence decision, validation, the byte-for-byte switch and
-        # the rollback are all one critical section under the target's own
-        # exclusive lock, so a shared-lock history query on the target
-        # sees either the complete pre-call file or the complete restored
-        # one. The two paths can only be created or removed by a holder of
-        # this same exclusive lock (history_copy.run), so the captured
-        # bytes stay current for the whole section.
-        target_before = _read_existing(target_real)
-        recovery_before = _read_existing(recovery_path)
+    try:
+        if not isinstance(target, str) or not target:
+            raise ValueError("target must be a non-empty string")
+        if not isinstance(key, str) or not key:
+            raise ValueError("key must be a non-empty string")
+        if fault not in _FAULTS:
+            raise ValueError(
+                "fault must be None, 'after_replace' or 'after_unlink'")
 
-        if recovery_before is None:
-            # No recovery copy: verify the target in place from the bytes
-            # read under this lock and report it unchanged.
-            if target_before is None:
-                raise FileNotFoundError(2, os.strerror(2), target_real)
-            return _verify_bytes(target_real, target_before, key), False
+        target_real = os.path.realpath(target)
+        recovery_path = target_real + ".recovery"
+        directory = os.path.dirname(target_real) or "."
 
-        # A recovery file is itself a complete history: validate it with
-        # history.verify proper before the target is touched. verify takes
-        # the recovery file's own companion lock (target+".recovery.lock"),
-        # not target+".lock", so nesting it under this exclusive hold does
-        # not self-conflict, and a verification failure performs no writes
-        # at all.
-        summary = _history.verify(recovery_path, key)
-        changed = target_before != recovery_before
+        with _recover_all._history_file_lock(target_real):
+            # The existence decision, validation, the byte-for-byte switch
+            # and the rollback are all one critical section under the
+            # target's own exclusive lock, so a shared-lock history query
+            # on the target sees either the complete pre-call file or the
+            # complete restored one. The two paths can only be created or
+            # removed by a holder of this same exclusive lock
+            # (history_copy.run), so the captured bytes stay current for
+            # the whole section.
+            target_before = _read_existing(target_real)
+            recovery_before = _read_existing(recovery_path)
 
-        try:
-            _stage_over(target_real, directory, recovery_before)
-            if fault == "after_replace":
-                raise OSError(5, "injected failure after replace")
-            _fsync_dir(directory)
+            try:
+                if recovery_before is None:
+                    # No recovery copy: verify the target in place from
+                    # the bytes read under this lock and report it
+                    # unchanged.
+                    if target_before is None:
+                        raise FileNotFoundError(2, os.strerror(2), target_real)
+                    summary = _verify_bytes(target_real, target_before, key)
+                    changed = False
+                else:
+                    # A recovery file is itself a complete history:
+                    # validate it with history.verify proper before the
+                    # target is touched. verify takes the recovery file's
+                    # own companion lock (target+".recovery.lock"), not
+                    # target+".lock", so nesting it under this exclusive
+                    # hold does not self-conflict, and a verification
+                    # failure performs no writes at all.
+                    summary = _history.verify(recovery_path, key)
+                    changed = target_before != recovery_before
 
-            os.unlink(recovery_path)
-            if fault == "after_unlink":
-                raise OSError(5, "injected failure after unlink")
-            _fsync_dir(directory)
-        except BaseException as first:
-            _rollback(target_real, recovery_path, directory,
-                      target_before, recovery_before, first)
+                    try:
+                        _stage_over(target_real, directory, recovery_before)
+                        if fault == "after_replace":
+                            raise OSError(5, "injected failure after replace")
+                        _fsync_dir(directory)
+
+                        os.unlink(recovery_path)
+                        if fault == "after_unlink":
+                            raise OSError(5, "injected failure after unlink")
+                        _fsync_dir(directory)
+                    except BaseException as first:
+                        _rollback(target_real, recovery_path, directory,
+                                  target_before, recovery_before, first)
+                        raise
+            except Exception:
+                # Snapshot the target the exception leaves while the
+                # target lock is still held -- after any rollback and
+                # against the section-entry baseline -- so a concurrent
+                # writer cannot interleave with the measurement. This
+                # read exists solely for the audit event; with auditing
+                # off the section is exactly the original one.
+                if auditing:
+                    after, known = _departure_bytes(target_real)
+                    departure = (target_before, after, known)
+                raise
+    except Exception as exc:
+        if not auditing:
             raise
+        # A failure inside the lock section is measured against the bytes
+        # sampled at that section's entry; the only failure before the
+        # section is acquiring the target lock, which never touches the
+        # target, so its event records changed=False. An unreadable
+        # departure target records the conservative no-deviation value
+        # rather than masking the operation's own exception.
+        if departure is None:
+            changed = False
+        else:
+            before, after, known = departure
+            changed = known and after != before
+        stage = _audit.failure_stage(exc)
+        audit_error = _audit.emit(
+            audit_path, audit_key, "restore", target, key,
+            changed, exc, stage)
+        if audit_error is not None:
+            raise audit_error from exc
+        raise
 
-        return summary, changed
+    if auditing:
+        # The restore (or verify-only no-recovery path) succeeded; the
+        # on-disk target result is retained even if this record fails.
+        audit_error = _audit.emit(
+            audit_path, audit_key, "restore", target, key,
+            changed, None, None)
+        if audit_error is not None:
+            raise audit_error
+
+    return summary, changed

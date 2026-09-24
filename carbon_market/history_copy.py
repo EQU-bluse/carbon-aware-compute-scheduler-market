@@ -51,6 +51,20 @@ Both locks are kernel flocks: they block other processes (and other
 opens of the same lock file in this process), and the kernel releases
 them automatically when the process exits, so a leftover lock file never
 blocks a later copy or query. The source is never written.
+
+When a copy is given the optional ``audit_path``/``audit_key`` pair --
+both non-empty strings, always together -- :func:`run` additionally
+appends one result event, keyed by ``audit_key`` in the audit journal of
+:mod:`carbon_market.audit`, before it returns or raises the operation
+exception: a success event records op ``"copy"``, the target as passed
+in, the copied history's key and whether the target bytes actually
+changed (error and stage null); a failure event names the final
+exception's class, classifies its stage (``"校验"``, ``"执行"``,
+``"同步"`` or ``"回滚"``) and sets ``changed`` from whether the target
+bytes at exception departure differ from those before the call. The
+operation's exception and chain leave exactly as without auditing; only
+a failure of the audit record itself surfaces its own exception, chained
+after the operation exception when the operation also failed.
 """
 
 from __future__ import annotations
@@ -59,6 +73,7 @@ import contextlib
 import os
 import tempfile
 
+from . import audit as _audit
 from . import history as _history
 from . import recover_all as _recover_all
 from ._jsonio import strict_loads
@@ -91,6 +106,34 @@ def _fsync_dir(directory: str, open_stage: str, fsync_stage: str) -> None:
 def _unlink_quiet(path: str) -> None:
     with contextlib.suppress(OSError):
         os.unlink(path)
+
+
+def _read_existing(path: str) -> bytes | None:
+    # None records that the file did not exist; a file's bytes may
+    # themselves be empty in principle, so an empty b"" is not the same
+    # answer. Used for the call-before snapshot, so a missing file is the
+    # only expected outcome.
+    try:
+        with open(path, "rb") as handle:
+            return handle.read()
+    except FileNotFoundError:
+        return None
+
+
+def _departure_bytes(path: str) -> tuple[bytes | None, bool]:
+    # Snapshot the target at the moment an operation exception leaves, for
+    # the failure event's changed flag. The read is deliberately
+    # best-effort: it must never mask or replace the operation's own
+    # exception, so any read failure other than the file being absent is
+    # reported as "unknown" and the caller records the conservative
+    # no-deviation value.
+    try:
+        with open(path, "rb") as handle:
+            return handle.read(), True
+    except FileNotFoundError:
+        return None, True
+    except OSError:
+        return None, False
 
 
 def _unlink_or_chain(path: str, first: BaseException) -> None:
@@ -267,6 +310,8 @@ def run(
     target: str,
     key: str,
     overwrite: bool = False,
+    audit_path: str | None = None,
+    audit_key: str | None = None,
 ) -> dict[str, object]:
     """Copy the history at ``source`` onto ``target`` and return its summary.
 
@@ -307,64 +352,144 @@ def run(
     On success the result carries keys key, count, statuses and terminal,
     in that order, with the values :func:`carbon_market.history.verify`
     reports for the source of this copy.
+
+    ``audit_path`` and ``audit_key`` are optional and must be given
+    together as non-empty strings, else ``ValueError`` before the
+    operation starts; with both omitted the copy behaves exactly as
+    without auditing. With them given, one result event keyed by
+    ``audit_key`` is appended via :func:`carbon_market.audit.record`
+    before the call returns or raises its operation exception: success
+    records op ``"copy"``, the target as passed, the history key and the
+    real byte-change result with error and stage null; failure records
+    the final exception's class name, the stage it left at
+    (``"校验"``, ``"执行"``, ``"同步"`` or ``"回滚"``) and whether the
+    target bytes at departure differ from those before the call. The
+    operation exception and its chain leave unchanged; should the audit
+    record itself fail, its exception is raised -- chained after the
+    operation exception when the operation also failed.
     """
-    for value in (source, target, key):
-        if not isinstance(value, str) or not value:
+    auditing = _audit.check_pair(audit_path, audit_key)
+
+    # Populated only when a failure leaves the target-lock critical
+    # section: (baseline bytes, departure bytes, departure known). A
+    # failure before that section (argument checks, source read,
+    # validation, key check) never writes the target, so its event simply
+    # records changed=False.
+    departure: tuple[bytes | None, bytes | None, bool] | None = None
+    # The target's call-before bytes sampled inside the target-lock
+    # section, also used for the success event; None until then.
+    commit_before: bytes | None = None
+
+    try:
+        for value in (source, target, key):
+            if not isinstance(value, str) or not value:
+                raise ValueError(
+                    "source, target and key must be non-empty strings")
+        if not isinstance(overwrite, bool):
+            raise ValueError("overwrite must be a boolean")
+
+        source_real = os.path.realpath(source)
+        target_real = os.path.realpath(target)
+        if source_real == target_real:
             raise ValueError(
-                "source, target and key must be non-empty strings")
-    if not isinstance(overwrite, bool):
-        raise ValueError("overwrite must be a boolean")
+                "source and target resolve to the same path: "
+                f"{source_real!r}")
 
-    source_real = os.path.realpath(source)
-    target_real = os.path.realpath(target)
-    if source_real == target_real:
-        raise ValueError(
-            f"source and target resolve to the same path: {source_real!r}")
+        # Read the source bytes under the same shared hold a read-only
+        # history query takes, from before the file is opened until it has
+        # been fully read and closed. A concurrent recover_all.run
+        # (exclusive holder) can therefore never expose a truncated or
+        # half-replaced file; the bytes buffered here are one complete
+        # pre- or post-update history. Parsing and validation follow only
+        # after the hold is released, exactly as in
+        # carbon_market.history._load -- the in-memory bytes are already
+        # fixed.
+        with _recover_all._history_file_lock(source_real, shared=True):
+            with open(source_real, "rb") as handle:
+                raw = handle.read()
 
-    # Read the source bytes under the same shared hold a read-only history
-    # query takes, from before the file is opened until it has been fully
-    # read and closed. A concurrent recover_all.run (exclusive holder) can
-    # therefore never expose a truncated or half-replaced file; the bytes
-    # buffered here are one complete pre- or post-update history. Parsing
-    # and validation follow only after the hold is released, exactly as in
-    # carbon_market.history._load -- the in-memory bytes are already fixed.
-    with _recover_all._history_file_lock(source_real, shared=True):
-        with open(source_real, "rb") as handle:
-            raw = handle.read()
+        try:
+            text = raw.decode("utf-8")
+        except UnicodeDecodeError as exc:
+            raise ValueError(
+                f"history file {source_real!r} is not valid UTF-8") from exc
+        try:
+            data = strict_loads(text)
+        except ValueError as exc:
+            raise ValueError(
+                f"history file {source_real!r} is not valid JSON") from exc
+        history = _recover_all._validate_history(data)
+        _history._validate_consistency(data, history)
+        if history["key"] != key:
+            raise KeyError(key)
 
-    try:
-        text = raw.decode("utf-8")
-    except UnicodeDecodeError as exc:
-        raise ValueError(
-            f"history file {source_real!r} is not valid UTF-8") from exc
-    try:
-        data = strict_loads(text)
-    except ValueError as exc:
-        raise ValueError(
-            f"history file {source_real!r} is not valid JSON") from exc
-    history = _recover_all._validate_history(data)
-    _history._validate_consistency(data, history)
-    if history["key"] != key:
-        raise KeyError(key)
+        directory = os.path.dirname(target_real) or "."
 
-    directory = os.path.dirname(target_real) or "."
-
-    # Commit under the target's own exclusive lock: the existence decision,
-    # the byte-for-byte write, the atomic replace, the directory sync and
-    # (on overwrite) the recovery file and the rollback are all one
-    # critical section, so a shared-lock history query on the target sees
-    # either the complete old file or the complete copy. The original
-    # bytes are written verbatim -- never re-serialized -- so the target
-    # is byte-identical to the source that was validated.
-    with _recover_all._history_file_lock(target_real):
-        _commit_copy(target_real, directory, raw, overwrite)
+        # Commit under the target's own exclusive lock: the existence
+        # decision, the byte-for-byte write, the atomic replace, the
+        # directory sync and (on overwrite) the recovery file and the
+        # rollback are all one critical section, so a shared-lock history
+        # query on the target sees either the complete old file or the
+        # complete copy. The original bytes are written verbatim -- never
+        # re-serialized -- so the target is byte-identical to the source
+        # that was validated.
+        with _recover_all._history_file_lock(target_real):
+            # Baseline and departure are both sampled inside this same
+            # exclusive critical section -- the baseline just before the
+            # commit and the departure right after any rollback -- so a
+            # concurrent lock-holding writer can never interleave. Both
+            # reads exist solely for the audit event; with auditing off
+            # the commit section is exactly the original one.
+            before = _read_existing(target_real) if auditing else None
+            commit_before = before
+            try:
+                _commit_copy(target_real, directory, raw, overwrite)
+            except Exception:
+                if auditing:
+                    after, known = _departure_bytes(target_real)
+                    departure = (before, after, known)
+                raise
+    except Exception as exc:
+        if not auditing:
+            raise
+        # A failure inside the commit section measures the bytes the
+        # exception leaves against the section baseline; a failure before
+        # it never touched the target. An unreadable departure target
+        # records the conservative no-deviation value rather than masking
+        # the operation's own exception.
+        if departure is None:
+            changed = False
+        else:
+            before, after, known = departure
+            changed = known and after != before
+        stage = _audit.failure_stage(exc)
+        audit_error = _audit.emit(
+            audit_path, audit_key, "copy", target, key,
+            changed, exc, stage)
+        if audit_error is not None:
+            raise audit_error from exc
+        raise
 
     entries = history["snapshots"]
     statuses = [entry_status for entry_status, _coord in entries]
     terminal = bool(entries) and entries[-1][0] in _history._TERMINAL_STATUSES
-    return {
+    result = {
         "key": history["key"],
         "count": len(entries),
         "statuses": statuses,
         "terminal": terminal,
     }
+
+    if auditing:
+        # The commit succeeded and leaves exactly the validated source
+        # bytes on the target; the real change is those bytes replacing
+        # (or arriving beside) the section baseline. An audit failure here
+        # must not roll the history copy back -- its on-disk result is
+        # retained.
+        audit_error = _audit.emit(
+            audit_path, audit_key, "copy", target, key,
+            commit_before != raw, None, None)
+        if audit_error is not None:
+            raise audit_error
+
+    return result

@@ -2,13 +2,17 @@
 
 Each journal file records the outcomes of copy and restore operations
 under caller-chosen idempotency keys. A document has the form
-``{"version": 1, "events": {key: event}}`` with the events ordered by key
-code point; every event carries exactly op, target, key, changed, error
-and stage, in that order. ``op`` is ``"copy"`` or ``"restore"`` and
-``changed`` is a boolean; a successful event has ``error`` and ``stage``
-both null, while a failed one names the exception class in ``error`` and
-the stage it failed at in ``stage`` -- one of ``"校验"``, ``"执行"``,
-``"同步"`` and ``"回滚"``.
+``{"version": 1, "events": {key: event}}`` with ``version`` before
+``events`` and the events ordered by key code point; every event carries
+exactly op, target, key, changed, error and stage, in that order. The
+public order is part of the contract and is verified on read: a document
+whose root fields, event fields or event keys appear out of order is
+malformed and raises ``ValueError`` -- it is never reordered and
+accepted, and a read-only query never rewrites it. ``op`` is ``"copy"``
+or ``"restore"`` and ``changed`` is a boolean; a successful event has
+``error`` and ``stage`` both null, while a failed one names the
+exception class in ``error`` and the stage it failed at in ``stage`` --
+one of ``"校验"``, ``"执行"``, ``"同步"`` and ``"回滚"``.
 
 :func:`record` replays the event already stored under a key: the same
 key with the same event returns a copy of it together with ``False`` and
@@ -63,6 +67,74 @@ _OPS = ("copy", "restore")
 _STAGES = ("校验", "执行", "同步", "回滚")
 
 
+def check_pair(audit_path: object, audit_key: object) -> bool:
+    """Validate the optional ``(audit_path, audit_key)`` argument pair.
+
+    Both omitted means auditing is off and returns ``False``; both given
+    as non-empty strings means auditing and returns ``True``. Exactly one
+    given, or either value not a non-empty string, is a caller error and
+    raises ``ValueError`` before the operation starts.
+    """
+    if audit_path is None and audit_key is None:
+        return False
+    if not isinstance(audit_path, str) or not audit_path \
+            or not isinstance(audit_key, str) or not audit_key:
+        raise ValueError(
+            "audit_path and audit_key must be provided together as "
+            "non-empty strings")
+    return True
+
+
+def failure_stage(exc: BaseException) -> str:
+    """Classify the stage an operation exception leaves the call at.
+
+    A target/recovery conflict is ``"执行"``; an :class:`OSError` chained
+    after the first error by a compensation cleanup or rollback is
+    ``"回滚"``; argument, history-content, history-key, recovery-copy or
+    missing-file validation failures (``ValueError``, ``KeyError`` and
+    ``FileNotFoundError``) are ``"校验"``; every other locking, temporary
+    file, replace, unlink or fsync failure is ``"同步"``.
+    """
+    # The explicit chain (raise ... from first) is the marker of a
+    # compensation cleanup or rollback that itself failed: the later
+    # error leaves with the first one as its __cause__ and the stage is
+    # 回滚, even when that later error happens to be a FileExistsError.
+    if isinstance(exc, OSError) and exc.__cause__ is not None:
+        return "回滚"
+    if isinstance(exc, FileExistsError):
+        return "执行"
+    if isinstance(exc, (ValueError, KeyError, FileNotFoundError)):
+        return "校验"
+    return "同步"
+
+
+def emit(audit_path: str, audit_key: str, op: str, target: str,
+         history_key: str, changed: bool,
+         exc: BaseException | None, stage: str | None) -> Exception | None:
+    """Append one operation result event, or return the audit's own error.
+
+    On success ``exc`` and ``stage`` are ``None``; on failure ``exc`` is
+    the operation exception (its class name is recorded) and ``stage``
+    the stage :func:`failure_stage` assigned. Returns ``None`` when the
+    event was recorded or replayed idempotently, or the journal's own
+    exception when recording failed so the caller can surface it --
+    chained after the operation exception when there was one.
+    """
+    event = {
+        "op": op,
+        "target": target,
+        "key": history_key,
+        "changed": bool(changed),
+        "error": None if exc is None else type(exc).__name__,
+        "stage": stage,
+    }
+    try:
+        record(audit_path, audit_key, event)
+    except Exception as audit_exc:  # journal failure: ValueError/OSError/...
+        return audit_exc
+    return None
+
+
 class _Store:
     def __init__(self, realpath: str) -> None:
         self.realpath = realpath
@@ -105,9 +177,12 @@ def _file_lock(realpath: str, *, shared: bool = False) -> Iterator[None]:
 
 
 def _validate_event(raw: object) -> dict[str, Any]:
-    if not isinstance(raw, dict) or set(raw.keys()) != set(_EVENT_FIELDS):
+    # The field set and its public order are both part of the contract:
+    # an event with a missing/extra field -- or the six fields in another
+    # order -- is malformed and is never reordered and accepted.
+    if not isinstance(raw, dict) or list(raw.keys()) != list(_EVENT_FIELDS):
         raise ValueError("event must be an object with exactly op, target, "
-                         "key, changed, error and stage")
+                         "key, changed, error and stage, in that order")
     if raw["op"] not in _OPS:
         raise ValueError("event op must be copy or restore")
     for field in ("target", "key"):
@@ -133,9 +208,11 @@ def _validate_event(raw: object) -> dict[str, Any]:
 
 
 def _validate_document(data: object) -> dict[str, Any]:
-    if not isinstance(data, dict) or set(data.keys()) != set(_ROOT_FIELDS):
+    # The root's public order is part of the contract: an object carrying
+    # any other set or order of fields is malformed rather than rebuilt.
+    if not isinstance(data, dict) or list(data.keys()) != list(_ROOT_FIELDS):
         raise ValueError("audit root must be an object with keys version "
-                         "and events")
+                         "and events, in that order")
 
     version = data["version"]
     # bool is a subclass of int and must be rejected as a version.
@@ -148,9 +225,14 @@ def _validate_document(data: object) -> dict[str, Any]:
         raise ValueError("events must be an object")
 
     # The persisted form is keyed in code-point order; a document offered
-    # out of order is still semantically valid and is rebuilt sorted.
+    # out of order is malformed and is rejected as it stands -- never
+    # sorted and accepted, and never rewritten by a read-only query.
+    event_keys = list(events_raw)
+    if event_keys != sorted(event_keys):
+        raise ValueError("audit events must be ordered by key code point")
+
     events: dict[str, Any] = {}
-    for event_key in sorted(events_raw):
+    for event_key in event_keys:
         if not isinstance(event_key, str) or not event_key:
             raise ValueError("event keys must be non-empty strings")
         events[event_key] = _validate_event(events_raw[event_key])
