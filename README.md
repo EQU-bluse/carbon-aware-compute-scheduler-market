@@ -61,6 +61,17 @@ The optional `If-None-Match` header may be omitted or appear exactly once as a s
 
 The bytes are read under the same checkpoint lock exports use (shared), held from open through validation and ETag computation, so a request racing an export observes only a complete old or complete new version. A missing checkpoint gets 404 `checkpoint_not_found`; bytes that are not valid UTF-8 or JSON, or a checkpoint with an illegal version, field order, anchor or digest chain, get 409 `checkpoint_invalid` with a body of only `{"error":...}`; other I/O failures get 503 `checkpoint_unavailable`. Real paths and system messages never appear in an error. Without `--checkpoint` the path remains a plain 404 like any other unknown path.
 
+## Offline bundle verification
+
+```bash
+python -m carbon_market verify-bundle --checkpoint CPATH --proof PPATH --etag '"<64 hex>"'
+```
+
+`verify-bundle` is the offline counterpart of the checkpoint download: it verifies a saved proof (`PPATH`, the object `GET /audit/proof` returned) against the downloaded checkpoint (`CPATH`, the bytes `GET /audit/checkpoint` served) without any server. Each option must appear exactly once with a non-empty value, and `--etag` must be the single strong tag the download response carried — one double-quoted string of 64 lowercase hexadecimal digits. Any argument or tag format error exits 2 with `invalid_request` on stderr, before any input file is read.
+
+Verification first recomputes the tag from the checkpoint's raw bytes — a mismatch fails immediately — then validates the checkpoint's full anchor chain and runs the same offline rechecks as `audit_proof.verify`: the embedded log bytes, query parameters, page, cursor and root digest are all recomputed, and the proof's generation, anchor and closed state must come from that one verified checkpoint snapshot. The checkpoint is read once under the shared lock, so a same-directory atomic replacement racing the read can only yield a self-consistent old or new combination, never a mix.
+
+On success stdout carries one compact UTF-8 JSON line (non-ASCII written through, exactly one trailing newline) with `valid`, `etag`, `generation`, `closed`, `events` and `next` in that order — `valid` always `true`, the rest from the verified tag and proof — and exits 0 with stderr empty. Failures write nothing to stdout and report a compact single-line object on stderr: encoding, JSON (negative-zero or non-finite literals included) or public-structure errors exit 3 with `invalid_bundle`; tag, digest-chain, generation, anchor, closed-state or page mismatches exit 4 with `verification_failed`; a missing file or any other locking, open or read error exits 5 with `bundle_unavailable`. Error objects never leak paths, system messages or input content. The command is read-only: the inputs are never modified, and the HTTP and library entries are unaffected.
 
 ## Test
 

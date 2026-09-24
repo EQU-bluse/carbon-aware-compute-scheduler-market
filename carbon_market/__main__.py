@@ -1,7 +1,11 @@
 from __future__ import annotations
 
 import argparse
+import json
+import sys
+from typing import NoReturn
 
+from . import audit_proof
 from . import auth
 from .server import serve
 
@@ -13,6 +17,23 @@ class _Once(argparse.Action):
         if getattr(namespace, self.dest, None) is not None:
             parser.error(f"{option_string} must not be given more than once")
         setattr(namespace, self.dest, values)
+
+
+def _emit_failure(code: str, status: int) -> NoReturn:
+    # The failure object is compact and single-line and carries only the
+    # error code: no paths, system messages or input content ever leak.
+    body = json.dumps({"error": code}, ensure_ascii=False,
+                      separators=(",", ":"))
+    sys.stderr.write(body + "\n")
+    raise SystemExit(status)
+
+
+def _invalid_request(message: str) -> NoReturn:
+    # argparse error hook of the verify-bundle subparser: every usage
+    # error -- unknown, missing, repeated or empty options -- is the
+    # same compact invalid_request object with exit status 2, and no
+    # input file has been read at this point.
+    _emit_failure("invalid_request", 2)
 
 
 def parser() -> argparse.ArgumentParser:
@@ -35,12 +56,32 @@ def parser() -> argparse.ArgumentParser:
         "--checkpoint", action=_Once,
         help="proof checkpoint file to expose at GET /audit/proof, "
              "requires --audit")
+    bundle = subcommands.add_parser(
+        "verify-bundle",
+        help="verify a downloaded checkpoint and proof bundle offline")
+    bundle.add_argument(
+        "--checkpoint", action=_Once, required=True,
+        help="downloaded checkpoint file to verify against")
+    bundle.add_argument(
+        "--proof", action=_Once, required=True,
+        help="exported proof file to verify")
+    bundle.add_argument(
+        "--etag", action=_Once, required=True,
+        help='strong ETag of the checkpoint download ("<64 hex>")')
+    bundle.error = _invalid_request  # type: ignore[method-assign]
     return command
 
 
 def main() -> None:
     command = parser()
-    args = command.parse_args()
+    args, extras = command.parse_known_args()
+    if extras:
+        # Unrecognized arguments surface through the main parser even
+        # when they belong to a subcommand; verify-bundle reports every
+        # usage error as the compact invalid_request object.
+        if args.command == "verify-bundle":
+            _invalid_request(" ".join(extras))
+        command.error(f"unrecognized arguments: {' '.join(extras)}")
     if args.command == "serve":
         # --audit pairs with exactly one authorization method: the
         # single --token or the multi-token --auth file. Both omitted
@@ -75,6 +116,28 @@ def main() -> None:
                 command.error(f"invalid --auth file: {exc}")
         serve(args.host, args.port, audit_path=args.audit, token=args.token,
               auth=args.auth, checkpoint=args.checkpoint)
+    elif args.command == "verify-bundle":
+        # Argument and tag format errors (ValueError raised before any
+        # file is read) exit 2; encoding, JSON or public-structure
+        # errors exit 3; tag, chain, generation, anchor, state or page
+        # mismatches exit 4; a missing file or any other locking, open
+        # or read failure exits 5. A failure writes nothing to stdout.
+        try:
+            result = audit_proof.verify_bundle(
+                args.checkpoint, args.proof, args.etag)
+        except audit_proof.InvalidBundleError:
+            _emit_failure("invalid_bundle", 3)
+        except audit_proof.VerificationFailedError:
+            _emit_failure("verification_failed", 4)
+        except OSError:
+            _emit_failure("bundle_unavailable", 5)
+        except ValueError:
+            _emit_failure("invalid_request", 2)
+        # Compact UTF-8 JSON with non-ASCII written through and exactly
+        # one trailing newline; stderr stays empty on success.
+        body = json.dumps(result, ensure_ascii=False,
+                          separators=(",", ":"), allow_nan=False)
+        sys.stdout.write(body + "\n")
 
 
 if __name__ == "__main__":

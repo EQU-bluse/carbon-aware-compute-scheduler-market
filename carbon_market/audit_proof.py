@@ -77,6 +77,23 @@ returns a proof; concurrent appenders serialize and each observes
 either the complete previous checkpoint or the complete new one, and a
 restarted process continues the same anchor chain from the persisted
 checkpoint.
+
+:func:`verify_bundle` closes the loop for the checkpoint download: given
+the downloaded checkpoint file, a saved proof file and the single strong
+entity tag the download response carried, it recomputes the tag from the
+checkpoint's raw bytes before any further check and then validates and
+verifies both files with exactly the same rules the online entries use.
+The checkpoint is read once under the shared lock and every later check
+works on those bytes, so a same-directory atomic replacement racing the
+read can only produce a self-consistent old or new combination, never a
+mix of two versions. Argument and tag format errors raise ``ValueError``
+before any file is opened; encoding, JSON (negative-zero and non-finite
+literals included) or public-structure errors raise
+:class:`InvalidBundleError`; a tag, digest-chain, generation, anchor,
+closed-state or page mismatch raises :class:`VerificationFailedError`;
+a missing file raises ``FileNotFoundError`` and every other locking,
+open or read failure surfaces as ``OSError``. Both new exceptions are
+``ValueError`` subclasses, so existing callers are unaffected.
 """
 
 from __future__ import annotations
@@ -86,14 +103,17 @@ import fcntl
 import hashlib
 import json
 import os
+import re
 import tempfile
 import threading
 from typing import Any, Iterator
 
+from . import _jsonio
 from . import audit
 from ._jsonio import strict_loads
 
-__all__ = ["export", "verify", "read_snapshot"]
+__all__ = ["export", "verify", "verify_bundle", "read_snapshot",
+           "InvalidBundleError", "VerificationFailedError"]
 
 _VERSION = 1
 _ROOT_FIELDS = ("version", "generations")
@@ -104,6 +124,17 @@ _PROOF_FIELDS = ("version", "generation", "params", "result", "log_bytes",
                  "log_digest", "head", "closed", "anchor_digest")
 _PARAM_FIELDS = ("cursor", "limit", "op", "stage", "key")
 _HEXADECIMAL = frozenset("0123456789abcdef")
+# The strong entity tag of a checkpoint download: one double-quoted
+# string of 64 lowercase hexadecimal digits, nothing else.
+_ETAG = re.compile(r'"[0-9a-f]{64}"')
+
+
+class InvalidBundleError(ValueError):
+    """A bundle file's encoding, JSON or public structure is invalid."""
+
+
+class VerificationFailedError(ValueError):
+    """A bundle's tag, chain, generation, anchor, state or page mismatches."""
 
 
 class _CheckpointStore:
@@ -153,6 +184,19 @@ def _compact(payload: Any) -> bytes:
                       allow_nan=False).encode("utf-8")
 
 
+def _reject_constant(token: str) -> None:
+    raise ValueError(f"non-finite number literal {token!r} is not allowed")
+
+
+def _loads(text: str) -> Any:
+    # The persisted-file JSON convention: strict_loads (negative-zero
+    # literals rejected) plus the non-finite literals NaN, Infinity and
+    # -Infinity, which Python's json accepts unless told otherwise.
+    return json.loads(text, parse_int=_jsonio._parse_int,
+                      parse_float=_jsonio._parse_float,
+                      parse_constant=_reject_constant)
+
+
 def _anchor_digest(manifest: list[list[Any]], log_digest: str,
                    head: str | None, previous: str | None,
                    closed: bool) -> str:
@@ -196,19 +240,19 @@ def _manifest(document: dict[str, Any]) -> list[list[Any]]:
 
 def _validate_manifest(raw: object) -> list[list[Any]]:
     if not isinstance(raw, list):
-        raise ValueError("anchor manifest must be a list of "
-                         "[audit key, event digest] pairs")
+        raise InvalidBundleError("anchor manifest must be a list of "
+                                 "[audit key, event digest] pairs")
     manifest: list[list[Any]] = []
     last_key: str | None = None
     for item in raw:
         if not isinstance(item, list) or len(item) != 2 \
                 or not isinstance(item[0], str) or not item[0] \
                 or not _is_digest(item[1]):
-            raise ValueError("anchor manifest entries must be "
-                             "[non-empty key, 64-digit hex digest]")
+            raise InvalidBundleError("anchor manifest entries must be "
+                                     "[non-empty key, 64-digit hex digest]")
         if last_key is not None and item[0] <= last_key:
-            raise ValueError("anchor manifest must be ordered by key "
-                             "code point without repeats")
+            raise InvalidBundleError("anchor manifest must be ordered by "
+                                     "key code point without repeats")
         manifest.append([item[0], item[1]])
         last_key = item[0]
     return manifest
@@ -224,30 +268,33 @@ def _check_extension(old_manifest: list[list[Any]],
     # Equal manifests (re-query or byte-level log rotation with same
     # events) are permitted by the caller and never reach this check.
     if len(new_manifest) <= len(old_manifest):
-        raise ValueError("a generation only accepts snapshots that add new "
-                         "audit events")
+        raise VerificationFailedError("a generation only accepts snapshots "
+                                      "that add new audit events")
     new_digests = {audit_key: digest for audit_key, digest in new_manifest}
     for audit_key, digest in old_manifest:
         if new_digests.get(audit_key) != digest:
-            raise ValueError("a generation cannot rewrite, delete or "
-                             "reorder an already anchored event")
+            raise VerificationFailedError("a generation cannot rewrite, "
+                                          "delete or reorder an already "
+                                          "anchored event")
 
 
 def _validate_checkpoint(data: object) -> list[dict[str, Any]]:
     if not isinstance(data, dict) or list(data.keys()) != list(_ROOT_FIELDS):
-        raise ValueError("checkpoint root must be an object with keys "
-                         "version and generations, in that order")
+        raise InvalidBundleError("checkpoint root must be an object with "
+                                 "keys version and generations, in that "
+                                 "order")
     version = data["version"]
     if not isinstance(version, int) or isinstance(version, bool) \
             or version != _VERSION:
-        raise ValueError("unsupported checkpoint version")
+        raise InvalidBundleError("unsupported checkpoint version")
     generations_raw = data["generations"]
     if not isinstance(generations_raw, list):
-        raise ValueError("checkpoint generations must be a list")
+        raise InvalidBundleError("checkpoint generations must be a list")
     if not generations_raw:
         # export only creates a checkpoint together with its first
         # generation, so a persisted empty list is structural damage.
-        raise ValueError("checkpoint must carry at least one generation")
+        raise InvalidBundleError("checkpoint must carry at least one "
+                                 "generation")
 
     seen_names: set[str] = set()
     generations: list[dict[str, Any]] = []
@@ -259,61 +306,71 @@ def _validate_checkpoint(data: object) -> list[dict[str, Any]]:
         is_last_generation = gen_position == len(generations_raw) - 1
         if not isinstance(generation_raw, dict) \
                 or list(generation_raw.keys()) != list(_GENERATION_FIELDS):
-            raise ValueError("each generation must be an object with keys "
-                             "name and anchors, in that order")
+            raise InvalidBundleError("each generation must be an object "
+                                     "with keys name and anchors, in that "
+                                     "order")
         name = generation_raw["name"]
         if not isinstance(name, str) or not name:
-            raise ValueError("generation name must be a non-empty string")
+            raise InvalidBundleError("generation name must be a non-empty "
+                                     "string")
         if name in seen_names:
-            raise ValueError("generation names must not repeat")
+            raise VerificationFailedError("generation names must not "
+                                          "repeat")
         if generations and name <= generations[-1]["name"]:
             # Names open in strictly ascending code-point order; an
             # equal-or-earlier name is a repeat or a regression.
-            raise ValueError("generation names must not regress")
+            raise VerificationFailedError("generation names must not "
+                                          "regress")
         seen_names.add(name)
         anchors_raw = generation_raw["anchors"]
         if not isinstance(anchors_raw, list) or not anchors_raw:
-            raise ValueError("each generation must carry at least one anchor")
+            raise InvalidBundleError("each generation must carry at least "
+                                     "one anchor")
 
         anchors: list[dict[str, Any]] = []
         for index, anchor_raw in enumerate(anchors_raw):
             is_last_anchor = index == len(anchors_raw) - 1
             if not isinstance(anchor_raw, dict) \
                     or list(anchor_raw.keys()) != list(_ANCHOR_FIELDS):
-                raise ValueError("each anchor must be an object with keys "
-                                 "manifest, log_digest, head, previous, "
-                                 "closed and digest, in that order")
+                raise InvalidBundleError("each anchor must be an object "
+                                         "with keys manifest, log_digest, "
+                                         "head, previous, closed and "
+                                         "digest, in that order")
             manifest = _validate_manifest(anchor_raw["manifest"])
             if not _is_digest(anchor_raw["log_digest"]):
-                raise ValueError("anchor log_digest must be a 64-digit "
-                                 "lowercase hexadecimal digest")
+                raise InvalidBundleError("anchor log_digest must be a "
+                                         "64-digit lowercase hexadecimal "
+                                         "digest")
             head = anchor_raw["head"]
             if head is not None and not _is_digest(head):
-                raise ValueError("anchor head must be null or a 64-digit "
-                                 "lowercase hexadecimal digest")
+                raise InvalidBundleError("anchor head must be null or a "
+                                         "64-digit lowercase hexadecimal "
+                                         "digest")
             declared_previous = anchor_raw["previous"]
             if index > 0 and not _is_digest(declared_previous):
-                raise ValueError("anchor previous digest must be a "
-                                 "64-digit hexadecimal digest")
+                raise InvalidBundleError("anchor previous digest must be a "
+                                         "64-digit hexadecimal digest")
             if declared_previous != previous:
-                raise ValueError("anchor previous digest does not continue "
-                                 "the chain")
+                raise VerificationFailedError("anchor previous digest does "
+                                              "not continue the chain")
             if not isinstance(anchor_raw["closed"], bool):
-                raise ValueError("anchor closed must be a boolean")
+                raise InvalidBundleError("anchor closed must be a boolean")
             digest = anchor_raw["digest"]
             if not _is_digest(digest):
-                raise ValueError("anchor digest must be a 64-digit "
-                                 "lowercase hexadecimal digest")
+                raise InvalidBundleError("anchor digest must be a 64-digit "
+                                         "lowercase hexadecimal digest")
             expected = _anchor_digest(manifest, anchor_raw["log_digest"],
                                       head, previous, anchor_raw["closed"])
             if digest != expected:
-                raise ValueError("anchor digest does not match its content")
+                raise VerificationFailedError("anchor digest does not "
+                                              "match its content")
 
             if anchors:
                 earlier = anchors[-1]
                 if earlier["closed"]:
-                    raise ValueError("a closed anchor cannot be followed "
-                                     "inside its generation")
+                    raise VerificationFailedError("a closed anchor cannot "
+                                                  "be followed inside its "
+                                                  "generation")
                 # Consecutive anchors either pin the same manifest (a
                 # byte-level log rotation with the events intact, or the
                 # closing anchor flipping the closed flag) or extend it
@@ -321,17 +378,18 @@ def _validate_checkpoint(data: object) -> list[dict[str, Any]]:
                 # anchored pair survives; anything else is a rewrite.
                 if manifest == earlier["manifest"]:
                     if head != earlier["head"]:
-                        raise ValueError("a same-snapshot anchor cannot "
-                                         "move the root digest")
+                        raise VerificationFailedError(
+                            "a same-snapshot anchor cannot move the root "
+                            "digest")
                     if anchor_raw["log_digest"] == earlier["log_digest"] \
                             and anchor_raw["closed"] == earlier["closed"]:
-                        raise ValueError("a duplicate anchor changes "
-                                         "nothing")
+                        raise VerificationFailedError("a duplicate anchor "
+                                                      "changes nothing")
                 else:
                     _check_extension(earlier["manifest"], manifest)
             if anchor_raw["closed"] and not is_last_anchor:
-                raise ValueError("only the last anchor of a generation "
-                                 "may be closed")
+                raise VerificationFailedError("only the last anchor of a "
+                                              "generation may be closed")
 
             anchor = {"manifest": manifest,
                       "log_digest": anchor_raw["log_digest"], "head": head,
@@ -343,10 +401,25 @@ def _validate_checkpoint(data: object) -> list[dict[str, Any]]:
         if not is_last_generation and not anchors[-1]["closed"]:
             # An open generation may only be the last one of the
             # checkpoint: any following generation proves it was closed.
-            raise ValueError("a new generation can only start after the "
-                             "previous one is closed")
+            raise VerificationFailedError("a new generation can only start "
+                                          "after the previous one is "
+                                          "closed")
         generations.append({"name": name, "anchors": anchors})
     return generations
+
+
+def _parse_checkpoint(realpath: str, raw: bytes) -> list[dict[str, Any]]:
+    try:
+        text = raw.decode("utf-8")
+    except UnicodeDecodeError as exc:
+        raise InvalidBundleError(
+            f"checkpoint file {realpath!r} is not valid UTF-8") from exc
+    try:
+        data = _loads(text)
+    except ValueError as exc:
+        raise InvalidBundleError(
+            f"checkpoint file {realpath!r} is not valid JSON") from exc
+    return _validate_checkpoint(data)
 
 
 def _read_checkpoint(realpath: str) -> tuple[list[dict[str, Any]] | None,
@@ -356,17 +429,21 @@ def _read_checkpoint(realpath: str) -> tuple[list[dict[str, Any]] | None,
             raw = handle.read()
     except FileNotFoundError:
         return None, None
+    return _parse_checkpoint(realpath, raw), raw
+
+
+def _parse_proof(realpath: str, raw: bytes) -> dict[str, Any]:
     try:
         text = raw.decode("utf-8")
     except UnicodeDecodeError as exc:
-        raise ValueError(
-            f"checkpoint file {realpath!r} is not valid UTF-8") from exc
+        raise InvalidBundleError(
+            f"proof file {realpath!r} is not valid UTF-8") from exc
     try:
-        data = strict_loads(text)
+        data = _loads(text)
     except ValueError as exc:
-        raise ValueError(
-            f"checkpoint file {realpath!r} is not valid JSON") from exc
-    return _validate_checkpoint(data), raw
+        raise InvalidBundleError(
+            f"proof file {realpath!r} is not valid JSON") from exc
+    return _validate_proof(data)
 
 
 def _serialize_checkpoint(generations: list[dict[str, Any]]) -> bytes:
@@ -593,46 +670,52 @@ def export(
 
 def _validate_proof(data: object) -> dict[str, Any]:
     if not isinstance(data, dict) or list(data.keys()) != list(_PROOF_FIELDS):
-        raise ValueError("proof must be an object with the exported fields "
-                         "in their original order")
+        raise InvalidBundleError("proof must be an object with the "
+                                 "exported fields in their original order")
     if not isinstance(data["version"], int) \
             or isinstance(data["version"], bool) \
             or data["version"] != _VERSION:
-        raise ValueError("unsupported proof version")
+        raise InvalidBundleError("unsupported proof version")
     if not isinstance(data["generation"], str) or not data["generation"]:
-        raise ValueError("proof generation must be a non-empty string")
+        raise InvalidBundleError("proof generation must be a non-empty "
+                                 "string")
     params = data["params"]
     if not isinstance(params, dict) \
             or list(params.keys()) != list(_PARAM_FIELDS):
-        raise ValueError("proof params must be the exported query "
-                         "parameters")
-    _check_params(params["cursor"], params["limit"], params["op"],
-                  params["stage"], params["key"])
+        raise InvalidBundleError("proof params must be the exported query "
+                                 "parameters")
+    try:
+        _check_params(params["cursor"], params["limit"], params["op"],
+                      params["stage"], params["key"])
+    except ValueError as exc:
+        raise InvalidBundleError(
+            "proof params must be valid search parameters") from exc
     result = data["result"]
     if not isinstance(result, dict) \
             or list(result.keys()) != ["events", "next"]:
-        raise ValueError("proof result must be the exported search result")
+        raise InvalidBundleError("proof result must be the exported "
+                                 "search result")
     if not isinstance(result["events"], list):
-        raise ValueError("proof result events must be a list")
+        raise InvalidBundleError("proof result events must be a list")
     next_cursor = result["next"]
     if next_cursor is not None and (not isinstance(next_cursor, str)
                                     or not next_cursor):
-        raise ValueError("proof result next must be null or a non-empty "
-                         "string")
+        raise InvalidBundleError("proof result next must be null or a "
+                                 "non-empty string")
     if not isinstance(data["log_bytes"], str):
-        raise ValueError("proof log_bytes must be a string")
+        raise InvalidBundleError("proof log_bytes must be a string")
     if not _is_digest(data["log_digest"]):
-        raise ValueError("proof log_digest must be a 64-digit lowercase "
-                         "hexadecimal digest")
+        raise InvalidBundleError("proof log_digest must be a 64-digit "
+                                 "lowercase hexadecimal digest")
     head = data["head"]
     if head is not None and not _is_digest(head):
-        raise ValueError("proof head must be null or a 64-digit lowercase "
-                         "hexadecimal digest")
+        raise InvalidBundleError("proof head must be null or a 64-digit "
+                                 "lowercase hexadecimal digest")
     if not isinstance(data["closed"], bool):
-        raise ValueError("proof closed must be a boolean")
+        raise InvalidBundleError("proof closed must be a boolean")
     if not _is_digest(data["anchor_digest"]):
-        raise ValueError("proof anchor_digest must be a 64-digit lowercase "
-                         "hexadecimal digest")
+        raise InvalidBundleError("proof anchor_digest must be a 64-digit "
+                                 "lowercase hexadecimal digest")
     return data
 
 
@@ -656,6 +739,65 @@ def _search_document(document: dict[str, Any], params: dict[str, Any]) \
         page = matches[:limit]
         return {"events": page, "next": page[-1][0]}
     return {"events": matches, "next": None}
+
+
+def _verify_against_generations(
+    realpath: str,
+    generations: list[dict[str, Any]],
+    clean: dict[str, Any],
+) -> dict[str, Any]:
+    # The content checks shared by verify and verify_bundle: the proof's
+    # generation, anchor and closed state must come from this one
+    # checkpoint snapshot, and the page is recomputed from the embedded
+    # log bytes and parameters. Every mismatch is a verification failure.
+    names = [item["name"] for item in generations]
+    if clean["generation"] not in names:
+        raise VerificationFailedError("proof generation is not recorded "
+                                      "in the checkpoint")
+    generation = generations[names.index(clean["generation"])]
+    anchor = next((item for item in generation["anchors"]
+                   if item["digest"] == clean["anchor_digest"]), None)
+    if anchor is None:
+        raise VerificationFailedError("proof anchor is not recorded in "
+                                      "the checkpoint")
+
+    params = clean["params"]
+    raw = clean["log_bytes"].encode("utf-8")
+    if hashlib.sha256(raw).hexdigest() != clean["log_digest"]:
+        raise VerificationFailedError("proof log bytes do not match "
+                                      "their log digest")
+    if clean["log_digest"] != anchor["log_digest"]:
+        raise VerificationFailedError("proof log digest is not bound to "
+                                      "the anchor")
+    try:
+        document = audit._parse_document(realpath, raw)
+        audit._ensure_chain(document)
+    except ValueError as exc:
+        raise VerificationFailedError("proof log bytes are not a "
+                                      "complete sealed audit journal") \
+            from exc
+    if document["version"] != 2:
+        raise VerificationFailedError("proof requires a sealed version 2 "
+                                      "audit journal")
+    if clean["head"] != document["head"] \
+            or anchor["head"] != document["head"]:
+        raise VerificationFailedError("proof root digest does not match "
+                                      "the journal")
+    if _manifest(document) != anchor["manifest"]:
+        raise VerificationFailedError("proof event manifest does not "
+                                      "match the anchor")
+    if clean["closed"] != anchor["closed"]:
+        raise VerificationFailedError("proof closed state does not match "
+                                      "the anchor")
+
+    recomputed = _search_document(document, params)
+    if recomputed != clean["result"]:
+        raise VerificationFailedError("proof result does not follow from "
+                                      "the embedded log and parameters")
+    return {"events": clean["result"]["events"],
+            "next": clean["result"]["next"],
+            "generation": clean["generation"],
+            "closed": anchor["closed"]}
 
 
 def verify(checkpoint_path: str, proof: dict[str, Any]) -> dict[str, Any]:
@@ -691,43 +833,79 @@ def verify(checkpoint_path: str, proof: dict[str, Any]) -> dict[str, Any]:
     if generations is None:
         raise FileNotFoundError(
             f"checkpoint file {checkpoint_real!r} does not exist")
+    return _verify_against_generations(checkpoint_real, generations, clean)
 
-    names = [item["name"] for item in generations]
-    if clean["generation"] not in names:
-        raise ValueError("proof generation is not recorded in the "
-                         "checkpoint")
-    generation = generations[names.index(clean["generation"])]
-    anchor = next((item for item in generation["anchors"]
-                   if item["digest"] == clean["anchor_digest"]), None)
-    if anchor is None:
-        raise ValueError("proof anchor is not recorded in the checkpoint")
 
-    params = clean["params"]
-    raw = clean["log_bytes"].encode("utf-8")
-    if hashlib.sha256(raw).hexdigest() != clean["log_digest"]:
-        raise ValueError("proof log bytes do not match their log digest")
-    if clean["log_digest"] != anchor["log_digest"]:
-        raise ValueError("proof log digest is not bound to the anchor")
-    document = audit._parse_document(checkpoint_real, raw)
-    audit._ensure_chain(document)
-    if document["version"] != 2:
-        raise ValueError("proof requires a sealed version 2 audit journal")
-    if clean["head"] != document["head"] \
-            or anchor["head"] != document["head"]:
-        raise ValueError("proof root digest does not match the journal")
-    if _manifest(document) != anchor["manifest"]:
-        raise ValueError("proof event manifest does not match the anchor")
-    if clean["closed"] != anchor["closed"]:
-        raise ValueError("proof closed state does not match the anchor")
+def verify_bundle(checkpoint_path: str, proof_path: str,
+                  etag: str) -> dict[str, Any]:
+    """Verify a downloaded checkpoint and a saved proof fully offline.
 
-    recomputed = _search_document(document, params)
-    if recomputed != clean["result"]:
-        raise ValueError("proof result does not follow from the embedded "
-                         "log and parameters")
-    return {"events": clean["result"]["events"],
-            "next": clean["result"]["next"],
-            "generation": clean["generation"],
-            "closed": anchor["closed"]}
+    ``checkpoint_path`` and ``proof_path`` must be non-empty strings and
+    ``etag`` the single strong entity tag the checkpoint download
+    response carried: one double-quoted string of 64 lowercase
+    hexadecimal digits. Any argument or tag format error raises
+    ``ValueError`` before any file is opened.
+
+    The checkpoint is read once, under the same shared lock exports and
+    the snapshot download hold, and the tag is recomputed from those
+    exact bytes before anything else: a mismatch raises
+    :class:`VerificationFailedError` immediately. Every later check --
+    the checkpoint's anchor chain, the proof envelope and the offline
+    rechecks of :func:`verify` -- works on that one snapshot, so a
+    same-directory atomic replacement racing the read can only produce
+    a self-consistent old or new combination, never a mix of two
+    versions. The proof's generation, anchor and closed state all come
+    from the verified checkpoint snapshot.
+
+    Bytes that are not valid UTF-8 or JSON (negative-zero and
+    non-finite literals included), or a checkpoint or proof whose
+    public structure deviates, raise :class:`InvalidBundleError`; a
+    tag, digest-chain, generation, anchor, closed-state or page
+    mismatch raises :class:`VerificationFailedError`; a missing file
+    raises ``FileNotFoundError`` and every other locking, open or read
+    failure surfaces as ``OSError``. Nothing is written: the inputs are
+    never modified.
+
+    Returns ``{"valid": True, "etag": ..., "generation": ...,
+    "closed": ..., "events": ..., "next": ...}`` in that order, with
+    the tag's 64-digit lowercase digest and the verified proof's
+    generation, closed state and search result.
+    """
+    if not isinstance(checkpoint_path, str) or not checkpoint_path \
+            or not isinstance(proof_path, str) or not proof_path:
+        raise ValueError("checkpoint_path and proof_path must be "
+                         "non-empty strings")
+    if not isinstance(etag, str) or _ETAG.fullmatch(etag) is None:
+        raise ValueError("etag must be a single strong tag: one "
+                         "double-quoted string of 64 lowercase "
+                         "hexadecimal digits")
+
+    checkpoint_real = os.path.realpath(checkpoint_path)
+    proof_real = os.path.realpath(proof_path)
+
+    # One complete read under the shared lock, exactly like the
+    # snapshot download: a racing export is observed as either the
+    # complete old or the complete new checkpoint, and the tag check
+    # below binds every later decision to those very bytes.
+    with _file_lock(checkpoint_real, shared=True):
+        with open(checkpoint_real, "rb") as handle:
+            checkpoint_raw = handle.read()
+    digest = hashlib.sha256(checkpoint_raw).hexdigest()
+    if digest != etag[1:-1]:
+        raise VerificationFailedError(
+            "checkpoint bytes do not match the verified tag")
+    generations = _parse_checkpoint(checkpoint_real, checkpoint_raw)
+
+    with open(proof_real, "rb") as handle:
+        proof_raw = handle.read()
+    proof = _parse_proof(proof_real, proof_raw)
+
+    outcome = _verify_against_generations(checkpoint_real, generations,
+                                          proof)
+    return {"valid": True, "etag": digest,
+            "generation": outcome["generation"],
+            "closed": outcome["closed"], "events": outcome["events"],
+            "next": outcome["next"]}
 
 
 def read_snapshot(checkpoint_path: str) -> tuple[bytes, str]:
