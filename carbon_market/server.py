@@ -6,7 +6,7 @@ import urllib.parse
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
-from . import audit
+from . import audit, auth
 
 # Query parameters GET /audit accepts; anything else is an invalid request.
 _AUDIT_PARAMS = ("cursor", "limit", "op", "stage", "key")
@@ -72,15 +72,31 @@ class Handler(BaseHTTPRequestHandler):
         if tokens is None or len(tokens) != 1 or not tokens[0].strip():
             self._json(HTTPStatus.UNAUTHORIZED, {"error": "unauthorized"})
             return
-        expected = getattr(self.server, "audit_token").encode("utf-8")
-        if not hmac.compare_digest(tokens[0].encode("utf-8"), expected):
-            self._json(HTTPStatus.FORBIDDEN, {"error": "forbidden"})
-            return
+
+        if getattr(self.server, "auth_path", None) is not None:
+            record = self._multi_token_authenticate(tokens[0])
+            if record is None:
+                return  # the helper already sent 403/503
+        else:
+            expected = getattr(self.server, "audit_token").encode("utf-8")
+            if not hmac.compare_digest(tokens[0].encode("utf-8"), expected):
+                self._json(HTTPStatus.FORBIDDEN, {"error": "forbidden"})
+                return
+            record = None
 
         try:
             params = _parse_audit_params(query)
         except ValueError:
             self._json(HTTPStatus.BAD_REQUEST, {"error": "invalid_request"})
+            return
+
+        # Scopes are enforced only after parameter validation and before
+        # the journal is touched: an out-of-scope request must never open
+        # the audit file or learn which record its token matched.
+        if record is not None and not auth.check_scope(
+                record, params.get("op"), params.get("stage"),
+                params.get("key")):
+            self._json(HTTPStatus.FORBIDDEN, {"error": "forbidden"})
             return
 
         kwargs: dict[str, object] = {}
@@ -103,6 +119,26 @@ class Handler(BaseHTTPRequestHandler):
         else:
             self._json(HTTPStatus.OK, result)
 
+    def _multi_token_authenticate(self, token: str) -> auth.Record | None:
+        # The configuration is re-read on every request so a same-directory
+        # atomic rotation takes effect without a restart; each request is
+        # evaluated against one complete snapshot, old or new. A file that
+        # has vanished or become invalid makes authorization unavailable
+        # rather than failing open or closed on a stale snapshot.
+        try:
+            config = auth.load_config(getattr(self.server, "auth_path"))
+        except auth.AuthConfigError:
+            self._json(HTTPStatus.SERVICE_UNAVAILABLE,
+                       {"error": "auth_unavailable"})
+            return None
+        record = auth.authenticate(config, token)
+        if record is None:
+            # Unknown token and expired grace deadline are identical to
+            # the client and reveal no record detail.
+            self._json(HTTPStatus.FORBIDDEN, {"error": "forbidden"})
+            return None
+        return record
+
     def _json(self, status: HTTPStatus, payload: object) -> None:
         body = json.dumps(payload, separators=(",", ":")).encode("utf-8")
         self.send_response(status)
@@ -116,8 +152,9 @@ class Handler(BaseHTTPRequestHandler):
 
 
 def serve(host: str, port: int, audit_path: str | None = None,
-          token: str | None = None) -> None:
+          token: str | None = None, auth_path: str | None = None) -> None:
     with ThreadingHTTPServer((host, port), Handler) as server:
         server.audit_path = audit_path  # type: ignore[attr-defined]
         server.audit_token = token  # type: ignore[attr-defined]
+        server.auth_path = auth_path  # type: ignore[attr-defined]
         server.serve_forever()
