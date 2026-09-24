@@ -113,7 +113,15 @@ class ExportBasicsTest(_Fixture):
         self.assertEqual(list(proof),
                          ["version", "generation", "params", "result",
                           "log_bytes", "log_digest", "head", "closed",
-                          "anchor_digest"])
+                          "anchor_digest", "checkpoint_etag"])
+        self.assertEqual(proof["version"], 2)
+        # The proof binds the strong tag of the checkpoint bytes left
+        # behind by its own anchor commit -- the exact tag the
+        # checkpoint download serves.
+        raw_checkpoint = open(self.checkpoint, "rb").read()
+        self.assertEqual(
+            proof["checkpoint_etag"],
+            '"' + hashlib.sha256(raw_checkpoint).hexdigest() + '"')
         self.assertEqual(proof["params"],
                          {"cursor": None, "limit": 2, "op": "copy",
                           "stage": None, "key": None})
@@ -186,7 +194,10 @@ class AppendAndGenerationTest(_Fixture):
         self.assertNotEqual(anchors[0]["digest"], anchors[1]["digest"])
         self.assertFalse(anchors[0]["closed"])
         self.assertFalse(anchors[1]["closed"])
-        self._verify(p1)
+        # Only the proof bound to the current checkpoint snapshot
+        # verifies; p1 names the pre-append bytes and is rejected.
+        with self.assertRaises(audit_proof.BundleMismatchError):
+            self._verify(p1)
         self._verify(p2)
 
     def test_deleted_event_is_rejected_without_appending(self) -> None:
@@ -221,7 +232,7 @@ class AppendAndGenerationTest(_Fixture):
         self._record_all("a")
         p1 = self._export()
         # Rotate the bytes (extra newline) without touching events; the
-        # chain stays continuous and both proofs verify offline.
+        # chain stays continuous and the new proof verifies offline.
         with open(self.journal, "ab") as handle:
             handle.write(b"\n")
         p2 = self._export()
@@ -232,7 +243,10 @@ class AppendAndGenerationTest(_Fixture):
         self.assertNotEqual(anchors[1]["log_digest"],
                             anchors[0]["log_digest"])
         self.assertEqual(p2["head"], p1["head"])
-        self._verify(p1)
+        # The rotation changed the checkpoint bytes, so the pre-rotation
+        # proof is bound to a snapshot that no longer exists.
+        with self.assertRaises(audit_proof.BundleMismatchError):
+            self._verify(p1)
         self._verify(p2)
 
     def _extend_checkpoint(self, manifest: list) -> None:
@@ -259,9 +273,12 @@ class AppendAndGenerationTest(_Fixture):
         manifest = self._anchors()[0]["manifest"]
         self._extend_checkpoint(
             [manifest[0], ["b", "0" * 64], manifest[1]])
-        # The extended checkpoint validates, so the old proof verifies.
-        self.assertEqual(
-            [item[0] for item in self._verify(proof)["events"]], ["a", "c"])
+        # The extended checkpoint still validates as a snapshot, but
+        # the old proof is bound to the pre-extension bytes and no
+        # longer verifies against it.
+        audit_proof.read_snapshot(self.checkpoint)
+        with self.assertRaises(audit_proof.BundleMismatchError):
+            self._verify(proof)
 
     def test_inserted_key_cannot_rewrite_a_known_digest(self) -> None:
         self._record_all("a", "c")
@@ -290,8 +307,10 @@ class FinalCloseTest(_Fixture):
         self.assertEqual(anchors[1]["previous"], anchors[0]["digest"])
         self.assertFalse(open_proof["closed"])
         self.assertTrue(closed_proof["closed"])
-        self.assertEqual(
-            self._verify(open_proof)["closed"], False)
+        # The closing anchor changed the checkpoint bytes, so the open
+        # proof's snapshot binding no longer matches.
+        with self.assertRaises(audit_proof.BundleMismatchError):
+            self._verify(open_proof)
         self.assertEqual(
             self._verify(closed_proof)["closed"], True)
 
@@ -334,7 +353,9 @@ class GenerationSequenceTest(_Fixture):
         self.assertTrue(g1_last["closed"])
         # The anchor chain continues across the generation boundary.
         self.assertEqual(g2_first["previous"], g1_last["digest"])
-        self.assertEqual(self._verify(p1)["generation"], "g1")
+        # p1 is bound to the checkpoint snapshot before g2 opened.
+        with self.assertRaises(audit_proof.BundleMismatchError):
+            self._verify(p1)
         self.assertEqual(self._verify(p2)["generation"], "g2")
 
     def test_new_generation_cannot_start_while_previous_is_open(self) -> None:
@@ -413,7 +434,81 @@ class OfflineVerifyTest(_Fixture):
             self._verify(other)
 
 
-class TamperedProofTest(_Fixture):
+class SnapshotBindingTest(_Fixture):
+    def test_proof_binds_the_committed_checkpoint_tag(self) -> None:
+        self._record_all("a")
+        proof = self._export()
+        raw = open(self.checkpoint, "rb").read()
+        self.assertEqual(proof["checkpoint_etag"],
+                         '"' + hashlib.sha256(raw).hexdigest() + '"')
+        self._verify(proof)
+
+    def test_duplicate_export_binds_the_unchanged_tag(self) -> None:
+        self._record_all("a")
+        first = self._export(limit=1)
+        second = self._export(limit=5)
+        self.assertEqual(first["checkpoint_etag"],
+                         second["checkpoint_etag"])
+        self._verify(second)
+
+    def test_new_anchor_moves_the_bound_tag(self) -> None:
+        self._record_all("a")
+        p1 = self._export()
+        self._record_all("b")
+        p2 = self._export()
+        self.assertNotEqual(p1["checkpoint_etag"], p2["checkpoint_etag"])
+        self.assertEqual(
+            p2["checkpoint_etag"],
+            '"' + hashlib.sha256(open(self.checkpoint, "rb").read())
+            .hexdigest() + '"')
+        with self.assertRaises(audit_proof.BundleMismatchError):
+            self._verify(p1)
+        self._verify(p2)
+
+    def test_replaced_checkpoint_snapshot_is_rejected(self) -> None:
+        # A proof verifies only against the exact checkpoint bytes it
+        # was exported from, never against a re-created lookalike.
+        self._record_all("a")
+        proof = self._export()
+        original = open(self.checkpoint, "rb").read()
+        self._record_all("b")
+        self._export()
+        _write_bytes(self.checkpoint, original)
+        self._verify(proof)
+        self._record_all("c")
+        self._export()
+        with self.assertRaises(audit_proof.BundleMismatchError):
+            self._verify(proof)
+
+    def test_tampered_checkpoint_etag_is_a_mismatch(self) -> None:
+        self._record_all("a")
+        proof = self._export()
+        proof["checkpoint_etag"] = '"' + "0" * 64 + '"'
+        with self.assertRaises(audit_proof.BundleMismatchError):
+            self._verify(proof)
+
+    def test_malformed_checkpoint_etag_is_a_format_error(self) -> None:
+        self._record_all("a")
+        proof = self._export()
+        for bad in (0, None, "unquoted", '"' + "0" * 63 + '"',
+                    'W/"' + "0" * 64 + '"'):
+            with self.subTest(bad=bad):
+                tampered = copy.deepcopy(proof)
+                tampered["checkpoint_etag"] = bad
+                with self.assertRaises(audit_proof.BundleFormatError):
+                    self._verify(tampered)
+
+    def test_version_one_proof_is_an_incomplete_structure(self) -> None:
+        self._record_all("a")
+        proof = self._export()
+        # A version 1 proof carries no snapshot binding at all.
+        del proof["checkpoint_etag"]
+        proof["version"] = 1
+        with self.assertRaises(audit_proof.BundleFormatError):
+            self._verify(proof)
+
+
+
     def _tampered(self, **changes: object) -> dict:
         self._record_all("a", "b", "c")
         proof = self._export(limit=2)

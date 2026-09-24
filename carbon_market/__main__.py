@@ -88,7 +88,7 @@ def _verify_bundle(args: argparse.Namespace) -> None:
              "closed": result["closed"],
              "events": result["events"], "next": result["next"]},
             ensure_ascii=False, separators=(",", ":"), allow_nan=False)
-    except audit_proof._MismatchError:
+    except audit_proof.BundleMismatchError:
         _fail("verification_failed", 4)
     except ValueError:
         _fail("invalid_bundle", 3)

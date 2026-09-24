@@ -428,16 +428,79 @@ class VerificationFailedTest(_Fixture):
         self._export("g1")
         stale = self._etag()
         self._record("b")
-        audit_proof.export(self.journal, self.checkpoint, "g1")
+        proof2 = audit_proof.export(self.journal, self.checkpoint, "g1")
         status, _, stderr = self._run_bundle(etag=stale)
         self.assertEqual(status, 4)
         self.assertEqual(json.loads(stderr),
                          {"error": "verification_failed"})
-        # The new tag with the old proof still verifies: anchors only
-        # ever append, so the combination stays self-consistent.
+        # The old proof is bound to the old snapshot: even with the new
+        # tag its checkpoint_etag disagrees with the checkpoint bytes.
+        status, _, stderr = self._run_bundle()
+        self.assertEqual(status, 4)
+        self.assertEqual(json.loads(stderr),
+                         {"error": "verification_failed"})
+        # The proof exported from the current snapshot verifies.
+        with open(self.proof_path, "w", encoding="utf-8") as handle:
+            handle.write(json.dumps(proof2, ensure_ascii=False))
         status, stdout, _ = self._run_bundle()
         self.assertEqual(status, 0)
         self.assertEqual(json.loads(stdout)["etag"], self._etag())
+
+    def test_old_checkpoint_with_new_proof_is_verification_failed(
+            self) -> None:
+        self._record("a")
+        self._export("g1")
+        old_bytes = open(self.checkpoint, "rb").read()
+        self._record("b")
+        proof2 = audit_proof.export(self.journal, self.checkpoint, "g1")
+        with open(self.proof_path, "w", encoding="utf-8") as handle:
+            handle.write(json.dumps(proof2, ensure_ascii=False))
+        # Roll the checkpoint file back to the previous snapshot: the
+        # proof's bound tag names the newer bytes.
+        etag = self._write(self.checkpoint, old_bytes)
+        status, _, stderr = self._run_bundle(etag=etag)
+        self.assertEqual(status, 4)
+        self.assertEqual(json.loads(stderr),
+                         {"error": "verification_failed"})
+
+    def test_tag_from_another_download_is_verification_failed(self) -> None:
+        self._record("a")
+        self._export("g1")
+        # A tag computed over a different checkpoint response -- even a
+        # well-formed strong tag -- is not this snapshot's tag.
+        other = os.path.join(self.tmp.name, "other.json")
+        audit_proof.export(self.journal, other, "g1", final=True)
+        foreign = self._etag(other)
+        status, _, stderr = self._run_bundle(etag=foreign)
+        self.assertEqual(status, 4)
+        self.assertEqual(json.loads(stderr),
+                         {"error": "verification_failed"})
+
+    def test_version_one_proof_is_invalid_bundle(self) -> None:
+        self._record("a")
+        proof = self._export("g1")
+        # A version 1 proof carries no snapshot binding: it is an
+        # incomplete proof structure, not a mismatch.
+        del proof["checkpoint_etag"]
+        proof["version"] = 1
+        with open(self.proof_path, "w", encoding="utf-8") as handle:
+            handle.write(json.dumps(proof, ensure_ascii=False))
+        status, stdout, stderr = self._run_bundle()
+        self.assertEqual(status, 3)
+        self.assertEqual(stdout, "")
+        self.assertEqual(json.loads(stderr), {"error": "invalid_bundle"})
+
+    def test_tampered_checkpoint_etag_is_verification_failed(self) -> None:
+        self._record("a")
+        proof = self._export("g1")
+        proof["checkpoint_etag"] = '"' + "0" * 64 + '"'
+        with open(self.proof_path, "w", encoding="utf-8") as handle:
+            handle.write(json.dumps(proof, ensure_ascii=False))
+        status, stdout, stderr = self._run_bundle()
+        self.assertEqual(status, 4)
+        self.assertEqual(stdout, "")
+        self.assertEqual(json.loads(stderr),
+                         {"error": "verification_failed"})
 
 
 class ConcurrencyTest(_Fixture):
@@ -453,6 +516,12 @@ class ConcurrencyTest(_Fixture):
             try:
                 self._record(f"new{index}")
                 audit_proof.export(self.journal, self.checkpoint, "g1")
+            except audit_proof.BundleMismatchError:
+                # A record that lands before an already anchored key
+                # rewrites that key's sealed digest; the racing export
+                # is then rejected and appends nothing -- itself a
+                # self-consistent outcome.
+                pass
             except BaseException as exc:  # pragma: no cover
                 failures.append(exc)
 
@@ -462,7 +531,7 @@ class ConcurrencyTest(_Fixture):
                     try:
                         result = audit_proof.verify_bundle(
                             self.checkpoint, self.proof_path, self._etag())
-                    except audit_proof._MismatchError:
+                    except audit_proof.BundleMismatchError:
                         # The tag was computed from a version the locked
                         # read no longer saw: a complete old or new
                         # combination, never a torn one.

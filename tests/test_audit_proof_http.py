@@ -192,7 +192,15 @@ class ProofHttpTest(_HttpFixture):
         self.assertEqual(list(body),
                          ["version", "generation", "params", "result",
                           "log_bytes", "log_digest", "head", "closed",
-                          "anchor_digest"])
+                          "anchor_digest", "checkpoint_etag"])
+        self.assertEqual(body["version"], 2)
+        # The proof binds the strong tag of the checkpoint snapshot it
+        # was exported from -- the same tag GET /audit/checkpoint
+        # would serve for these bytes.
+        raw_checkpoint = open(self.checkpoint, "rb").read()
+        self.assertEqual(
+            body["checkpoint_etag"],
+            '"' + hashlib.sha256(raw_checkpoint).hexdigest() + '"')
         self.assertEqual(body["generation"], "g1")
         self.assertIs(body["closed"], False)
         self.assertEqual(body["params"],
