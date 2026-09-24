@@ -59,6 +59,11 @@ returns the proof's original search result together with its generation
 and closed state. Any change to the embedded log bytes, parameters, page
 content, cursor or any digest raises ``ValueError``.
 
+:func:`snapshot` is the read-only counterpart: it returns the
+checkpoint's raw bytes and their SHA-256 ETag, read and validated under
+the checkpoint's shared flock, so downloads never observe a
+half-committed checkpoint.
+
 Exports only accept a complete version 2 journal: a version 1 journal,
 a broken digest chain or a malformed checkpoint structure raises
 ``ValueError``. Invalid argument types, an empty generation name, a
@@ -93,7 +98,7 @@ from typing import Any, Iterator
 from . import audit
 from ._jsonio import strict_loads
 
-__all__ = ["export", "verify"]
+__all__ = ["export", "snapshot", "verify"]
 
 _VERSION = 1
 _ROOT_FIELDS = ("version", "generations")
@@ -656,6 +661,36 @@ def _search_document(document: dict[str, Any], params: dict[str, Any]) \
         page = matches[:limit]
         return {"events": page, "next": page[-1][0]}
     return {"events": matches, "next": None}
+
+
+def snapshot(checkpoint_path: str) -> tuple[bytes, str]:
+    """Read the validated checkpoint bytes and their ETag, read-only.
+
+    The checkpoint is opened, read, validated and hashed while holding
+    the same shared kernel flock :func:`verify` uses and :func:`export`
+    takes exclusively, so a concurrent export is observed as either the
+    complete old checkpoint or the complete new one, never a
+    half-committed mixture. The returned bytes are exactly the file's raw
+    UTF-8 content -- nothing is reordered or reserialized -- and the
+    ETag is the lowercase hexadecimal SHA-256 of those very bytes, so a
+    conditional decision made against them stays consistent.
+
+    ``checkpoint_path`` must be a non-empty string. A missing checkpoint
+    raises ``FileNotFoundError``; invalid UTF-8, malformed JSON, an
+    unsupported version, a wrong field order or a broken anchor or
+    digest chain raises ``ValueError``; every other locking or I/O
+    failure raises ``OSError``.
+    """
+    if not isinstance(checkpoint_path, str) or not checkpoint_path:
+        raise ValueError("checkpoint_path must be a non-empty string")
+    checkpoint_real = os.path.realpath(checkpoint_path)
+    with _file_lock(checkpoint_real, shared=True):
+        generations, raw = _read_checkpoint(checkpoint_real)
+        if generations is None or raw is None:
+            raise FileNotFoundError(
+                f"checkpoint file {checkpoint_real!r} does not exist")
+        etag = hashlib.sha256(raw).hexdigest()
+    return raw, etag
 
 
 def verify(checkpoint_path: str, proof: dict[str, Any]) -> dict[str, Any]:

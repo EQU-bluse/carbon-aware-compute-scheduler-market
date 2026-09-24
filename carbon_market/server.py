@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hmac
 import json
+import re
 import urllib.parse
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -17,6 +18,9 @@ _PROOF_PARAMS = ("generation", "final") + _AUDIT_PARAMS
 _OPS = ("copy", "restore")
 _STAGES = ("成功", "校验", "执行", "同步", "回滚")
 _MAX_LIMIT = 1000
+# A conditional checkpoint download names the snapshot by a single
+# strong ETag: the quoted 64-digit lowercase SHA-256 of its bytes.
+_IF_NONE_MATCH = re.compile(r'"[0-9a-f]{64}"')
 
 
 def _decode_component(text: str) -> str:
@@ -90,6 +94,10 @@ class Handler(BaseHTTPRequestHandler):
         if path == "/audit/proof" \
                 and getattr(self.server, "audit_checkpoint", None) is not None:
             self._proof(query)
+            return
+        if path == "/audit/checkpoint" \
+                and getattr(self.server, "audit_checkpoint", None) is not None:
+            self._checkpoint(query)
             return
         self._json(HTTPStatus.NOT_FOUND, {"error": "not_found"})
 
@@ -212,8 +220,82 @@ class Handler(BaseHTTPRequestHandler):
         else:
             self._json(HTTPStatus.OK, proof)
 
+    def _parse_if_none_match(self) -> str | None:
+        # The conditional header is optional; when given it must appear
+        # exactly once and be a single strong ETag -- the quoted 64-digit
+        # lowercase digest. A missing, blank, repeated or malformed value
+        # is an invalid request and the checkpoint is never opened.
+        values = self.headers.get_all("If-None-Match")
+        if values is None:
+            return None
+        if len(values) != 1:
+            raise ValueError("If-None-Match must appear exactly once")
+        value = values[0].strip()
+        if not _IF_NONE_MATCH.fullmatch(value):
+            raise ValueError("If-None-Match must be a single quoted "
+                             "64-digit lowercase digest")
+        return value[1:-1]
+
+    def _checkpoint(self, query: str) -> None:
+        authorized, record = self._authorize()
+        if not authorized:
+            return
+
+        # The download takes no parameters at all: the checkpoint file
+        # is fixed at startup and the client can neither select nor
+        # probe its location.
+        try:
+            _parse_query(query, ())
+            conditional = self._parse_if_none_match()
+        except ValueError:
+            self._json(HTTPStatus.BAD_REQUEST, {"error": "invalid_request"})
+            return
+
+        # The snapshot exposes the complete checkpoint, so only a token
+        # whose operation, stage and history-key scopes are all "*"
+        # may download it; any restricted scope is a plain 403, checked
+        # before the checkpoint is ever opened.
+        if record is not None and (record.ops is not None
+                                   or record.stages is not None
+                                   or record.keys is not None):
+            self._json(HTTPStatus.FORBIDDEN, {"error": "forbidden"})
+            return
+
+        try:
+            raw, etag = audit_proof.snapshot(
+                getattr(self.server, "audit_checkpoint"))
+        except FileNotFoundError:
+            # Never leak the configured path or the system message.
+            self._json(HTTPStatus.NOT_FOUND,
+                       {"error": "checkpoint_not_found"})
+            return
+        except ValueError:
+            self._json(HTTPStatus.CONFLICT, {"error": "checkpoint_invalid"})
+            return
+        except OSError:
+            self._json(HTTPStatus.SERVICE_UNAVAILABLE,
+                       {"error": "checkpoint_unavailable"})
+            return
+
+        # The 304 decision compares against the ETag of the exact bytes
+        # just read and validated under the checkpoint's shared lock.
+        if conditional == etag:
+            self.send_response(HTTPStatus.NOT_MODIFIED)
+            self.send_header("ETag", f'"{etag}"')
+            self.end_headers()
+            return
+        self.send_response(HTTPStatus.OK)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(raw)))
+        self.send_header("ETag", f'"{etag}"')
+        self.end_headers()
+        self.wfile.write(raw)
+
     def _json(self, status: HTTPStatus, payload: object) -> None:
-        body = json.dumps(payload, separators=(",", ":")).encode("utf-8")
+        # Compact JSON with non-ASCII written through as UTF-8 and no
+        # trailing newline.
+        body = json.dumps(payload, ensure_ascii=False,
+                          separators=(",", ":")).encode("utf-8")
         self.send_response(status)
         self.send_header("Content-Type", "application/json")
         self.send_header("Content-Length", str(len(body)))

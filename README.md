@@ -51,6 +51,14 @@ python -m carbon_market serve --host 127.0.0.1 --port 8000 --audit PATH --token 
 
 The same authorization as `GET /audit` applies, in the same order (401/403, 400 `invalid_request`, scoped filters 403, 503 `auth_unavailable`). The query takes a mandatory non-empty `generation` name, an optional `final` flag (exactly `true` or `false`, defaulting to `false`) and the usual `cursor`, `limit`, `op`, `stage` and `key` filters. A successful export answers 200 with the offline-savable proof object, its page computed from the same journal snapshot the proof seals. A missing journal or checkpoint parent directory gets 404 `proof_not_found` (the real paths never leak); an invalid chain, checkpoint, generation state or growth relation gets 409 `proof_invalid` and appends no anchor; locking or I/O failures get 503 `proof_unavailable` with the old checkpoint preserved.
 
+## Checkpoint download endpoint
+
+`--checkpoint` also enables `GET /audit/checkpoint`, a read-only download of the checkpoint snapshot fixed at startup. The path takes no parameters and clients can never select or probe the checkpoint location.
+
+The same authorization as `GET /audit` applies, in the same order (401/403, 400 `invalid_request`, 503 `auth_unavailable`); under `--auth` only a token whose operation, stage and history-key scopes are all `"*"` may download — any restricted scope gets 403. A successful download answers 200 with the checkpoint's raw UTF-8 bytes exactly as read and validated under the checkpoint's shared lock (never reordered or reserialized), `Content-Type: application/json` and a strong `ETag` holding the lowercase SHA-256 of the response bytes.
+
+A request may carry one `If-None-Match` header with a single quoted 64-digit lowercase digest; a value equal to the current ETag gets 304 with an empty body and the same `ETag`, any other valid value gets the full 200. A missing, blank, repeated or malformed conditional header gets 400 `invalid_request` without the checkpoint ever being opened. A missing checkpoint gets 404 `checkpoint_not_found`; invalid UTF-8, JSON, version, field order, anchor or digest chain gets 409 `checkpoint_invalid`; other I/O failures get 503 `checkpoint_unavailable`.
+
 ## Test
 
 ```bash
