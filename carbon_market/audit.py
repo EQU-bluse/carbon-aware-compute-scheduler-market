@@ -18,19 +18,30 @@ one of ``"校验"``, ``"执行"``, ``"同步"`` and ``"回滚"``.
 key with the same event returns a copy of it together with ``False`` and
 writes nothing, while the same key with a different event is a conflict
 and raises ``ValueError``. A new key appends its event, creates the file
-when missing, and returns the event copy together with ``True``.
-:func:`get` is strictly read-only and returns a copy of the event stored
-under a key; an unknown key raises ``KeyError(key)``.
+when missing, and returns the event copy together with ``True``. The
+caller may pass the event's fields in any order -- only the field set
+must match exactly -- and the event is stored and returned in the
+public order. :func:`get` is strictly read-only and returns a copy of
+the event stored under a key; an unknown key raises ``KeyError(key)``.
 
-Both functions resolve the journal to its real path and guard the file
-with a per-realpath lock that excludes both threads of this process and
-other processes: :func:`record` holds an exclusive kernel flock on the
-companion lock file (``path + ".lock"``) around the whole
-validate/replace sequence and :func:`get` holds a shared one only while
-opening and reading, so a reader racing a writer observes either the
-complete previous document or the complete new one -- never a truncated
-or half-replaced file. The kernel releases the flock on process exit, so
-a leftover lock file never blocks a later call.
+:func:`search` is the read-only paginated query: it scans the journal in
+ascending audit-key code-point order, keeps only the events at keys
+strictly greater than an optional exclusive cursor and matching every
+given filter -- op, failure stage (``"成功"`` selects the successful
+events) and history key, combined with logical AND -- and returns one
+page of ``[audit_key, event]`` pairs together with the cursor to resume
+from, or ``None`` when the page is the last. Non-matching events never
+consume page capacity.
+
+All three functions resolve the journal to its real path and guard the
+file with a per-realpath lock that excludes both threads of this process
+and other processes: :func:`record` holds an exclusive kernel flock on
+the companion lock file (``path + ".lock"``) around the whole
+validate/replace sequence and the read-only queries hold a shared one
+only while opening and reading, so a reader racing a writer observes
+either the complete previous document or the complete new one -- never a
+truncated or half-replaced file. The kernel releases the flock on
+process exit, so a leftover lock file never blocks a later call.
 
 A record commits via a same-directory temporary file that is written and
 fsynced, moved over the journal with :func:`os.replace` and followed by
@@ -58,13 +69,18 @@ from typing import Any, Iterator
 
 from ._jsonio import strict_loads
 
-__all__ = ["record", "get"]
+__all__ = ["record", "get", "search"]
 
 _VERSION = 1
 _ROOT_FIELDS = ("version", "events")
 _EVENT_FIELDS = ("op", "target", "key", "changed", "error", "stage")
 _OPS = ("copy", "restore")
 _STAGES = ("校验", "执行", "同步", "回滚")
+# The search stage filter additionally accepts 成功, selecting the
+# events whose error and stage are both null.
+_SEARCH_STAGES = ("成功",) + _STAGES
+_DEFAULT_LIMIT = 100
+_MAX_LIMIT = 1000
 
 
 def check_pair(audit_path: object, audit_key: object) -> bool:
@@ -176,13 +192,23 @@ def _file_lock(realpath: str, *, shared: bool = False) -> Iterator[None]:
         os.close(fd)
 
 
-def _validate_event(raw: object) -> dict[str, Any]:
-    # The field set and its public order are both part of the contract:
-    # an event with a missing/extra field -- or the six fields in another
-    # order -- is malformed and is never reordered and accepted.
-    if not isinstance(raw, dict) or list(raw.keys()) != list(_EVENT_FIELDS):
+def _validate_event(raw: object, *, strict_order: bool) -> dict[str, Any]:
+    # The field set is part of the contract everywhere; the public field
+    # order is enforced only for events read from disk. A caller-passed
+    # event may arrive in any order and is normalized to the public
+    # order -- never reordered on read, where an out-of-order event is
+    # malformed and rejected as it stands.
+    if not isinstance(raw, dict):
         raise ValueError("event must be an object with exactly op, target, "
-                         "key, changed, error and stage, in that order")
+                         "key, changed, error and stage")
+    if strict_order:
+        if list(raw.keys()) != list(_EVENT_FIELDS):
+            raise ValueError(
+                "event fields must be op, target, key, changed, error and "
+                "stage, in that order")
+    elif set(raw.keys()) != set(_EVENT_FIELDS):
+        raise ValueError("event must be an object with exactly op, target, "
+                         "key, changed, error and stage")
     if raw["op"] not in _OPS:
         raise ValueError("event op must be copy or restore")
     for field in ("target", "key"):
@@ -235,7 +261,8 @@ def _validate_document(data: object) -> dict[str, Any]:
     for event_key in event_keys:
         if not isinstance(event_key, str) or not event_key:
             raise ValueError("event keys must be non-empty strings")
-        events[event_key] = _validate_event(events_raw[event_key])
+        events[event_key] = _validate_event(events_raw[event_key],
+                                            strict_order=True)
 
     return {"version": _VERSION, "events": events}
 
@@ -371,13 +398,15 @@ def record(
     """Record one copy/restore audit event under an idempotency ``key``.
 
     ``path`` and ``key`` must be non-empty strings and ``event`` an object
-    with exactly op, target, key, changed, error and stage: ``op`` must be
-    ``"copy"`` or ``"restore"``, ``target`` and the event's own ``key``
-    non-empty strings and ``changed`` a boolean. On success ``error`` and
-    ``stage`` must both be null; on failure ``error`` must be a non-empty
-    exception class name and ``stage`` one of ``"校验"``, ``"执行"``,
-    ``"同步"`` and ``"回滚"``. Any invalid input raises ``ValueError``, and
-    so does ``fault`` being anything other than ``None`` or ``"replace"``.
+    with exactly op, target, key, changed, error and stage -- in any
+    order; the event is stored and returned in the public order. ``op``
+    must be ``"copy"`` or ``"restore"``, ``target`` and the event's own
+    ``key`` non-empty strings and ``changed`` a boolean. On success
+    ``error`` and ``stage`` must both be null; on failure ``error`` must
+    be a non-empty exception class name and ``stage`` one of ``"校验"``,
+    ``"执行"``, ``"同步"`` and ``"回滚"``. Any invalid input raises
+    ``ValueError``, and so does ``fault`` being anything other than
+    ``None`` or ``"replace"``.
 
     Returns ``(event, created)``: ``True`` when this call appended the
     event (creating the journal file if missing), ``False`` when the key
@@ -399,7 +428,7 @@ def record(
     for value in (path, key):
         if not isinstance(value, str) or not value:
             raise ValueError("path and key must be non-empty strings")
-    clean_event = _validate_event(event)
+    clean_event = _validate_event(event, strict_order=False)
     if fault is not None and fault != "replace":
         raise ValueError('fault must be None or "replace"')
 
@@ -424,6 +453,31 @@ def record(
             return dict(clean_event), True
 
 
+def _read_existing_document(realpath: str) -> dict[str, Any]:
+    # Read-only path shared by get and search: the shared flock is held
+    # only while the file is opened and read, so a query racing a writer
+    # observes either the complete previous document or the complete new
+    # one. A missing journal surfaces as FileNotFoundError; malformed
+    # UTF-8/JSON (negative-zero literals included), an unsupported
+    # version or any structural or order deviation raises ValueError --
+    # the document is never reordered and accepted, and never rewritten.
+    with _file_lock(realpath, shared=True):
+        with open(realpath, "rb") as handle:
+            raw = handle.read()
+
+    try:
+        text = raw.decode("utf-8")
+    except UnicodeDecodeError as exc:
+        raise ValueError(
+            f"audit file {realpath!r} is not valid UTF-8") from exc
+    try:
+        data = strict_loads(text)
+    except ValueError as exc:
+        raise ValueError(
+            f"audit file {realpath!r} is not valid JSON") from exc
+    return _validate_document(data)
+
+
 def get(path: str, key: str) -> dict[str, Any]:
     """Return a read-only copy of the audit event stored under ``key``.
 
@@ -443,23 +497,108 @@ def get(path: str, key: str) -> dict[str, Any]:
             raise ValueError("path and key must be non-empty strings")
 
     realpath = os.path.realpath(path)
-    with _file_lock(realpath, shared=True):
-        with open(realpath, "rb") as handle:
-            raw = handle.read()
-
-    try:
-        text = raw.decode("utf-8")
-    except UnicodeDecodeError as exc:
-        raise ValueError(
-            f"audit file {realpath!r} is not valid UTF-8") from exc
-    try:
-        data = strict_loads(text)
-    except ValueError as exc:
-        raise ValueError(
-            f"audit file {realpath!r} is not valid JSON") from exc
-    document = _validate_document(data)
+    document = _read_existing_document(realpath)
 
     events = document["events"]
     if key not in events:
         raise KeyError(key)
     return dict(events[key])
+
+
+def _matches(event: dict[str, Any], op: str | None, stage: str | None,
+             key: str | None) -> bool:
+    # Every provided filter must hold (logical AND). "成功" selects the
+    # successful events -- error and stage both null -- while any other
+    # stage filter names the failure stage to match exactly. The history
+    # key filter is a plain string equality: no prefix matching, case
+    # folding or path normalization.
+    if op is not None and event["op"] != op:
+        return False
+    if stage is not None:
+        if stage == "成功":
+            if event["error"] is not None or event["stage"] is not None:
+                return False
+        elif event["stage"] != stage:
+            return False
+    if key is not None and event["key"] != key:
+        return False
+    return True
+
+
+def search(
+    path: str,
+    cursor: str | None = None,
+    limit: int = _DEFAULT_LIMIT,
+    op: str | None = None,
+    stage: str | None = None,
+    key: str | None = None,
+) -> dict[str, Any]:
+    """Return one page of audit events matching the given filters.
+
+    ``path`` must be a non-empty string. ``cursor`` is ``None`` or a
+    non-empty string -- it need not name an existing event -- and only
+    events whose audit key is strictly greater than it in code-point
+    order are considered. ``limit`` is the page size: an integer from 1
+    to 1000 (booleans are rejected), defaulting to 100. Each of ``op``,
+    ``stage`` and ``key`` is an optional filter; all given filters must
+    hold simultaneously. ``op`` is ``"copy"`` or ``"restore"``; ``stage``
+    is one of ``"成功"`` (events whose error and stage are both null),
+    ``"校验"``, ``"执行"``, ``"同步"`` and ``"回滚"`` (events that failed
+    at that stage); ``key`` matches the event's history key by exact
+    string equality. Any other value raises ``ValueError``.
+
+    The journal is scanned in ascending audit-key code-point order and
+    filtered afterwards, so non-matching events never consume page
+    capacity. Returns ``{"events": [[audit_key, event], ...], "next":
+    cursor_or_none}``: each event is a fresh copy with the public field
+    order, and ``next`` is the audit key of the page's last item when
+    further matching events remain, else ``None``. With no matching
+    events the page is empty and ``next`` is ``None``.
+
+    The query is strictly read-only: a missing journal raises
+    ``FileNotFoundError``; malformed JSON or UTF-8, a negative-zero
+    literal, or an unsupported version, structure or order raises
+    ``ValueError``; any other locking or I/O failure raises ``OSError``.
+    It holds the journal's companion lock shared only while the file is
+    opened and read, so a query racing a writer observes either the
+    complete previous document or the complete new one.
+    """
+    if not isinstance(path, str) or not path:
+        raise ValueError("path must be a non-empty string")
+    if cursor is not None and (not isinstance(cursor, str) or not cursor):
+        raise ValueError("cursor must be None or a non-empty string")
+    # bool is a subclass of int and must be rejected as a page size.
+    if not isinstance(limit, int) or isinstance(limit, bool) \
+            or not 1 <= limit <= _MAX_LIMIT:
+        raise ValueError("limit must be an integer between 1 and 1000")
+    if op is not None and op not in _OPS:
+        raise ValueError('op filter must be "copy" or "restore"')
+    if stage is not None and stage not in _SEARCH_STAGES:
+        raise ValueError(
+            "stage filter must be one of 成功, 校验, 执行, 同步, 回滚")
+    if key is not None and (not isinstance(key, str) or not key):
+        raise ValueError("key filter must be a non-empty string")
+
+    realpath = os.path.realpath(path)
+    document = _read_existing_document(realpath)
+
+    # The persisted events are validated to be in ascending key
+    # code-point order, so the document order is the scan order. One
+    # extra match is collected to learn whether the page is the last.
+    matches: list[list[Any]] = []
+    for audit_key, event in document["events"].items():
+        if cursor is not None and audit_key <= cursor:
+            continue
+        if not _matches(event, op, stage, key):
+            continue
+        matches.append([audit_key, dict(event)])
+        if len(matches) > limit:
+            break
+
+    if len(matches) > limit:
+        page = matches[:limit]
+        next_cursor: str | None = page[-1][0]
+    else:
+        page = matches
+        next_cursor = None
+    return {"events": page, "next": next_cursor}
