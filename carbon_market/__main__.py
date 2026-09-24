@@ -57,6 +57,11 @@ def parser() -> argparse.ArgumentParser:
     bundle.add_argument(
         "--etag", action=_Once, required=True,
         help="strong ETag the checkpoint download carried")
+    bundle.add_argument(
+        "--trust-dir", action=_Once, default=None,
+        help="directory retaining the trusted snapshot sequence; "
+             "when given, the verified checkpoint must continue the "
+             "retained chain and advances its head")
     # Usage errors of this command surface as the compact invalid_request
     # failure object on stderr, not as argparse's usage text.
     bundle.error = _raise_usage
@@ -72,16 +77,18 @@ def _fail(code: str, status: int) -> None:
 
 
 def _verify_bundle(args: argparse.Namespace) -> None:
-    # All three options are required and may appear at most once
-    # (argparse enforces both); an empty value or a tag that is not one
-    # quoted 64-digit lowercase digest is a usage error too, and no
-    # argument error may read the input files.
+    # The three bundle options are required and may appear at most once
+    # (argparse enforces both); an empty value, a tag that is not one
+    # quoted 64-digit lowercase digest or an empty --trust-dir is a
+    # usage error too, and no argument error may read the input files.
     if not args.checkpoint or not args.proof or not args.etag \
-            or not audit_proof._ETAG_RE.fullmatch(args.etag):
+            or not audit_proof._ETAG_RE.fullmatch(args.etag) \
+            or (args.trust_dir is not None and not args.trust_dir):
         _fail("invalid_request", 2)
     try:
         result = audit_proof.verify_bundle(
-            args.checkpoint, args.proof, args.etag)
+            args.checkpoint, args.proof, args.etag,
+            trust_dir=args.trust_dir)
         payload = json.dumps(
             {"valid": True, "etag": args.etag,
              "generation": result["generation"],

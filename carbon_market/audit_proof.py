@@ -84,6 +84,33 @@ snapshot-binding mismatch raises ``BundleMismatchError``; both are
 public ``ValueError`` subclasses that let the command-line entry tell a
 malformed bundle apart from a failed verification.
 
+The strong-tag binding pairs one checkpoint with one proof, but a
+complete old bundle still verifies on its own. The optional
+``trust_dir`` of :func:`verify_bundle` closes that replay gap with a
+persistent snapshot sequence retained on this machine: after the
+single-bundle verification above succeeds, the verified checkpoint is
+compared with the latest trusted snapshot under the trust directory's
+exclusive lock and the chain head advances. A first use with a
+not-yet-existing directory establishes the trust anchor from the
+verified checkpoint and saves its original bytes; a later bundle
+carrying the same strong tag is an idempotent replay that is fully
+rechecked and rewrites nothing; a new tag is accepted only when its
+checkpoint is a strictly append-only successor of the latest trusted
+one -- every retained generation, anchor, field and value unchanged,
+with only legal generations or anchors appended. Each sequence node
+binds the current tag, the predecessor tag, the digest of the
+checkpoint bytes and the previous node digest, and the chain head names
+only the last complete node, so a restarted process still verifies the
+true predecessor relation. An already retained older version, a fork
+that deleted or rewrote old anchors, or a bundle that cannot continue
+the chain is rejected as a rollback with ``BundleMismatchError``; a
+tampered node, chain digest or head relation is never repaired or
+overwritten with the current bundle. Directory updates serialize on an
+exclusive cross-process lock and commit through same-directory
+temporary files, fsync, atomic replace and a directory fsync, so any
+failure preserves the pre-call chain head, unreferenced complete nodes
+are reused on re-entry, and leftover fragments never participate.
+
 Exports only accept a complete version 2 journal: a version 1 journal,
 a broken digest chain or a malformed checkpoint structure raises
 ``ValueError``. Invalid argument types, an empty generation name, a
@@ -139,6 +166,20 @@ _HEXADECIMAL = frozenset("0123456789abcdef")
 # conditional download accepts and serves, and the same shape a proof
 # carries in its checkpoint_etag binding.
 _ETAG_RE = re.compile(r'"[0-9a-f]{64}"')
+
+# The trust directory retains the persistent snapshot sequence: a head
+# file naming the last complete node, one content-addressed node file
+# per accepted checkpoint and one content-addressed snapshot file per
+# checkpoint's original bytes. Node and head documents are compact
+# UTF-8 JSON with a fixed field order, validated exactly like the
+# checkpoint and the proof.
+_TRUST_VERSION = 1
+_TRUST_HEAD_FIELDS = ("version", "head")
+_TRUST_NODE_FIELDS = ("version", "tag", "previous_tag",
+                      "checkpoint_digest", "previous", "digest")
+_TRUST_HEAD_NAME = "head.json"
+_TRUST_NODE_PREFIX = "node-"
+_TRUST_CHECKPOINT_PREFIX = "checkpoint-"
 
 
 class BundleFormatError(ValueError):
@@ -897,15 +938,338 @@ def _loads_bundle(raw: bytes) -> Any:
         raise BundleFormatError("bundle file is not valid JSON") from exc
 
 
+def _node_digest(tag: str, previous_tag: str | None,
+                 checkpoint_digest: str, previous: str | None) -> str:
+    # The four-part binding every sequence node commits to: the current
+    # strong tag, the predecessor tag, the digest of the checkpoint
+    # bytes and the previous node digest.
+    return hashlib.sha256(_compact(
+        [tag, previous_tag, checkpoint_digest, previous])).hexdigest()
+
+
+def _serialize_trust(document: dict[str, Any]) -> bytes:
+    # The same compact UTF-8 JSON convention as the checkpoint, with a
+    # single trailing newline.
+    return (json.dumps(document, ensure_ascii=False, separators=(",", ":"),
+                       allow_nan=False) + "\n").encode("utf-8")
+
+
+def _load_trust_json(path: str) -> Any:
+    # Trust metadata follows the bundle's decoding rules: an encoding
+    # failure, a negative-zero or non-finite literal, or a JSON grammar
+    # error is a format error, never a mismatch.
+    with open(path, "rb") as handle:
+        raw = handle.read()
+    try:
+        text = raw.decode("utf-8")
+    except UnicodeDecodeError as exc:
+        raise BundleFormatError("trust metadata is not valid UTF-8") \
+            from exc
+    try:
+        return finite_loads(text)
+    except ValueError as exc:
+        raise BundleFormatError("trust metadata is not valid JSON") from exc
+
+
+def _validate_trust_head(data: object) -> str:
+    if not isinstance(data, dict) \
+            or list(data.keys()) != list(_TRUST_HEAD_FIELDS):
+        raise BundleFormatError("trust head must be an object with keys "
+                                "version and head, in that order")
+    version = data["version"]
+    if not isinstance(version, int) or isinstance(version, bool) \
+            or version != _TRUST_VERSION:
+        raise BundleFormatError("unsupported trust head version")
+    head = data["head"]
+    if not _is_digest(head):
+        raise BundleFormatError("trust head must name a 64-digit "
+                                "lowercase hexadecimal node digest")
+    return head
+
+
+def _validate_trust_node(data: object) -> dict[str, Any]:
+    if not isinstance(data, dict) \
+            or list(data.keys()) != list(_TRUST_NODE_FIELDS):
+        raise BundleFormatError("trust node must be an object with keys "
+                                "version, tag, previous_tag, "
+                                "checkpoint_digest, previous and digest, "
+                                "in that order")
+    version = data["version"]
+    if not isinstance(version, int) or isinstance(version, bool) \
+            or version != _TRUST_VERSION:
+        raise BundleFormatError("unsupported trust node version")
+    tag = data["tag"]
+    if not isinstance(tag, str) or not _ETAG_RE.fullmatch(tag):
+        raise BundleFormatError("trust node tag must be a single strong "
+                                "tag: a quoted 64-digit lowercase "
+                                "hexadecimal digest")
+    previous_tag = data["previous_tag"]
+    if previous_tag is not None and (not isinstance(previous_tag, str)
+                                     or not _ETAG_RE.fullmatch(previous_tag)):
+        raise BundleFormatError("trust node previous_tag must be null or "
+                                "a single strong tag")
+    if not _is_digest(data["checkpoint_digest"]):
+        raise BundleFormatError("trust node checkpoint_digest must be a "
+                                "64-digit lowercase hexadecimal digest")
+    previous = data["previous"]
+    if previous is not None and not _is_digest(previous):
+        raise BundleFormatError("trust node previous must be null or a "
+                                "64-digit lowercase hexadecimal digest")
+    if not _is_digest(data["digest"]):
+        raise BundleFormatError("trust node digest must be a 64-digit "
+                                "lowercase hexadecimal digest")
+    node = {"version": version, "tag": tag, "previous_tag": previous_tag,
+            "checkpoint_digest": data["checkpoint_digest"],
+            "previous": previous, "digest": data["digest"]}
+    if (previous is None) != (previous_tag is None):
+        raise BundleMismatchError("trust node predecessor fields do not "
+                                  "agree")
+    if node["digest"] != _node_digest(tag, previous_tag,
+                                      node["checkpoint_digest"], previous):
+        raise BundleMismatchError("trust node digest does not match its "
+                                  "content")
+    return node
+
+
+def _snapshot_name(checkpoint_digest: str) -> str:
+    return _TRUST_CHECKPOINT_PREFIX + checkpoint_digest + ".json"
+
+
+def _load_trust_chain(trust_real: str) -> list[dict[str, Any]]:
+    # Read the head and walk the predecessor links back to the genesis
+    # node, rechecking every node digest, every saved snapshot against
+    # the digest its node binds, and the tag linkage, so a restarted
+    # process verifies the true predecessor relation from the persisted
+    # files. A missing head, node or snapshot, a digest that does not
+    # match its content or address, or a broken predecessor relation is
+    # a mismatch and is never repaired with the current bundle.
+    head_path = os.path.join(trust_real, _TRUST_HEAD_NAME)
+    try:
+        head_data = _load_trust_json(head_path)
+    except FileNotFoundError:
+        raise BundleMismatchError("trust chain head is missing") from None
+    digest = _validate_trust_head(head_data)
+    nodes: list[dict[str, Any]] = []
+    seen: set[str] = set()
+    while digest is not None:
+        if digest in seen:
+            raise BundleMismatchError("trust chain loops back on itself")
+        seen.add(digest)
+        node_path = os.path.join(
+            trust_real, _TRUST_NODE_PREFIX + digest + ".json")
+        try:
+            node = _validate_trust_node(_load_trust_json(node_path))
+        except FileNotFoundError:
+            raise BundleMismatchError("trust chain node is missing") \
+                from None
+        if node["digest"] != digest:
+            raise BundleMismatchError("trust node content does not match "
+                                      "its address")
+        snapshot_path = os.path.join(
+            trust_real, _snapshot_name(node["checkpoint_digest"]))
+        try:
+            with open(snapshot_path, "rb") as handle:
+                snapshot = handle.read()
+        except FileNotFoundError:
+            raise BundleMismatchError("a trusted checkpoint snapshot is "
+                                      "missing") from None
+        if hashlib.sha256(snapshot).hexdigest() \
+                != node["checkpoint_digest"]:
+            raise BundleMismatchError("a trusted checkpoint snapshot "
+                                      "does not match its digest")
+        nodes.append(node)
+        digest = node["previous"]
+    for index in range(len(nodes) - 1):
+        if nodes[index]["previous_tag"] != nodes[index + 1]["tag"]:
+            raise BundleMismatchError("trust node predecessor tag does "
+                                      "not match the chain")
+    return nodes
+
+
+def _commit_trust_file(realpath: str, directory: str,
+                       payload: bytes) -> None:
+    # Same-directory temporary, fsync, atomic replace, directory fsync.
+    # Until the replace succeeds the addressed file keeps its previous
+    # content (or absence), so a failure only removes this attempt's
+    # temporary and leftover fragments never participate.
+    fd, tmp_path = tempfile.mkstemp(
+        dir=directory, prefix=".trust-", suffix=".tmp")
+    try:
+        with os.fdopen(fd, "wb") as handle:
+            handle.write(payload)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(tmp_path, realpath)
+    except BaseException:
+        with contextlib.suppress(OSError):
+            os.unlink(tmp_path)
+        raise
+    _fsync_dir(directory)
+
+
+def _commit_content_file(realpath: str, directory: str,
+                         payload: bytes) -> None:
+    # Node and snapshot files are content-addressed: an existing file
+    # with the same complete content is an unreferenced or referenced
+    # node reused as-is, while different content at a trusted name is
+    # tampered evidence that is never overwritten with the current
+    # bundle.
+    try:
+        with open(realpath, "rb") as handle:
+            existing = handle.read()
+    except FileNotFoundError:
+        _commit_trust_file(realpath, directory, payload)
+    else:
+        if existing != payload:
+            raise BundleMismatchError("a trust file does not match its "
+                                      "content address")
+
+
+def _commit_trust_head(head_path: str, directory: str, payload: bytes,
+                       old_bytes: bytes | None) -> None:
+    # The chain head commits last and only ever names a complete node.
+    # Like the checkpoint commit, a failure after the replace stages the
+    # pre-call bytes back (or removes the file) while the exclusive lock
+    # is held, so any failure preserves the pre-call chain head.
+    fd, tmp_path = tempfile.mkstemp(
+        dir=directory, prefix=".trust-", suffix=".tmp")
+    try:
+        with os.fdopen(fd, "wb") as handle:
+            handle.write(payload)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(tmp_path, head_path)
+    except BaseException:
+        with contextlib.suppress(OSError):
+            os.unlink(tmp_path)
+        raise
+    try:
+        _fsync_dir(directory)
+    except BaseException as first:
+        audit._rollback(head_path, directory, old_bytes, first)
+        raise
+
+
+def _make_trust_node(tag: str, previous_tag: str | None,
+                     checkpoint_digest: str,
+                     previous: str | None) -> dict[str, Any]:
+    return {"version": _TRUST_VERSION, "tag": tag,
+            "previous_tag": previous_tag,
+            "checkpoint_digest": checkpoint_digest, "previous": previous,
+            "digest": _node_digest(tag, previous_tag, checkpoint_digest,
+                                   previous)}
+
+
+def _check_trust_extension(old_generations: list[dict[str, Any]],
+                           new_generations: list[dict[str, Any]]) -> None:
+    # The new checkpoint must be a strictly append-only successor of the
+    # latest trusted one: every retained generation keeps its name and
+    # position, every retained anchor keeps its place, fields and
+    # values, and only legal generations or anchors may be appended. A
+    # removed or rewritten generation or anchor is a rollback or a fork.
+    if len(new_generations) < len(old_generations):
+        raise BundleMismatchError("a trusted generation cannot be "
+                                  "removed")
+    for old_generation, new_generation in zip(old_generations,
+                                              new_generations):
+        if new_generation["name"] != old_generation["name"]:
+            raise BundleMismatchError("a trusted generation cannot be "
+                                      "renamed or reordered")
+        old_anchors = old_generation["anchors"]
+        new_anchors = new_generation["anchors"]
+        if len(new_anchors) < len(old_anchors) \
+                or new_anchors[:len(old_anchors)] != old_anchors:
+            raise BundleMismatchError("a trusted anchor cannot be "
+                                      "removed or modified")
+
+
+def _establish_trust(trust_real: str, tag: str, raw: bytes) -> None:
+    # First use with a not-yet-existing directory: the trust anchor is
+    # the currently verified checkpoint, whose original bytes are saved
+    # next to the genesis node; the head commits last. A missing parent
+    # directory surfaces as FileNotFoundError from the mkdir.
+    os.mkdir(trust_real)
+    _fsync_dir(os.path.dirname(trust_real) or ".")
+    checkpoint_digest = hashlib.sha256(raw).hexdigest()
+    node = _make_trust_node(tag, None, checkpoint_digest, None)
+    _commit_trust_file(os.path.join(trust_real,
+                                    _snapshot_name(checkpoint_digest)),
+                       trust_real, raw)
+    _commit_trust_file(
+        os.path.join(trust_real,
+                     _TRUST_NODE_PREFIX + node["digest"] + ".json"),
+        trust_real, _serialize_trust(node))
+    head = {"version": _TRUST_VERSION, "head": node["digest"]}
+    _commit_trust_head(os.path.join(trust_real, _TRUST_HEAD_NAME),
+                       trust_real, _serialize_trust(head), None)
+
+
+def _advance_trust(trust_real: str, tag: str, raw: bytes,
+                   generations: list[dict[str, Any]]) -> None:
+    # Compare the verified checkpoint with the retained sequence and
+    # advance the chain head, all under the trust directory's exclusive
+    # lock. The same strong tag as the head is an idempotent replay that
+    # rewrites nothing; an already retained older tag is a replayed
+    # rollback; a new tag must continue the latest trusted snapshot.
+    if not os.path.isdir(trust_real):
+        _establish_trust(trust_real, tag, raw)
+        return
+    nodes = _load_trust_chain(trust_real)
+    head = nodes[0]
+    if tag == head["tag"]:
+        # Idempotent replay: the proof was fully rechecked before this
+        # point and the directory is not rewritten.
+        return
+    for node in nodes[1:]:
+        if tag == node["tag"]:
+            raise BundleMismatchError("an already retained older version "
+                                      "cannot be replayed")
+    snapshot_path = os.path.join(
+        trust_real, _snapshot_name(head["checkpoint_digest"]))
+    try:
+        with open(snapshot_path, "rb") as handle:
+            trusted_raw = handle.read()
+    except FileNotFoundError:
+        raise BundleMismatchError("the trusted checkpoint snapshot is "
+                                  "missing") from None
+    if hashlib.sha256(trusted_raw).hexdigest() != head["checkpoint_digest"]:
+        raise BundleMismatchError("the trusted checkpoint snapshot does "
+                                  "not match its digest")
+    trusted_generations = _parse_checkpoint(snapshot_path, trusted_raw)
+    _check_trust_extension(trusted_generations, generations)
+
+    checkpoint_digest = hashlib.sha256(raw).hexdigest()
+    node = _make_trust_node(tag, head["tag"], checkpoint_digest,
+                            head["digest"])
+    # Snapshot and node commit before the head; both are
+    # content-addressed, so a re-entry after a failed attempt reuses the
+    # complete files and only the head commit remains.
+    _commit_content_file(
+        os.path.join(trust_real, _snapshot_name(checkpoint_digest)),
+        trust_real, raw)
+    _commit_content_file(
+        os.path.join(trust_real,
+                     _TRUST_NODE_PREFIX + node["digest"] + ".json"),
+        trust_real, _serialize_trust(node))
+    head_path = os.path.join(trust_real, _TRUST_HEAD_NAME)
+    with open(head_path, "rb") as handle:
+        old_head = handle.read()
+    head_document = {"version": _TRUST_VERSION, "head": node["digest"]}
+    _commit_trust_head(head_path, trust_real,
+                       _serialize_trust(head_document), old_head)
+
+
 def verify_bundle(checkpoint_path: str, proof_path: str,
-                  etag: str) -> dict[str, Any]:
+                  etag: str, trust_dir: str | None = None
+                  ) -> dict[str, Any]:
     """Verify a downloaded checkpoint/proof pair entirely offline.
 
     ``checkpoint_path`` and ``proof_path`` must be non-empty strings and
     ``etag`` a single strong entity tag -- one double-quoted string of
     64 lowercase hexadecimal digits, exactly as the checkpoint
-    download's ``ETag`` header carried it. Argument errors raise
-    ``ValueError`` before any file is read.
+    download's ``ETag`` header carried it. ``trust_dir`` must be ``None``
+    or a non-empty string. Argument errors raise ``ValueError`` before
+    any file is read.
 
     The checkpoint is opened, read, hashed, parsed and structurally
     validated under the *same* shared kernel flock an export or a
@@ -927,14 +1291,38 @@ def verify_bundle(checkpoint_path: str, proof_path: str,
     against an old checkpoint or a tag carried by another download
     response is a mismatch. Nothing is rewritten.
 
-    Returns the same result dict as :func:`verify`. A missing file
+    With ``trust_dir`` given, the single-bundle verification above runs
+    first, unchanged; then, under the trust directory's exclusive
+    cross-process lock, the verified checkpoint is compared with the
+    retained snapshot sequence and the chain head advances. A
+    not-yet-existing directory is created with the verified checkpoint
+    as the trust anchor, its original bytes saved; the head's own
+    strong tag is an idempotent replay that rewrites nothing; a new tag
+    must name a checkpoint that is a strictly append-only successor of
+    the latest trusted one -- retained generations, anchors, fields and
+    values unchanged, only legal generations or anchors appended -- and
+    commits as a new node binding the current tag, the predecessor tag,
+    the checkpoint bytes digest and the previous node digest. An
+    already retained older version, a fork that deleted or rewrote old
+    anchors, or a bundle that cannot continue the chain is rejected as
+    a rollback. Every commit uses a same-directory temporary file,
+    fsync, atomic replace and a directory fsync, so any failure
+    preserves the pre-call chain head, unreferenced complete nodes are
+    reused on re-entry, and tampered node content, chain digests or
+    head relations are never repaired or overwritten with the current
+    bundle. Without ``trust_dir`` no directory is created and the
+    result is exactly the single-bundle verification.
+
+    Returns the same result dict as :func:`verify`. A missing file --
+    or the missing parent of a trust directory that must be created --
     raises ``FileNotFoundError``; an encoding, JSON or structural error
-    in either file -- including a version 1 proof, which predates the
-    snapshot binding -- raises ``BundleFormatError``; a tag,
-    digest-chain, generation, anchor, closed-state, page or
-    snapshot-binding mismatch raises ``BundleMismatchError``; every
-    other locking or I/O failure raises ``OSError``. Both error types
-    are ``ValueError`` subclasses.
+    in either file or in the trust metadata -- including a version 1
+    proof, which predates the snapshot binding -- raises
+    ``BundleFormatError``; a tag, digest-chain, generation, anchor,
+    closed-state, page, snapshot-binding, chain-digest or head-relation
+    mismatch, an old-version replay or a forked continuation raises
+    ``BundleMismatchError``; every other locking or I/O failure raises
+    ``OSError``. Both error types are ``ValueError`` subclasses.
     """
     for value in (checkpoint_path, proof_path):
         if not isinstance(value, str) or not value:
@@ -943,6 +1331,9 @@ def verify_bundle(checkpoint_path: str, proof_path: str,
     if not isinstance(etag, str) or not _ETAG_RE.fullmatch(etag):
         raise ValueError("etag must be a single strong tag: a quoted "
                          "64-digit lowercase hexadecimal digest")
+    if trust_dir is not None \
+            and (not isinstance(trust_dir, str) or not trust_dir):
+        raise ValueError("trust_dir must be None or a non-empty string")
 
     checkpoint_real = os.path.realpath(checkpoint_path)
     proof_real = os.path.realpath(proof_path)
@@ -964,7 +1355,16 @@ def verify_bundle(checkpoint_path: str, proof_path: str,
             raise BundleMismatchError(
                 "proof checkpoint_etag does not bind the checkpoint "
                 "snapshot in hand")
-        return _verify_proof(generations, clean, checkpoint_real)
+        result = _verify_proof(generations, clean, checkpoint_real)
+    if trust_dir is None:
+        return result
+    trust_real = os.path.realpath(trust_dir)
+    with _file_lock(trust_real):
+        # The single-bundle verification is complete; only now does the
+        # verified checkpoint meet the retained sequence, serialized
+        # against every other process advancing the same chain.
+        _advance_trust(trust_real, tag, raw, generations)
+    return result
 
 
 def read_snapshot(checkpoint_path: str) -> tuple[bytes, str]:
