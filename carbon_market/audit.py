@@ -1,66 +1,77 @@
-"""Idempotent audit journal of copy/restore operations.
+"""Idempotent audit journal of copy/restore operations with a digest chain.
 
-Each journal file records the outcomes of copy and restore operations
-under caller-chosen idempotency keys. A document has the form
-``{"version": 1, "events": {key: event}}`` with ``version`` before
-``events`` and the events ordered by key code point; every event carries
-exactly op, target, key, changed, error and stage, in that order. The
-public order is part of the contract and is verified on read: a document
-whose root fields, event fields or event keys appear out of order is
-malformed and raises ``ValueError`` -- it is never reordered and
-accepted, and a read-only query never rewrites it. ``op`` is ``"copy"``
-or ``"restore"`` and ``changed`` is a boolean; a successful event has
-``error`` and ``stage`` both null, while a failed one names the
-exception class in ``error`` and the stage it failed at in ``stage`` --
-one of ``"校验"``, ``"执行"``, ``"同步"`` and ``"回滚"``.
+Two on-disk versions are supported:
 
-:func:`record` replays the event already stored under a key: the same
-key with the same event returns a copy of it together with ``False`` and
-writes nothing, while the same key with a different event is a conflict
-and raises ``ValueError``. A new key appends its event, creates the file
-when missing, and returns the event copy together with ``True``. The
-caller may pass the event's fields in any order -- only the field set
-must match exactly -- and the event is stored and returned in the
-public order. :func:`get` is strictly read-only and returns a copy of
-the event stored under a key; an unknown key raises ``KeyError(key)``.
+Version 1 is the legacy form ``{"version": 1, "events": {key: event}}``
+with ``version`` before ``events`` and the events ordered by key code
+point; every event carries exactly op, target, key, changed, error and
+stage, in that order. It carries no integrity metadata. It is accepted
+for reads and for idempotent replays, but a :func:`record` that appends a
+new event seals the whole document -- old events included -- into version
+2 in the same atomic commit. Pure reads and identical replays never
+upgrade it.
 
-:func:`search` is the read-only paginated query: it scans the journal in
-ascending audit-key code-point order, keeps only the events at keys
-strictly greater than an optional exclusive cursor and matching every
-given filter -- op, failure stage (``"成功"`` selects the successful
-events) and history key, combined with logical AND -- and returns one
-page of ``[audit_key, event]`` pairs together with the cursor to resume
-from, or ``None`` when the page is the last. Non-matching events never
-consume page capacity.
+Version 2 is the sealed form: the root keeps ``version`` and ``events``
+in that order and appends ``head`` after them; each events value is the
+triple ``[event, previous_digest, digest]``, where the first item's
+previous digest is ``null`` and every later item references the previous
+item in code-point order. Item digests are 64 lowercase hex chars: an
+item's digest is the SHA-256 of the compact UTF-8 JSON (the same compact
+encoding the journal uses) of ``[audit_key, event, previous_digest]``.
+The root ``head`` holds the last item's digest, or ``null`` for an empty
+log; removing or altering the tail therefore breaks the chain rather
+than rewrites its anchor.
 
-All three functions resolve the journal to its real path and guard the
-file with a per-realpath lock that excludes both threads of this process
-and other processes: :func:`record` holds an exclusive kernel flock on
-the companion lock file (``path + ".lock"``) around the whole
-validate/replace sequence and the read-only queries hold a shared one
-only while opening and reading, so a reader racing a writer observes
-either the complete previous document or the complete new one -- never a
-truncated or half-replaced file. The kernel releases the flock on
-process exit, so a leftover lock file never blocks a later call.
+Read queries (:func:`get`, :func:`search`) still return exactly the
+original event objects -- chain fields never leak into query results --
+and :func:`verify` is the read-only integrity report:
+
+* a legal version-1 journal returns its real count, ``sealed`` and
+  ``valid`` false and ``first_invalid``/``head`` null;
+* a version-2 journal validates item digests, previous references and
+  the root head, returning count, ``sealed`` and ``valid`` true,
+  ``first_invalid`` null and the declared head;
+
+* tampering is reported rather than raised: a bad item digest reports
+  that zero-based index, a broken previous reference reports the current
+  index, and only the root-head mismatch (with the chain itself intact)
+  reports ``count``;
+* structural/encoding/version violations still raise ``ValueError``.
+
+:func:`record` validates the old chain under the exclusive lock before
+appending; a broken chain raises ``ValueError`` without touching the
+file. Concurrent inserts serialize on the lock, each rebuilding the
+sorted document with fresh digests for every item (no cached state
+survives across calls), so a restart simply continues from the persisted
+last item. Same-key same-event replay writes nothing (even against
+version 1) and returns the stored event with ``False``; same-key
+different-event conflict raises ``ValueError``.
+
+All entry points resolve the journal to its real path and guard the
+file with a per-realpath threading lock plus a per-realpath kernel flock
+on the companion lock file (``path + ".lock"``): :func:`record` holds an
+exclusive flock around the whole validate/replace sequence and the
+read-only queries hold a shared one only while opening and reading, so a
+reader racing a writer observes either the complete previous document or
+the complete new one -- never a truncated or half-replaced file.
 
 A record commits via a same-directory temporary file that is written and
 fsynced, moved over the journal with :func:`os.replace` and followed by
-a directory fsync. When ``fault`` is ``"replace"`` an ``OSError`` is
-injected immediately after the replace (before the directory sync),
-exercising recovery: the journal's pre-call bytes are staged back over
-it -- or, when the file did not exist beforehand, the new file is
-removed -- and the directory synced again, all while the exclusive lock
-is held. If the rollback itself fails, that ``OSError`` is raised with
-the first error chained as its ``__cause__``. A failure before the
-replace only discards the temporary. The journal is therefore either the
-complete pre-call document or the complete post-call one; a failed
-record never leaves a partially updated file.
+a directory fsync. With ``fault="replace"`` an ``OSError`` is injected
+right after the replace (before the directory sync), and the call
+restores the journal's pre-call bytes (or removes the newly created
+file), dir-fsynced, while the exclusive lock is held. A failure before
+the replace only discards the temporary. The journal is therefore
+either the complete pre-call document -- a legacy version-1 document
+included -- or the complete sealed version-2 document; a failed record
+never leaves a partially updated file.
 """
 
 from __future__ import annotations
 
 import contextlib
 import fcntl
+import hashlib
 import json
 import os
 import tempfile
@@ -69,10 +80,12 @@ from typing import Any, Iterator
 
 from ._jsonio import strict_loads
 
-__all__ = ["record", "get", "search"]
+__all__ = ["record", "get", "search", "verify"]
 
-_VERSION = 1
-_ROOT_FIELDS = ("version", "events")
+_V1 = 1
+_V2 = 2
+_ROOT_FIELDS_V1 = ("version", "events")
+_ROOT_FIELDS_V2 = ("version", "events", "head")
 _EVENT_FIELDS = ("op", "target", "key", "changed", "error", "stage")
 _OPS = ("copy", "restore")
 _STAGES = ("校验", "执行", "同步", "回滚")
@@ -81,6 +94,7 @@ _STAGES = ("校验", "执行", "同步", "回滚")
 _SEARCH_STAGES = ("成功",) + _STAGES
 _DEFAULT_LIMIT = 100
 _MAX_LIMIT = 1000
+_HEX = frozenset("0123456789abcdef")
 
 
 def check_pair(audit_path: object, audit_key: object) -> bool:
@@ -99,6 +113,9 @@ def check_pair(audit_path: object, audit_key: object) -> bool:
             "audit_path and audit_key must be provided together as "
             "non-empty strings")
     return True
+
+
+
 
 
 def failure_stage(exc: BaseException) -> str:
@@ -145,6 +162,9 @@ def emit(audit_path: str, audit_key: str, op: str, target: str,
         "stage": stage,
     }
     try:
+        # Recomputing every item digest at append time seals version-1
+        # journals on first insert and makes every v2 commit stand on
+        # its own chain.
         record(audit_path, audit_key, event)
     except Exception as audit_exc:  # journal failure: ValueError/OSError/...
         return audit_exc
@@ -192,6 +212,10 @@ def _file_lock(realpath: str, *, shared: bool = False) -> Iterator[None]:
         os.close(fd)
 
 
+# ---------------------------------------------------------------------------
+# Validation
+# ---------------------------------------------------------------------------
+
 def _validate_event(raw: object, *, strict_order: bool) -> dict[str, Any]:
     # The field set is part of the contract everywhere; the public field
     # order is enforced only for events read from disk. A caller-passed
@@ -233,23 +257,17 @@ def _validate_event(raw: object, *, strict_order: bool) -> dict[str, Any]:
     return {field: raw[field] for field in _EVENT_FIELDS}
 
 
-def _validate_document(data: object) -> dict[str, Any]:
-    # The root's public order is part of the contract: an object carrying
-    # any other set or order of fields is malformed rather than rebuilt.
-    if not isinstance(data, dict) or list(data.keys()) != list(_ROOT_FIELDS):
-        raise ValueError("audit root must be an object with keys version "
-                         "and events, in that order")
+def _is_digest(value: object) -> bool:
+    # Declared digests and previous references are exactly 64 lowercase
+    # hex characters; uppercase or odd lengths cannot name a real digest
+    # and count as malformed structure rather than a broken chain.
+    return isinstance(value, str) and len(value) == 64 \
+        and all(char in _HEX for char in value)
 
-    version = data["version"]
-    # bool is a subclass of int and must be rejected as a version.
-    if not isinstance(version, int) or isinstance(version, bool) \
-            or version != _VERSION:
-        raise ValueError("unsupported audit version")
 
-    events_raw = data["events"]
+def _validate_v1_events(events_raw: object) -> dict[str, Any]:
     if not isinstance(events_raw, dict):
         raise ValueError("events must be an object")
-
     # The persisted form is keyed in code-point order; a document offered
     # out of order is malformed and is rejected as it stands -- never
     # sorted and accepted, and never rewritten by a read-only query.
@@ -263,22 +281,102 @@ def _validate_document(data: object) -> dict[str, Any]:
             raise ValueError("event keys must be non-empty strings")
         events[event_key] = _validate_event(events_raw[event_key],
                                             strict_order=True)
+    return events
 
-    return {"version": _VERSION, "events": events}
+
+def _validate_v2_entry(raw: object) -> tuple[dict[str, Any], str | None, str]:
+    # A sealed value is exactly [event, previous, digest]: a JSON array of
+    # length 3, previous null or a 64-lowercase-hex digest and digest a
+    # 64-lowercase-hex digest. The chaining relationships themselves are
+    # checked separately by _chain_first_invalid so a tampered document
+    # can report the offending zero-based position instead of raising.
+    if not isinstance(raw, list) or len(raw) != 3:
+        raise ValueError("sealed audit entries must be [event, previous, "
+                         "digest] triples")
+    event_raw, previous_raw, digest_raw = raw
+    previous: str | None
+    if previous_raw is None:
+        previous = None
+    elif _is_digest(previous_raw):
+        previous = previous_raw
+    else:
+        raise ValueError("previous digest must be null or a 64-character "
+                         "lowercase hex digest")
+    if not _is_digest(digest_raw):
+        raise ValueError("digest must be a 64-character lowercase hex "
+                         "digest")
+    event = _validate_event(event_raw, strict_order=True)
+    return event, previous, digest_raw
 
 
-def _read_document(
-    realpath: str,
-) -> tuple[dict[str, Any] | None, bytes | None]:
-    # The journal is created on demand, so a missing file simply means no
-    # event has been recorded yet; the raw bytes are returned as well so a
-    # later rollback can restore that exact pre-call content.
-    try:
-        with open(realpath, "rb") as handle:
-            raw = handle.read()
-    except FileNotFoundError:
-        return None, None
+def _validate_v2_events(
+    events_raw: object,
+) -> dict[str, tuple[dict[str, Any], str | None, str]]:
+    if not isinstance(events_raw, dict):
+        raise ValueError("events must be an object")
+    event_keys = list(events_raw)
+    if event_keys != sorted(event_keys):
+        raise ValueError("audit events must be ordered by key code point")
 
+    entries: dict[str, tuple[dict[str, Any], str | None, str]] = {}
+    for event_key in event_keys:
+        if not isinstance(event_key, str) or not event_key:
+            raise ValueError("event keys must be non-empty strings")
+        entries[event_key] = _validate_v2_entry(events_raw[event_key])
+    return entries
+
+
+def _validate_head(head_raw: object) -> str | None:
+    # Shape only: null or a 64-lowercase-hex digest. Whether null is
+    # permitted for a non-empty log, or the digest equals the last
+    # item's digest, is a chain condition -- verify reports it (count)
+    # instead of raising, and record/get/search reject it as a broken
+    # chain.
+    if head_raw is None:
+        return None
+    if not _is_digest(head_raw):
+        raise ValueError("head must be null or a 64-character lowercase "
+                         "hex digest")
+    return head_raw
+
+
+def _validate_document(data: object) -> dict[str, Any]:
+    # Returns {"version": int, "events": {key: event} (plain events),
+    # "entries": {key: (event, previous, digest)} for v2, "head": str|None
+    # for v2}. Structure, field order, key order and value shapes are
+    # enforced here with ValueError; digest/previous/head *content* is
+    # not -- that is a chain condition, reported via verify and rejected
+    # by record/get/search through _assert_intact_chain.
+    if not isinstance(data, dict):
+        raise ValueError("audit root must be an object with version and "
+                         "events (and head for version 2), in order")
+    root_fields = list(data.keys())
+    version_raw = data.get("version", object())
+    # bool is a subclass of int and must be rejected as a version.
+    if not isinstance(version_raw, int) or isinstance(version_raw, bool):
+        raise ValueError("unsupported audit version")
+    if version_raw == _V1:
+        if root_fields != list(_ROOT_FIELDS_V1):
+            raise ValueError("audit root must be an object with keys version "
+                             "and events, in that order")
+        events = _validate_v1_events(data["events"])
+        return {"version": _V1, "events": events,
+                "entries": None, "head": None}
+    if version_raw == _V2:
+        if root_fields != list(_ROOT_FIELDS_V2):
+            raise ValueError("audit root must be an object with keys version, "
+                             "events and head, in that order")
+        entries = _validate_v2_events(data["events"])
+        head = _validate_head(data["head"])
+        events = {key: entry[0] for key, entry in entries.items()}
+        return {"version": _V2, "events": events,
+                "entries": entries, "head": head}
+    raise ValueError("unsupported audit version")
+
+
+def _read_document_raw(realpath: str) -> tuple[object, bytes]:
+    with open(realpath, "rb") as handle:
+        raw = handle.read()
     try:
         text = raw.decode("utf-8")
     except UnicodeDecodeError as exc:
@@ -289,19 +387,125 @@ def _read_document(
     except ValueError as exc:
         raise ValueError(
             f"audit file {realpath!r} is not valid JSON") from exc
+    return data, raw
+
+
+def _read_document(
+    realpath: str,
+) -> tuple[dict[str, Any] | None, bytes | None]:
+    # The journal is created on demand, so a missing file simply means no
+    # event has been recorded yet; the raw bytes are returned as well so a
+    # later rollback can restore that exact pre-call content.
+    try:
+        data, raw = _read_document_raw(realpath)
+    except FileNotFoundError:
+        return None, None
     return _validate_document(data), raw
+
+
+# ---------------------------------------------------------------------------
+# Digest chain
+# ---------------------------------------------------------------------------
+
+def _compact_json(value: Any) -> bytes:
+    # The established compact UTF-8 convention: compact separators,
+    # non-ASCII written through, NaN/Infinity impossible for the value
+    # shapes involved. Both the per-item preimage and the whole document
+    # serialize through this one function.
+    text = json.dumps(value, ensure_ascii=False, separators=(",", ":"),
+                      allow_nan=False)
+    return text.encode("utf-8")
+
+
+def _item_digest(audit_key: str, event: dict[str, Any],
+                 previous: str | None) -> str:
+    preimage = _compact_json([audit_key, event, previous])
+    return hashlib.sha256(preimage).hexdigest()
+
+
+def _chain_first_invalid(
+    keys: list[str],
+    entries: dict[str, tuple[dict[str, Any], str | None, str]],
+    head: str | None,
+) -> int | None:
+    # Walk the sealed entries in persisted (code-point) order:
+    #   * a wrong item digest reports its own index;
+    #   * a previous reference not equal to the preceding item's digest
+    #     reports the current index (the first item must reference null);
+    #   * only the root head mismatch, chain otherwise intact, reports
+    #     count.
+    # The declared-digest check precedes the previous check within an
+    # item; the previous check at index i needs the declared digest at
+    # i-1. Both checks at i run before advancing.
+    previous_expected: str | None = None
+    last_digest: str | None = None
+    for index, audit_key in enumerate(keys):
+        event, previous, digest = entries[audit_key]
+        if digest != _item_digest(audit_key, event, previous):
+            # Even if the previous reference is also wrong, the item's
+            # own digest mismatch is reported at its index first.
+            return index
+        if previous != previous_expected:
+            # A tamperer changing the stored previous breaks both this
+            # link and the item digest, so reaching here means the event
+            # content changed while the triple stayed self-consistent --
+            # report the current item.
+            return index
+        previous_expected = digest
+        last_digest = digest
+    if head != last_digest:
+        return len(keys)
+    return None
+
+
+def _assert_intact_chain(document: dict[str, Any]) -> None:
+    if document["version"] == _V1:
+        return
+    keys = list(document["events"])
+    bad = _chain_first_invalid(keys, document["entries"], document["head"])
+    if bad is not None:
+        raise ValueError("audit digest chain is broken")
+
+
+# ---------------------------------------------------------------------------
+# Serialization / commit
+# ---------------------------------------------------------------------------
+
+def _seal_events(
+    events: dict[str, Any],
+) -> tuple[dict[str, tuple[dict[str, Any], str | None, str]], str | None]:
+    # Rebuild the whole chain from scratch: insert paths (new v2 log,
+    # v1->v2 upgrade, and append to an existing v2 log) all funnel here,
+    # and the exclusive lock plus full recomputation make concurrent
+    # inserts serialize correctly with no cached suffix to invalidate.
+    keys = sorted(events)
+    entries: dict[str, tuple[dict[str, Any], str | None, str]] = {}
+    previous: str | None = None
+    head: str | None = None
+    for audit_key in keys:
+        event = events[audit_key]
+        digest = _item_digest(audit_key, event, previous)
+        entries[audit_key] = (event, previous, digest)
+        previous = digest
+        head = digest
+    return entries, head
 
 
 def _serialize(events: dict[str, Any]) -> bytes:
     # Compact UTF-8 JSON, non-ASCII written through, events ordered by key
-    # code point, terminated by exactly one newline.
-    document = {
-        "version": _VERSION,
-        "events": {key: events[key] for key in sorted(events)},
+    # code point, terminated by exactly one newline. Every journal written
+    # from now on is version 2 with the full [event, previous, digest]
+    # chain and a root head (null for an empty log).
+    entries, head = _seal_events(events)
+    document: dict[str, Any] = {
+        "version": _V2,
+        "events": {
+            key: [entries[key][0], entries[key][1], entries[key][2]]
+            for key in sorted(entries)
+        },
+        "head": head,
     }
-    text = json.dumps(document, ensure_ascii=False, separators=(",", ":"),
-                      allow_nan=False) + "\n"
-    return text.encode("utf-8")
+    return _compact_json(document) + b"\n"
 
 
 def _fsync_dir(directory: str) -> None:
@@ -320,8 +524,8 @@ def _rollback(
 ) -> None:
     # Restore the exact state the journal held when record started, while
     # the exclusive lock is still held: stage the pre-call bytes back over
-    # the replaced file (same-directory temporary, fsync, replace), or
-    # remove the file when it did not exist beforehand; sync the directory
+    # the replaced file (same-directory temp, fsync, replace), or remove
+    # the file when it did not exist beforehand; sync the directory
     # afterwards. Any failure of this recovery is raised chained after the
     # first error.
     try:
@@ -389,6 +593,10 @@ def _commit(
         raise
 
 
+# ---------------------------------------------------------------------------
+# Public API
+# ---------------------------------------------------------------------------
+
 def record(
     path: str,
     key: str,
@@ -408,15 +616,20 @@ def record(
     ``ValueError``, and so does ``fault`` being anything other than
     ``None`` or ``"replace"``.
 
-    Returns ``(event, created)``: ``True`` when this call appended the
-    event (creating the journal file if missing), ``False`` when the key
-    already carried an identical event -- that replay writes nothing and
-    never triggers the ``fault``. A key already carrying a different event
-    raises ``ValueError``. A missing parent directory raises
-    ``FileNotFoundError``; malformed JSON or UTF-8, a negative-zero
-    literal, or an unsupported version or structure in an existing
-    journal raises ``ValueError``; any other locking or I/O failure raises
-    ``OSError``.
+    An existing journal is chain-validated under the exclusive lock
+    before anything is written; a broken v2 chain raises ``ValueError``
+    and leaves the file untouched. Returns ``(event, created)``:
+    ``True`` when this call appended the event -- sealing a legacy
+    version-1 journal into version 2 (old events included) or creating
+    the file (version 2) as needed -- and ``False`` when the key already
+    carried an identical event. That replay writes nothing, never
+    upgrades a version-1 file and never triggers the ``fault``. A key
+    already carrying a different event raises ``ValueError``.
+
+    A missing parent directory raises ``FileNotFoundError``; malformed
+    JSON or UTF-8, a negative-zero literal, an unsupported version or
+    structure, or a broken digest chain in an existing journal raises
+    ``ValueError``; any other locking or I/O failure raises ``OSError``.
 
     The commit writes a same-directory temporary, fsyncs it, replaces the
     journal atomically and fsyncs its directory. With
@@ -437,6 +650,8 @@ def record(
     with store.lock:
         with _file_lock(realpath):
             document, old_bytes = _read_document(realpath)
+            if document is not None:
+                _assert_intact_chain(document)
             events: dict[str, Any] = (
                 {} if document is None else dict(document["events"]))
 
@@ -454,7 +669,7 @@ def record(
 
 
 def _read_existing_document(realpath: str) -> dict[str, Any]:
-    # Read-only path shared by get and search: the shared flock is held
+    # Read-only path shared by get/search/verify: the shared flock is held
     # only while the file is opened and read, so a query racing a writer
     # observes either the complete previous document or the complete new
     # one. A missing journal surfaces as FileNotFoundError; malformed
@@ -462,35 +677,26 @@ def _read_existing_document(realpath: str) -> dict[str, Any]:
     # version or any structural or order deviation raises ValueError --
     # the document is never reordered and accepted, and never rewritten.
     with _file_lock(realpath, shared=True):
-        with open(realpath, "rb") as handle:
-            raw = handle.read()
-
-    try:
-        text = raw.decode("utf-8")
-    except UnicodeDecodeError as exc:
-        raise ValueError(
-            f"audit file {realpath!r} is not valid UTF-8") from exc
-    try:
-        data = strict_loads(text)
-    except ValueError as exc:
-        raise ValueError(
-            f"audit file {realpath!r} is not valid JSON") from exc
+        data, _raw = _read_document_raw(realpath)
     return _validate_document(data)
 
 
 def get(path: str, key: str) -> dict[str, Any]:
     """Return a read-only copy of the audit event stored under ``key``.
 
+    Sealed (version-2) events are returned as plain event dicts -- the
+    previous/digest chain fields never appear in query results.
+
     ``path`` and ``key`` must be non-empty strings, else ``ValueError``.
     A missing journal file raises ``FileNotFoundError``; malformed JSON or
-    UTF-8, a negative-zero literal, or an unsupported version or structure
-    raises ``ValueError``; an unknown key raises ``KeyError(key)``; any
-    other locking or I/O failure raises ``OSError``. The query never
-    writes and holds the journal's companion lock shared only while the
-    file is opened and read, so it can only observe a complete document.
-    The returned dict is a fresh copy with fields op, target, key,
-    changed, error and stage in that order; mutating it never affects the
-    journal.
+    UTF-8, a negative-zero literal, an unsupported version or structure,
+    or a broken digest chain raises ``ValueError`` without rewriting the
+    file; an unknown key raises ``KeyError(key)``; any other locking or
+    I/O failure raises ``OSError``. The query never writes and holds the
+    journal's companion lock shared only while the file is opened and
+    read, so it can only observe a complete document. The returned dict
+    is a fresh copy with fields op, target, key, changed, error and
+    stage in that order; mutating it never affects the journal.
     """
     for value in (path, key):
         if not isinstance(value, str) or not value:
@@ -498,6 +704,7 @@ def get(path: str, key: str) -> dict[str, Any]:
 
     realpath = os.path.realpath(path)
     document = _read_existing_document(realpath)
+    _assert_intact_chain(document)
 
     events = document["events"]
     if key not in events:
@@ -550,18 +757,19 @@ def search(
     The journal is scanned in ascending audit-key code-point order and
     filtered afterwards, so non-matching events never consume page
     capacity. Returns ``{"events": [[audit_key, event], ...], "next":
-    cursor_or_none}``: each event is a fresh copy with the public field
-    order, and ``next`` is the audit key of the page's last item when
-    further matching events remain, else ``None``. With no matching
-    events the page is empty and ``next`` is ``None``.
+    cursor_or_none}`` where each value is the plain event (chain fields
+    are not exposed), and ``next`` is the audit key of the page's last
+    item when further matching events remain, else ``None``. With no
+    matching events the page is empty and ``next`` is ``None``.
 
     The query is strictly read-only: a missing journal raises
     ``FileNotFoundError``; malformed JSON or UTF-8, a negative-zero
-    literal, or an unsupported version, structure or order raises
-    ``ValueError``; any other locking or I/O failure raises ``OSError``.
-    It holds the journal's companion lock shared only while the file is
-    opened and read, so a query racing a writer observes either the
-    complete previous document or the complete new one.
+    literal, an unsupported version or structure, or a broken digest
+    chain raises ``ValueError`` and never rewrites the file; any other
+    locking or I/O failure raises ``OSError``. It holds the journal's
+    companion lock shared only while the file is opened and read, so a
+    query racing a writer observes either the complete previous document
+    or the complete new one.
     """
     if not isinstance(path, str) or not path:
         raise ValueError("path must be a non-empty string")
@@ -581,6 +789,7 @@ def search(
 
     realpath = os.path.realpath(path)
     document = _read_existing_document(realpath)
+    _assert_intact_chain(document)
 
     # The persisted events are validated to be in ascending key
     # code-point order, so the document order is the scan order. One
@@ -602,3 +811,56 @@ def search(
         page = matches
         next_cursor = None
     return {"events": page, "next": next_cursor}
+
+
+def verify(path: str) -> dict[str, Any]:
+    """Return the read-only integrity report of the audit journal.
+
+    ``path`` must be a non-empty string, else ``ValueError``. A missing
+    journal raises ``FileNotFoundError``; malformed UTF-8/JSON, a
+    negative-zero literal, an unsupported version, or any root/event/
+    entry structural or field-order violation raises ``ValueError``;
+    other locking or I/O failures raise ``OSError``. The call never
+    writes.
+
+    Returns a dict with keys ``version``, ``count``, ``sealed``,
+    ``valid``, ``first_invalid`` and ``head``, in that order:
+
+    * Version 1: the real event count, ``sealed`` and ``valid`` false,
+      ``first_invalid`` and ``head`` null.
+    * Intact version 2: ``count`` events, ``sealed`` and ``valid`` true,
+      ``first_invalid`` null, ``head`` the digest declared by the file.
+    * Tampered version 2 (bad item digest, broken previous reference or
+      wrong root head) is not raised: ``valid`` is false and
+      ``first_invalid`` names the first zero-based position -- the
+      item's own index for a digest mismatch, the current index for a
+      broken previous link, or ``count`` solely when just the root head
+      is wrong -- while ``head`` stays the declared value.
+    """
+    if not isinstance(path, str) or not path:
+        raise ValueError("path must be a non-empty string")
+
+    realpath = os.path.realpath(path)
+    document = _read_existing_document(realpath)
+
+    keys = list(document["events"])
+    count = len(keys)
+    if document["version"] == _V1:
+        sealed = False
+        valid = False
+        first_invalid: int | None = None
+        head: str | None = None
+    else:
+        sealed = True
+        first_invalid = _chain_first_invalid(
+            keys, document["entries"], document["head"])
+        valid = first_invalid is None
+        head = document["head"]
+    return {
+        "version": document["version"],
+        "count": count,
+        "sealed": sealed,
+        "valid": valid,
+        "first_invalid": first_invalid,
+        "head": head,
+    }
