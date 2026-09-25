@@ -288,7 +288,7 @@ def _validate_signal(
     resource_region: str,
     at: int,
     signal_history: dict[str, list[dict[str, Any]]] | None,
-) -> tuple[dict[str, Any], int, int]:
+) -> tuple[int, int]:
     # A live candidate freezes the exact published signal record --
     # region, version and all observations -- so a later signal publish
     # cannot change what an earlier trade was decided under. When the
