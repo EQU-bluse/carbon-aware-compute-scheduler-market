@@ -9,13 +9,13 @@ booking: given the signals valid *now*, should the job stay on the
 resource version its trade froze, or migrate to another resource whose
 current version is cleaner or cheaper right now?
 
-:func:`evaluate` is the one and only public call. It reads the seven
-layers -- the ``jobs.submit`` acceptance file, the resource supply file,
-the live signal file, the ``market.clear`` clearing ledger, the dispatch
-ledger, the execution ledger and this module's advice ledger -- as one
-snapshot under their shared locks together with the advice ledger's
-exclusive lock, all seven taken in resolved real-path order, so
-concurrent calls across processes can never deadlock.
+:func:`evaluate` reads the seven layers -- the ``jobs.submit``
+acceptance file, the resource supply file, the live signal file, the
+``market.clear`` clearing ledger, the dispatch ledger, the execution
+ledger and this module's advice ledger -- as one snapshot under their
+shared locks together with the advice ledger's exclusive lock, all
+seven taken in resolved real-path order, so concurrent calls across
+processes can never deadlock.
 
 The re-evaluation rules are deliberately asymmetric between the slot
 the job already occupies and every alternative:
@@ -58,6 +58,43 @@ every commit goes through a synced same-directory temporary file, an
 atomic replace and a directory fsync, restoring the pre-call bytes on
 failure, so an unsuccessful call leaves neither a temporary fragment
 nor half an audit event.
+
+:func:`apply` turns one recorded ``migrate`` advice into a persistent
+capacity reservation. It reads the same seven snapshots as
+:func:`evaluate` together with the intent ledger under the same
+locking discipline -- eight paths taken in resolved real-path order,
+the intent ledger exclusive and the seven inputs shared. Only a
+``migrate`` advice recorded for the same job is consumed: a ``keep``
+advice, an advice recorded for another job or an apply moment earlier
+than the advice moment raises ``ValueError``. A claimed dispatch
+decision or an active execution plan raises ``PermissionError``, a
+succeeded decision or a completed plan raises ``ValueError`` and an
+apply moment past the job deadline raises ``TimeoutError`` -- none of
+them creates the intent ledger.
+
+The apply recomputes the feasible candidates on the consistent
+snapshot with the current supply and the latest valid signals, keeping
+the region, residency, budget, deadline and ordering rules; capacity
+is deducted per exact resource version for every trade and every other
+job's intent, while this job's own source occupancy is never deducted
+twice. The first recomputed item must still be the advice target: a
+changed target, an empty feasible set or insufficient remaining
+capacity raises ``LookupError`` without writing.
+
+The intent record freezes, in order, the job id, the advice key, the
+apply moment, the source and target selections, the frozen target
+supply and signal records, the dispatch and execution states and the
+``reserved`` state. The intent ledger (version 1) holds ``intents``
+keyed by job id, ``idempotency`` bindings keyed by call key and one
+``audit`` event per first-served key binding the complete request and
+the committed record. A first reservation returns ``(record, True)``;
+replaying the same key with the same request returns the record with
+``False`` without writing, while the same key with a different
+request, or the same job reserved under another key, raises
+``ValueError``. The byte-level contract -- canonical compact UTF-8
+JSON with non-ASCII written through, no negative-zero or non-finite
+literals, exactly one trailing newline, synced atomic commits
+restoring the pre-call bytes on failure -- is the advice ledger's own.
 """
 
 from __future__ import annotations
@@ -79,7 +116,7 @@ from . import resources as _resources
 from . import signals as _signals
 from ._jsonio import finite_loads
 
-__all__ = ["evaluate"]
+__all__ = ["evaluate", "apply"]
 
 _VERSION = 1
 _ROOT_FIELDS = ("version", "records", "audit")
@@ -93,6 +130,11 @@ _DISPATCH_STATES = ("ready", "claimed", "succeeded", "failed")
 _EXECUTION_STATES = ("none", "active", "completed", "failed",
                      "interrupted")
 _RECOMMENDATIONS = ("keep", "migrate")
+_INTENT_ROOT_FIELDS = ("version", "intents", "idempotency", "audit")
+_INTENT_FIELDS = ("job_id", "advice", "at", "source", "target", "supply",
+                  "signal", "dispatch", "execution", "state")
+_INTENT_REQUEST_FIELDS = ("job_id", "advice", "at")
+_INTENT_STATE = "reserved"
 _LOCK_SUFFIX = ".lock"
 
 
@@ -552,6 +594,100 @@ def _latest_signal(
     return signal_copy
 
 
+def _rank_candidates(
+    job: dict[str, Any],
+    job_id: str,
+    trade: dict[str, Any],
+    cleared: dict[str, dict[str, Any]],
+    history: dict[str, list[dict[str, Any]]],
+    signal_history: dict[str, list[dict[str, Any]]],
+    at: int,
+    extra: dict[tuple[str, int], int] | None = None,
+) -> tuple[dict[str, Any], list[dict[str, Any]]]:
+    # The feasible set and its ordering, shared by evaluate and apply:
+    # the retained item is the exact resource version the trade froze,
+    # every migration item is another resource's highest version valid
+    # at the moment, and each item prices on its region's latest signal
+    # valid at the moment. Capacity is deducted per exact resource
+    # version for every trade other jobs booked plus any extra
+    # reservations (other jobs' intents); this job's own frozen
+    # occupancy is never deducted against itself.
+    current_id = trade["resource_id"]
+    current_version = trade["version"]
+    current = {"resource_id": current_id,
+               "version": current_version}
+    work = job["work"]
+    regions = set(job["regions"])
+    residency = set(job["residency"])
+
+    booked: dict[tuple[str, int], int] = {}
+    for other_id, other in cleared.items():
+        if other_id == job_id:
+            continue
+        slot = (other["resource_id"], other["version"])
+        booked[slot] = booked.get(slot, 0) + other["work"]
+    for slot, amount in (extra or {}).items():
+        booked[slot] = booked.get(slot, 0) + amount
+
+    candidates: list[dict[str, Any]] = []
+
+    def consider(resource_record: dict[str, Any]) -> None:
+        if resource_record["region"] not in regions:
+            return
+        if not residency <= set(resource_record["residency"]):
+            return
+        if resource_record["end"] < job["deadline"]:
+            return
+        signal = _latest_signal(
+            signal_history, resource_record["region"], at)
+        if signal is None:
+            return
+        remaining = resource_record["capacity"] - booked.get(
+            (resource_record["resource_id"],
+             resource_record["version"]), 0)
+        if remaining < work:
+            return
+        total_cost = work * signal["unit_cost"]
+        total_carbon = work * signal["carbon_intensity"]
+        if total_cost > job["max_cost"] \
+                or total_carbon > job["carbon_cap"]:
+            return
+        candidates.append({
+            "resource": dict(resource_record),
+            "signal": signal,
+            "total_cost": total_cost,
+            "total_carbon": total_carbon,
+        })
+
+    # The retained item is the immutable version the trade froze,
+    # independent of whether its supply window is still open.
+    frozen_records = history.get(current_id)
+    if frozen_records is None or current_version > len(frozen_records):
+        raise ValueError("trade references an unpublished "
+                         "resource version")
+    consider(frozen_records[current_version - 1])
+
+    # Migration items: only other resources' highest versions
+    # valid at the moment -- never another version of the current
+    # resource.
+    for resource_id, versions in history.items():
+        if resource_id == current_id:
+            continue
+        active: dict[str, Any] | None = None
+        for version_record in versions:
+            if version_record["start"] <= at <= version_record["end"]:
+                active = version_record
+        if active is None:
+            continue
+        consider(active)
+
+    candidates.sort(key=lambda entry: (
+        entry["signal"]["carbon_intensity"],
+        entry["signal"]["unit_cost"],
+        entry["resource"]["resource_id"]))
+    return current, candidates
+
+
 def evaluate(
     jobs: str,
     supply: str,
@@ -718,80 +854,8 @@ def evaluate(
                 raise TimeoutError("evaluation moment exceeds the job "
                                    "deadline")
 
-            current_id = trade["resource_id"]
-            current_version = trade["version"]
-            current = {"resource_id": current_id,
-                       "version": current_version}
-            work = job["work"]
-            regions = set(job["regions"])
-            residency = set(job["residency"])
-
-            # Capacity already booked per exact resource version by
-            # every OTHER job; this job's own frozen occupancy is never
-            # deducted against itself.
-            booked: dict[tuple[str, int], int] = {}
-            for other_id, other in cleared.items():
-                if other_id == job_id:
-                    continue
-                slot = (other["resource_id"], other["version"])
-                booked[slot] = booked.get(slot, 0) + other["work"]
-
-            candidates: list[dict[str, Any]] = []
-
-            def consider(resource_record: dict[str, Any]) -> None:
-                if resource_record["region"] not in regions:
-                    return
-                if not residency <= set(resource_record["residency"]):
-                    return
-                if resource_record["end"] < job["deadline"]:
-                    return
-                signal = _latest_signal(
-                    signal_history, resource_record["region"], at)
-                if signal is None:
-                    return
-                remaining = resource_record["capacity"] - booked.get(
-                    (resource_record["resource_id"],
-                     resource_record["version"]), 0)
-                if remaining < work:
-                    return
-                total_cost = work * signal["unit_cost"]
-                total_carbon = work * signal["carbon_intensity"]
-                if total_cost > job["max_cost"] \
-                        or total_carbon > job["carbon_cap"]:
-                    return
-                candidates.append({
-                    "resource": dict(resource_record),
-                    "signal": signal,
-                    "total_cost": total_cost,
-                    "total_carbon": total_carbon,
-                })
-
-            # The retained item is the immutable version the trade froze,
-            # independent of whether its supply window is still open.
-            frozen_records = history.get(current_id)
-            if frozen_records is None or current_version > len(frozen_records):
-                raise ValueError("trade references an unpublished "
-                                 "resource version")
-            consider(frozen_records[current_version - 1])
-
-            # Migration items: only other resources' highest versions
-            # valid at the moment -- never another version of the current
-            # resource.
-            for resource_id, versions in history.items():
-                if resource_id == current_id:
-                    continue
-                active: dict[str, Any] | None = None
-                for version_record in versions:
-                    if version_record["start"] <= at <= version_record["end"]:
-                        active = version_record
-                if active is None:
-                    continue
-                consider(active)
-
-            candidates.sort(key=lambda entry: (
-                entry["signal"]["carbon_intensity"],
-                entry["signal"]["unit_cost"],
-                entry["resource"]["resource_id"]))
+            current, candidates = _rank_candidates(
+                job, job_id, trade, cleared, history, signal_history, at)
             if not candidates:
                 raise LookupError("no feasible resource for the job at "
                                   "the evaluation moment")
@@ -822,4 +886,560 @@ def evaluate(
                            "result": copy.deepcopy(record)}
             _commit_file(ledger_real,
                          _canonical_bytes(records, events), old_bytes)
+            return copy.deepcopy(record), True
+
+
+def _validate_intent(
+    record: object,
+    accepted: dict[str, dict[str, Any]],
+    trades: dict[str, dict[str, Any]],
+    advice_records: dict[str, dict[str, Any]],
+    history: dict[str, list[dict[str, Any]]],
+    signal_history: dict[str, list[dict[str, Any]]],
+) -> dict[str, Any]:
+    if not isinstance(record, dict) \
+            or set(record.keys()) != set(_INTENT_FIELDS):
+        raise ValueError("intent record has invalid fields")
+    job_id = record["job_id"]
+    if not isinstance(job_id, str) or not job_id:
+        raise ValueError("intent job_id must be a non-empty string")
+    advice_key = record["advice"]
+    if not isinstance(advice_key, str) or not advice_key:
+        raise ValueError("intent advice key must be a non-empty string")
+    at = record["at"]
+    if not _is_plain_int(at) or at < 0:
+        raise ValueError("intent at must be a non-boolean non-negative "
+                         "integer")
+    source = _validate_selection(record["source"], "intent source "
+                                 "selection")
+    target = _validate_selection(record["target"], "intent target "
+                                 "selection")
+    dispatch = record["dispatch"]
+    if dispatch not in _DISPATCH_STATES:
+        raise ValueError("intent dispatch state is invalid")
+    execution = record["execution"]
+    if execution not in _EXECUTION_STATES:
+        raise ValueError("intent execution state is invalid")
+    if record["state"] != _INTENT_STATE:
+        raise ValueError("intent state must be reserved")
+
+    job = accepted.get(job_id)
+    if job is None:
+        raise ValueError("intent record must reference an accepted job")
+    trade = trades.get(job_id)
+    if trade is None:
+        raise ValueError("intent record must reference a recorded trade")
+    if at > job["deadline"]:
+        raise ValueError("intent moment must not pass the job deadline")
+    if source != {"resource_id": trade["resource_id"],
+                  "version": trade["version"]}:
+        raise ValueError("intent source selection must match the trade")
+    if target == source:
+        raise ValueError("intent target must differ from its source")
+
+    # The advice the reservation consumes is a recorded migrate advice
+    # for the same job, targeting the same selection; the dispatch and
+    # execution states stay frozen point-in-time facts, checked for the
+    # state vocabulary only.
+    advice = advice_records.get(advice_key)
+    if advice is None:
+        raise ValueError("intent record must reference a recorded "
+                         "advice")
+    if advice["job_id"] != job_id:
+        raise ValueError("intent advice must belong to the same job")
+    if advice["recommendation"] != "migrate":
+        raise ValueError("intent advice must be a migrate advice")
+    if advice["current"] != source or advice["target"] != target:
+        raise ValueError("intent selections must match the advice")
+    if at < advice["at"]:
+        raise ValueError("intent moment must not precede the advice "
+                         "moment")
+
+    # The frozen supply and signal records must be the exact, immutable
+    # published versions; like a frozen advice candidate, a later
+    # publication must not invalidate the recorded intent, so only the
+    # frozen versions' own windows are checked.
+    supply = record["supply"]
+    if not isinstance(supply, dict) \
+            or set(supply.keys()) != set(_resources._RECORD_FIELDS):
+        raise ValueError("intent supply has invalid fields")
+    if {"resource_id": supply.get("resource_id"),
+            "version": supply.get("version")} != target:
+        raise ValueError("intent supply must be the target resource "
+                         "version")
+    records = history.get(target["resource_id"])
+    if records is None or target["version"] > len(records) \
+            or dict(supply) != records[target["version"] - 1]:
+        raise ValueError("intent supply must reference a published "
+                         "resource version")
+    if not supply["start"] <= at <= supply["end"]:
+        raise ValueError("intent target must be valid at the apply "
+                         "moment")
+    if supply["region"] not in set(job["regions"]):
+        raise ValueError("intent target is outside the job's regions")
+    if not set(job["residency"]) <= set(supply["residency"]):
+        raise ValueError("intent target does not cover job residency")
+    if supply["end"] < job["deadline"]:
+        raise ValueError("intent target does not cover the job deadline")
+
+    signal = record["signal"]
+    if not isinstance(signal, dict) \
+            or set(signal.keys()) != set(_signals._RECORD_FIELDS):
+        raise ValueError("intent signal has invalid fields")
+    # Validate a copy: _check_values normalizes the mix order in place,
+    # and the parsed record's raw key order must survive for the
+    # canonical-byte comparison.
+    signal_copy = dict(signal)
+    signal_copy["mix"] = dict(signal["mix"])
+    _signals._check_values(signal_copy)
+    if signal["region"] != supply["region"]:
+        raise ValueError("intent signal must cover the target region")
+    signal_records = signal_history.get(supply["region"])
+    if signal_records is None or signal["version"] > len(signal_records) \
+            or dict(signal) != signal_records[signal["version"] - 1]:
+        raise ValueError("intent signal must reference a published "
+                         "signal version")
+    if not (signal["observed"] <= at <= signal["expires"]):
+        raise ValueError("intent signal must be valid at the apply "
+                         "moment")
+    work = job["work"]
+    if work * signal["unit_cost"] > job["max_cost"] \
+            or work * signal["carbon_intensity"] > job["carbon_cap"]:
+        raise ValueError("intent target exceeds a job budget")
+    # Capacity is a decision-time fact: later trades and intents may
+    # legitimately fill the version, so it is enforced at reservation
+    # time, not on readback.
+
+    return {
+        "job_id": job_id,
+        "advice": advice_key,
+        "at": at,
+        "source": source,
+        "target": target,
+        "supply": copy.deepcopy(supply),
+        "signal": copy.deepcopy(signal),
+        "dispatch": dispatch,
+        "execution": execution,
+        "state": _INTENT_STATE,
+    }
+
+
+def _validate_intent_request(request: object) -> dict[str, Any]:
+    if not isinstance(request, dict) \
+            or set(request.keys()) != set(_INTENT_REQUEST_FIELDS):
+        raise ValueError("intent request has invalid fields")
+    job_id = request["job_id"]
+    if not isinstance(job_id, str) or not job_id:
+        raise ValueError("intent request job_id must be a non-empty "
+                         "string")
+    advice_key = request["advice"]
+    if not isinstance(advice_key, str) or not advice_key:
+        raise ValueError("intent request advice key must be a non-empty "
+                         "string")
+    at = request["at"]
+    if not _is_plain_int(at) or at < 0:
+        raise ValueError("intent request at must be a non-boolean "
+                         "non-negative integer")
+    return {"job_id": job_id, "advice": advice_key, "at": at}
+
+
+def _validate_intent_ledger(
+    data: object,
+    accepted: dict[str, dict[str, Any]],
+    trades: dict[str, dict[str, Any]],
+    advice_records: dict[str, dict[str, Any]],
+    history: dict[str, list[dict[str, Any]]],
+    signal_history: dict[str, list[dict[str, Any]]],
+) -> tuple[dict[str, dict[str, Any]], dict[str, dict[str, Any]],
+           dict[str, dict[str, Any]]]:
+    if not isinstance(data, dict) \
+            or set(data.keys()) != set(_INTENT_ROOT_FIELDS):
+        raise ValueError("intent ledger root must be an object with keys "
+                         "version, intents, idempotency and audit")
+    version = data["version"]
+    if not _is_plain_int(version) or version != _VERSION:
+        raise ValueError("unsupported intent ledger version")
+
+    intents_raw = data["intents"]
+    idempotency_raw = data["idempotency"]
+    audit_raw = data["audit"]
+    if not isinstance(intents_raw, dict) \
+            or not isinstance(idempotency_raw, dict) \
+            or not isinstance(audit_raw, dict):
+        raise ValueError("intents, idempotency and audit must be "
+                         "objects")
+    _check_sorted_keys(intents_raw, "intents")
+    _check_sorted_keys(idempotency_raw, "idempotency")
+    _check_sorted_keys(audit_raw, "audit")
+
+    intents: dict[str, dict[str, Any]] = {}
+    for job_id, record_raw in intents_raw.items():
+        if not isinstance(job_id, str) or not job_id:
+            raise ValueError("intent job ids must be non-empty strings")
+        record = _validate_intent(
+            record_raw, accepted, trades, advice_records, history,
+            signal_history)
+        if record["job_id"] != job_id:
+            raise ValueError("intent record id does not match its key")
+        intents[job_id] = record
+
+    idempotency: dict[str, dict[str, Any]] = {}
+    for key, request_raw in idempotency_raw.items():
+        if not isinstance(key, str) or not key:
+            raise ValueError("idempotency keys must be non-empty "
+                             "strings")
+        request = _validate_intent_request(request_raw)
+        if request["job_id"] not in intents:
+            raise ValueError("idempotency entry must reference a "
+                             "recorded intent")
+        idempotency[key] = request
+
+    events: dict[str, dict[str, Any]] = {}
+    for key, event_raw in audit_raw.items():
+        if not isinstance(key, str) or not key:
+            raise ValueError("audit keys must be non-empty strings")
+        if not isinstance(event_raw, dict) \
+                or set(event_raw.keys()) != set(_EVENT_FIELDS):
+            raise ValueError("intent audit event has invalid fields")
+        if event_raw["key"] != key or not isinstance(event_raw["key"], str):
+            raise ValueError("audit event key does not match its map "
+                             "key")
+        request = _validate_intent_request(event_raw["request"])
+        result = _validate_intent(
+            event_raw["result"], accepted, trades, advice_records,
+            history, signal_history)
+        if result != intents.get(result["job_id"]):
+            raise ValueError("audit event result does not match its "
+                             "intent")
+        if (request["job_id"], request["advice"], request["at"]) \
+                != (result["job_id"], result["advice"], result["at"]):
+            raise ValueError("audit event request does not match its "
+                             "result")
+        events[key] = {"key": key, "request": request, "result": result}
+
+    # The three sections describe one reservation history: each
+    # idempotency key binds one request and one event, the event
+    # carries exactly the bound request, and every intent is reserved
+    # under exactly one key.
+    if set(idempotency) != set(events):
+        raise ValueError("idempotency keys and audit events do not "
+                         "match")
+    for key, request in idempotency.items():
+        if events[key]["request"] != request:
+            raise ValueError("audit event does not match its "
+                             "idempotency entry")
+    bound: dict[str, str] = {}
+    for key, request in idempotency.items():
+        if request["job_id"] in bound:
+            raise ValueError("job reserved under more than one "
+                             "idempotency key")
+        bound[request["job_id"]] = key
+    if set(bound) != set(intents):
+        raise ValueError("every intent must be bound to a reservation "
+                         "request")
+
+    return intents, idempotency, events
+
+
+def _canonical_intent_bytes(
+    intents: dict[str, dict[str, Any]],
+    idempotency: dict[str, dict[str, Any]],
+    events: dict[str, dict[str, Any]],
+) -> bytes:
+    # Compact UTF-8 JSON, non-ASCII written through, sections in their
+    # fixed field order, intents keyed by job id and the other sections
+    # by call key, all in code-point order, terminated by exactly one
+    # newline.
+    payload = {
+        "version": _VERSION,
+        "intents": {job_id: intents[job_id] for job_id in sorted(intents)},
+        "idempotency": {key: idempotency[key] for key in sorted(idempotency)},
+        "audit": {key: events[key] for key in sorted(events)},
+    }
+    text = json.dumps(payload, ensure_ascii=False, separators=(",", ":"),
+                      allow_nan=False) + "\n"
+    return text.encode("utf-8")
+
+
+def _load_intent_ledger(
+    realpath: str,
+    accepted: dict[str, dict[str, Any]],
+    trades: dict[str, dict[str, Any]],
+    advice_records: dict[str, dict[str, Any]],
+    history: dict[str, list[dict[str, Any]]],
+    signal_history: dict[str, list[dict[str, Any]]],
+) -> tuple[dict[str, dict[str, Any]], dict[str, dict[str, Any]],
+           dict[str, dict[str, Any]], bytes | None]:
+    try:
+        with open(realpath, "rb") as handle:
+            raw = handle.read()
+    except FileNotFoundError:
+        return {}, {}, {}, None
+    try:
+        text = raw.decode("utf-8")
+    except UnicodeDecodeError as exc:
+        raise ValueError(
+            f"intent ledger {realpath!r} is not valid UTF-8") from exc
+    try:
+        # Negative-zero and non-finite literals are format errors.
+        data = finite_loads(text)
+    except ValueError as exc:
+        raise ValueError(
+            f"intent ledger {realpath!r} is not valid JSON") from exc
+    intents, idempotency, events = _validate_intent_ledger(
+        data, accepted, trades, advice_records, history, signal_history)
+    # As for the other ledgers, the ledger is accepted only in canonical
+    # compact form with a single trailing newline.
+    if raw != _canonical_intent_bytes(intents, idempotency, events):
+        raise ValueError(
+            f"intent ledger {realpath!r} is not in canonical compact "
+            "form")
+    return intents, idempotency, events, raw
+
+
+def apply(
+    jobs: str,
+    supply: str,
+    signals: str,
+    trades: str,
+    dispatch: str,
+    execution: str,
+    advice: str,
+    intents: str,
+    job_id: str,
+    advice_key: str,
+    key: str,
+    at: int,
+) -> tuple[dict[str, object], bool]:
+    """Apply one recorded migrate advice as a capacity reservation.
+
+    The eight paths, ``job_id``, ``advice_key`` and ``key`` must be
+    non-empty strings and ``at`` a non-boolean non-negative integer
+    apply moment; the eight paths must also resolve to distinct real
+    locations. Any violation raises ``ValueError`` before a business
+    file is read.
+
+    The acceptance, supply, signal, clearing, dispatch, execution and
+    advice files are read as one snapshot under their shared locks
+    together with the intent ledger's exclusive lock, all eight taken
+    in resolved real-path order. Only a ``migrate`` advice recorded
+    under ``advice_key`` for the same job is consumed: a ``keep``
+    advice, an advice recorded for another job or an apply moment
+    earlier than the advice moment raises ``ValueError``. A claimed
+    dispatch decision or an active execution plan raises
+    ``PermissionError``, a succeeded decision or a completed plan
+    raises ``ValueError``, and a moment past the job deadline raises
+    ``TimeoutError``; none of these writes.
+
+    The feasible candidates are recomputed on the snapshot with the
+    current supply and the latest valid signals, keeping the region,
+    residency, budget, deadline and ordering rules of
+    :func:`evaluate`; capacity is deducted per exact resource version
+    for every trade and every other job's recorded intent, while this
+    job's own source occupancy is never deducted twice. The first
+    recomputed candidate must still be the advice target: a changed
+    target, an empty feasible set or insufficient remaining capacity
+    raises ``LookupError`` without writing.
+
+    Returns ``(record, created)``. The record freezes, in order, the
+    job id, the advice key, the apply moment, the source and target
+    selections, the frozen target supply and signal records, the
+    dispatch and execution states and the ``reserved`` state. A
+    missing intent ledger is created only by the first reservation,
+    the intent, its idempotency binding and the audit event -- the
+    complete request plus the committed record -- in one synced atomic
+    write. Replaying the same key with the same job, advice key and
+    moment returns the stored record with ``False`` without writing;
+    the same key with a changed request, or the same job reserved
+    under another key, raises ``ValueError`` with the ledger
+    untouched.
+
+    An unknown job, advice key or dispatch decision raises
+    ``KeyError``; a job without a trade raises ``LookupError``;
+    neither creates the ledger. Missing input files or the ledger
+    parent raise ``FileNotFoundError``; invalid arguments, structure,
+    references, ordering or non-canonical bytes raise ``ValueError``;
+    other locking, read/write or sync failures raise ``OSError``.
+    """
+    for value in (jobs, supply, signals, trades, dispatch, execution,
+                  advice, intents, job_id, advice_key, key):
+        if not isinstance(value, str) or not value:
+            raise ValueError("the eight paths, job_id, advice_key and "
+                             "key must be non-empty strings")
+    if not _is_plain_int(at) or at < 0:
+        raise ValueError("at must be a non-boolean non-negative integer")
+
+    job_real = os.path.realpath(jobs)
+    supply_real = os.path.realpath(supply)
+    signal_real = os.path.realpath(signals)
+    trades_real = os.path.realpath(trades)
+    dispatch_real = os.path.realpath(dispatch)
+    execution_real = os.path.realpath(execution)
+    advice_real = os.path.realpath(advice)
+    intents_real = os.path.realpath(intents)
+    all_paths = (job_real, supply_real, signal_real, trades_real,
+                 dispatch_real, execution_real, advice_real,
+                 intents_real)
+    if len(set(all_paths)) != 8:
+        raise ValueError("the eight paths must be distinct real paths")
+
+    store = _get_store(intents)
+    with store.lock:
+        # Locks are taken in one resolved-real-path order shared by
+        # every caller, so concurrent applies can never deadlock; the
+        # intent ledger lock is exclusive, the seven snapshot locks
+        # shared.
+        with contextlib.ExitStack() as stack:
+            for locked in sorted(set(all_paths)):
+                stack.enter_context(
+                    _lock(locked, shared=(locked != intents_real)))
+
+            accepted, job_map, job_events, job_raw = \
+                _jobs._load_submit_file(job_real)
+            if job_raw is None:
+                raise FileNotFoundError(
+                    f"acceptance file {job_real!r} does not exist")
+            if job_raw != _jobs._serialize_submit_file(
+                    accepted, job_map, job_events):
+                raise ValueError(
+                    f"acceptance file {job_real!r} is not in canonical "
+                    "compact form")
+            history, _supply_map, _supply_events, supply_raw = \
+                _resources._load_file(supply_real)
+            if supply_raw is None:
+                raise FileNotFoundError(
+                    f"supply file {supply_real!r} does not exist")
+            signal_history, _signal_map, _signal_events, signal_raw = \
+                _signals._load_file(signal_real)
+            if signal_raw is None:
+                raise FileNotFoundError(
+                    f"signal file {signal_real!r} does not exist")
+            # Live trades freeze signal versions, so the signal history
+            # resolves their references; static trades validate as
+            # before.
+            cleared, _clear_keys, trades_raw = _market._load_clear_ledger(
+                trades_real, accepted, history, signal_history)
+            if trades_raw is None:
+                raise FileNotFoundError(
+                    f"clearing ledger {trades_real!r} does not exist")
+            decisions, _dispatch_keys, _dispatch_events, dispatch_raw = \
+                _dispatch._load_ledger(dispatch_real)
+            if dispatch_raw is None:
+                raise FileNotFoundError(
+                    f"dispatch ledger {dispatch_real!r} does not exist")
+            plans, _plan_keys, _plan_events = \
+                _execution._load_existing_ledger(execution_real)[:3]
+            advice_records, _advice_events, advice_raw = _load_ledger(
+                advice_real, accepted, cleared, history, signal_history)
+            if advice_raw is None:
+                raise FileNotFoundError(
+                    f"advice ledger {advice_real!r} does not exist")
+            intent_map, idempotency, events, old_bytes = \
+                _load_intent_ledger(
+                    intents_real, accepted, cleared, advice_records,
+                    history, signal_history)
+
+            request = {"job_id": job_id, "advice": advice_key, "at": at}
+            binding = idempotency.get(key)
+            if binding is not None:
+                if binding != request:
+                    raise ValueError("idempotency key was already used "
+                                     "with a different request")
+                # An equivalent replay returns the stored record
+                # without re-reserving or rewriting a byte.
+                return copy.deepcopy(intent_map[job_id]), False
+
+            job = accepted.get(job_id)
+            if job is None:
+                raise KeyError(job_id)
+            trade = cleared.get(job_id)
+            if trade is None:
+                raise LookupError("job has no recorded trade")
+            decision = decisions.get(job_id)
+            if decision is None:
+                raise KeyError(job_id)
+            advice_record = advice_records.get(advice_key)
+            if advice_record is None:
+                raise KeyError(advice_key)
+            if advice_record["job_id"] != job_id:
+                raise ValueError("advice key does not match the job")
+            if advice_record["recommendation"] != "migrate":
+                raise ValueError("only a migrate advice can be applied")
+            if at < advice_record["at"]:
+                raise ValueError("apply moment precedes the advice "
+                                 "moment")
+            if job_id in intent_map:
+                raise ValueError("job is already reserved under another "
+                                 "idempotency key")
+
+            job_plans = plans.get(job_id, {})
+            # Refusal order is fixed: work in flight is a
+            # PermissionError, a finished booking is a ValueError, and
+            # a moment past the deadline is a TimeoutError.
+            if decision["state"] == "claimed" \
+                    or any(plan["state"] == "active"
+                           for plan in job_plans.values()):
+                raise PermissionError("the dispatch decision is claimed "
+                                      "or an execution plan is active")
+            if decision["state"] == "succeeded" \
+                    or any(plan["state"] == "completed"
+                           for plan in job_plans.values()):
+                raise ValueError("a finished booking cannot be "
+                                 "re-reserved")
+            if at > job["deadline"]:
+                raise TimeoutError("apply moment exceeds the job "
+                                   "deadline")
+
+            # Other jobs' intents reserve their targets' capacity on
+            # top of every trade; this job's own source occupancy is
+            # never deducted twice.
+            extra: dict[tuple[str, int], int] = {}
+            for other_id, intent in intent_map.items():
+                if other_id == job_id:
+                    continue
+                slot = (intent["target"]["resource_id"],
+                        intent["target"]["version"])
+                extra[slot] = extra.get(slot, 0) \
+                    + accepted[other_id]["work"]
+
+            current, candidates = _rank_candidates(
+                job, job_id, trade, cleared, history, signal_history,
+                at, extra)
+            if not candidates:
+                raise LookupError("no feasible resource for the job at "
+                                  "the apply moment")
+            winner = candidates[0]
+            target = {"resource_id": winner["resource"]["resource_id"],
+                      "version": winner["resource"]["version"]}
+            if target != advice_record["target"]:
+                raise LookupError("the advice target is no longer the "
+                                  "first feasible candidate")
+
+            if job_plans:
+                execution_state = max(
+                    job_plans.values(),
+                    key=lambda plan: plan["attempt"])["state"]
+            else:
+                execution_state = "none"
+
+            record = {
+                "job_id": job_id,
+                "advice": advice_key,
+                "at": at,
+                "source": current,
+                "target": target,
+                "supply": copy.deepcopy(winner["resource"]),
+                "signal": copy.deepcopy(winner["signal"]),
+                "dispatch": decision["state"],
+                "execution": execution_state,
+                "state": _INTENT_STATE,
+            }
+            intent_map[job_id] = record
+            idempotency[key] = request
+            events[key] = {"key": key, "request": dict(request),
+                           "result": copy.deepcopy(record)}
+            _commit_file(intents_real,
+                         _canonical_intent_bytes(
+                             intent_map, idempotency, events),
+                         old_bytes)
             return copy.deepcopy(record), True
