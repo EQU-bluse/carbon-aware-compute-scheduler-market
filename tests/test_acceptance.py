@@ -181,6 +181,29 @@ class SubmitTest(_Fixture):
         record, created = self._submit()
         self.assertIs(created, False)
 
+    def test_pending_record_is_committed_before_the_evidence(self) -> None:
+        self._record("a")
+        self._export()
+        # Interrupt the first submission during the evidence write: the
+        # pending record is already committed, the evidence is not.
+        with mock.patch.object(acceptance, "_save_evidence",
+                               side_effect=OSError("injected")):
+            with self.assertRaises(OSError):
+                self._submit()
+        record = acceptance.get(self.ledger_dir, "k1")
+        self.assertEqual(record["state"], "pending")
+        self.assertIsNone(record["error"])
+        self.assertFalse(os.path.exists(
+            os.path.join(self.ledger_dir, "checkpoints")))
+        # The retry of the same bundle resumes from the stored pending
+        # record instead of posing as never received.
+        record, created = self._submit()
+        self.assertIs(created, True)
+        self.assertEqual(record["state"], "active")
+        evidence = os.path.join(self.ledger_dir, "checkpoints",
+                                record["checkpoint_digest"] + ".json")
+        self.assertTrue(os.path.exists(evidence))
+
     def test_format_failure_quarantines_then_raises(self) -> None:
         self._record("a")
         self._export()
@@ -207,7 +230,15 @@ class SubmitTest(_Fixture):
         record = acceptance.get(self.ledger_dir, "k1")
         self.assertEqual(record["state"], "quarantined")
         self.assertEqual(record["error"], "BundleMismatchError")
-        self.assertEqual(record["etag"], wrong_tag)
+        # The record carries the actual tag computed from the
+        # checkpoint's bytes, never the caller's claimed value.
+        self.assertEqual(record["etag"], self._etag())
+        # The evidence of the rejected bundle is retained.
+        self.assertTrue(os.path.exists(os.path.join(
+            self.ledger_dir, "checkpoints",
+            record["checkpoint_digest"] + ".json")))
+        self.assertTrue(os.path.exists(os.path.join(
+            self.ledger_dir, "proofs", record["proof_digest"] + ".json")))
 
     def test_quarantined_replay_reraises_without_writing(self) -> None:
         self._record("a")
@@ -270,10 +301,18 @@ class SubmitTest(_Fixture):
         wrong_tag = '"' + "0" * 64 + '"'
         with self.assertRaises(audit_proof.BundleMismatchError):
             self._submit(etag=wrong_tag)
+        # The same bytes, now with the correct claimed tag, are the
+        # same bundle: the quarantined record replays its failure.
+        with self.assertRaises(audit_proof.BundleMismatchError):
+            self._submit()
+        # A genuinely different bundle under the same key is a conflict.
+        self._record("b")
+        self._export()
         with self.assertRaises(ValueError):
-            self._submit()  # same key, the valid bundle: a conflict
+            self._submit()
         record = acceptance.get(self.ledger_dir, "k1")
         self.assertEqual(record["state"], "quarantined")
+        self.assertEqual(len(self._ledger()["conflicts"]), 1)
 
     def test_distinct_keys_share_the_ledger(self) -> None:
         self._record("a")

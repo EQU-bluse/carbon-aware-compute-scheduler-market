@@ -13,24 +13,28 @@ key.
 tag the checkpoint download carried, the trust directory, the ledger
 directory and the idempotency key. Each ledger record carries, in that
 order, ``key``, ``etag``, ``checkpoint_digest``, ``proof_digest``,
-``state`` and ``error``: the key it was submitted under, the tag the
-submission carried, the SHA-256 of the checkpoint's raw bytes, the
-SHA-256 of the proof's raw bytes, the acceptance state -- ``pending``,
-``active`` or ``quarantined`` -- and, only while quarantined, the class
-name of the public exception the verification raised (``error`` is null
-in every other state).
+``state`` and ``error``: the key it was submitted under, the *actual*
+strong tag computed from the checkpoint's raw bytes -- never the
+caller's claimed value -- the SHA-256 of the checkpoint's raw bytes,
+the SHA-256 of the proof's raw bytes, the acceptance state --
+``pending``, ``active`` or ``quarantined`` -- and, only while
+quarantined, the class name of the public exception the verification
+raised (``error`` is null in every other state).
 
-A first submission stores the checkpoint's and the proof's raw bytes
-content-addressed under the ledger directory and commits the record as
-``pending`` *before* the verification runs, so a crash mid-verification
-leaves exactly one explainable stage: a restarted process resumes the
-same bundle from ``pending`` and finishes the sequence, while leftover
+A first submission commits the record as ``pending`` *first* and only
+then stores the checkpoint's and the proof's raw bytes content-addressed
+under the ledger directory, all before the verification runs, so an
+evidence-write failure or a crash mid-verification leaves exactly one
+explainable stage: a restarted process resumes the same bundle from the
+persisted ``pending`` record -- finishing the evidence write and the
+sequence -- instead of posing as never received, while leftover
 unreferenced fragments never take part in any decision. A successful
 verification flips the record to ``active`` in the same call. A format
 failure keeps the evidence, quarantines the record and re-raises
 ``BundleFormatError``; a tag, digest-chain or lifecycle contradiction
 keeps the evidence, quarantines the record and re-raises
-``BundleMismatchError``. Missing inputs, missing parents and other
+``BundleMismatchError`` -- a claimed tag that does not match the
+checkpoint's bytes included. Missing inputs, missing parents and other
 locking or I/O failures propagate without moving the record: a failed
 call always keeps the pre-call state.
 
@@ -42,8 +46,9 @@ resumes and completes, and a ``quarantined`` record re-raises the
 recorded public exception type without touching the retained evidence.
 The same key with a different bundle is a conflict: both bundles' raw
 bytes and summaries are retained -- the new bundle's evidence is stored
-content-addressed and its summary appended to the ledger's ``conflicts``
--- the main record is never overwritten, and ``ValueError`` is raised.
+content-addressed and its summary (carrying the actual tag, like the
+main record) appended to the ledger's ``conflicts`` -- the main record
+is never overwritten, and ``ValueError`` is raised.
 An already recorded identical conflict advances nothing further.
 
 The ledger itself is one ``ledger.json`` inside the ledger directory: a
@@ -268,24 +273,31 @@ def submit(checkpoint_path: str, proof_path: str, etag: str,
     The bundle's raw bytes are read (a missing input raises
     ``FileNotFoundError``) and, under the ledger directory's exclusive
     kernel flock, the submission is matched against the ledger. A new
-    key stores both files' bytes content-addressed under the ledger
-    directory and commits a ``pending`` record; the bundle is then
-    verified by :func:`carbon_market.audit_proof.verify_bundle` -- the
-    complete existing verification, trust directory included. Success
-    flips the record to ``active`` and returns ``(record, True)``. A
-    format failure quarantines the record and re-raises
-    ``BundleFormatError``; a tag, digest-chain or lifecycle mismatch
-    quarantines it and re-raises ``BundleMismatchError`` -- in both
-    cases the evidence stays retained. Any other failure (a missing
-    parent, locking or I/O) propagates with the record left in its
-    pre-call state, so a restarted process resumes from ``pending``.
+    key commits a ``pending`` record first and then stores both files'
+    bytes content-addressed under the ledger directory; the bundle is
+    then verified by :func:`carbon_market.audit_proof.verify_bundle` --
+    the complete existing verification, trust directory included.
+    Success flips the record to ``active`` and returns
+    ``(record, True)``. A format failure quarantines the record and
+    re-raises ``BundleFormatError``; a tag, digest-chain or lifecycle
+    mismatch quarantines it and re-raises ``BundleMismatchError`` -- in
+    both cases the evidence stays retained, and a claimed tag that does
+    not match the checkpoint's bytes is no exception. An evidence-write
+    failure or any other failure (a missing parent, locking or I/O)
+    propagates with the record left in its pre-call state -- the
+    committed ``pending`` record included -- so a restarted process
+    resumes the same bundle from ``pending`` instead of posing as never
+    received.
 
-    The same bundle under an existing key replays: an ``active`` record
-    returns its copy with ``False`` and writes nothing, a ``pending``
-    record resumes and completes (returning ``True`` only when this call
-    is the first successful completion), and a ``quarantined`` record
-    re-raises the recorded public exception type without changing the
-    retained evidence. The same key with a different bundle retains both
+    The record's ``etag`` is always the actual strong tag computed from
+    the checkpoint's raw bytes, never the caller's claimed value; the
+    same holds for every conflict summary. The same bundle under an
+    existing key replays: an ``active`` record returns its copy with
+    ``False`` and writes nothing, a ``pending`` record resumes and
+    completes (returning ``True`` only when this call is the first
+    successful completion), and a ``quarantined`` record re-raises the
+    recorded public exception type without changing the retained
+    evidence. The same key with a different bundle retains both
     bundles' raw bytes and summaries, appends the new summary to the
     ledger's ``conflicts`` without overwriting the main record and
     raises ``ValueError``; an already recorded identical conflict
@@ -320,6 +332,10 @@ def submit(checkpoint_path: str, proof_path: str, etag: str,
         proof_raw = handle.read()
     checkpoint_digest = hashlib.sha256(checkpoint_raw).hexdigest()
     proof_digest = hashlib.sha256(proof_raw).hexdigest()
+    # The actual strong tag is recomputed from the checkpoint's raw
+    # bytes; the caller's claimed value only goes to the verification,
+    # which rejects it when the two disagree.
+    actual_tag = '"' + checkpoint_digest + '"'
 
     ledger_real = os.path.realpath(ledger_dir)
     store = audit_proof._get_store(ledger_real)
@@ -341,7 +357,7 @@ def submit(checkpoint_path: str, proof_path: str, etag: str,
             existing = records.get(key)
             if existing is not None:
                 same_bundle = (
-                    existing["etag"] == etag
+                    existing["etag"] == actual_tag
                     and existing["checkpoint_digest"] == checkpoint_digest
                     and existing["proof_digest"] == proof_digest)
                 if not same_bundle:
@@ -349,7 +365,7 @@ def submit(checkpoint_path: str, proof_path: str, etag: str,
                     # bundle's bytes and summary alongside the record's,
                     # never overwrite the main record. An already
                     # recorded identical conflict advances nothing.
-                    conflict = {"key": key, "etag": etag,
+                    conflict = {"key": key, "etag": actual_tag,
                                 "checkpoint_digest": checkpoint_digest,
                                 "proof_digest": proof_digest}
                     if conflict not in conflicts:
@@ -367,22 +383,27 @@ def submit(checkpoint_path: str, proof_path: str, etag: str,
                 if existing["state"] == "quarantined":
                     _raise_quarantined(existing)
                 # A pending record is resumed below: the identical
-                # bundle finishes its interrupted verification.
+                # bundle finishes its interrupted evidence write and
+                # verification.
                 record = existing
+                _save_evidence(ledger_real, checkpoint_digest,
+                               checkpoint_raw, proof_digest, proof_raw)
             else:
-                # First submission: save the evidence and commit the
-                # pending record before the verification runs, so a
-                # crash leaves exactly this one explainable stage.
-                record = {"key": key, "etag": etag,
+                # First submission: commit the pending record before the
+                # evidence is stored, so an evidence-write failure or a
+                # crash leaves exactly this one explainable stage and a
+                # retry of the same bundle resumes from pending instead
+                # of posing as never received.
+                record = {"key": key, "etag": actual_tag,
                           "checkpoint_digest": checkpoint_digest,
                           "proof_digest": proof_digest,
                           "state": "pending", "error": None}
-                _save_evidence(ledger_real, checkpoint_digest,
-                               checkpoint_raw, proof_digest, proof_raw)
                 records[key] = record
                 old_bytes = _commit_pending(
                     ledger_path, ledger_real, records, conflicts,
                     old_bytes)
+                _save_evidence(ledger_real, checkpoint_digest,
+                               checkpoint_raw, proof_digest, proof_raw)
 
             # The complete existing verification runs first; only its
             # outcome decides the acceptance state.

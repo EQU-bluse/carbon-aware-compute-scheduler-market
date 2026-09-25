@@ -7,7 +7,7 @@ import urllib.parse
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
-from . import audit, audit_proof, auth
+from . import acceptance, audit, audit_proof, auth
 
 # Query parameters GET /audit accepts; anything else is an invalid request.
 _AUDIT_PARAMS = ("cursor", "limit", "op", "stage", "key")
@@ -15,6 +15,10 @@ _AUDIT_PARAMS = ("cursor", "limit", "op", "stage", "key")
 # the optional closing flag; the audit and checkpoint paths are fixed by
 # the server and can never be selected through the query.
 _PROOF_PARAMS = ("generation", "final") + _AUDIT_PARAMS
+# GET /acceptance takes either the exact-lookup key alone or the
+# paginated exclusive cursor, page size and state filter.
+_ACCEPTANCE_PARAMS = ("key", "cursor", "limit", "state")
+_ACCEPTANCE_STATES = ("pending", "active", "quarantined")
 _OPS = ("copy", "restore")
 _STAGES = ("成功", "校验", "执行", "同步", "回滚")
 _MAX_LIMIT = 1000
@@ -81,6 +85,26 @@ def _parse_proof_params(query: str) -> dict[str, str]:
     return params
 
 
+def _parse_acceptance_params(query: str) -> dict[str, str]:
+    params = _parse_query(query, _ACCEPTANCE_PARAMS)
+    if "key" in params:
+        # An exact lookup stands alone: no cursor, page size or state
+        # may accompany the key.
+        if len(params) != 1:
+            raise ValueError("key cannot be combined with cursor, "
+                             "limit or state")
+        return params
+    limit = params.get("limit")
+    if limit is not None:
+        if not all("0" <= char <= "9" for char in limit):
+            raise ValueError("limit must be a decimal integer")
+        if not 1 <= int(limit) <= _MAX_LIMIT:
+            raise ValueError("limit must be between 1 and 1000")
+    if "state" in params and params["state"] not in _ACCEPTANCE_STATES:
+        raise ValueError("state must be pending, active or quarantined")
+    return params
+
+
 class Handler(BaseHTTPRequestHandler):
     server_version = "CarbonMarket/0.1"
 
@@ -102,6 +126,10 @@ class Handler(BaseHTTPRequestHandler):
             # The endpoint takes no parameters: the snapshot is always
             # the one checkpoint file fixed at startup.
             self._checkpoint(query)
+            return
+        if path == "/acceptance" \
+                and getattr(self.server, "acceptance_dir", None) is not None:
+            self._acceptance(query)
             return
         self._json(HTTPStatus.NOT_FOUND, {"error": "not_found"})
 
@@ -280,6 +308,63 @@ class Handler(BaseHTTPRequestHandler):
             else:
                 self._raw(HTTPStatus.OK, body, etag)
 
+    def _acceptance(self, query: str) -> None:
+        authorized, record = self._authorize()
+        if not authorized:
+            return
+
+        try:
+            params = _parse_acceptance_params(query)
+        except ValueError:
+            self._json(HTTPStatus.BAD_REQUEST, {"error": "invalid_request"})
+            return
+
+        # Scope checks follow parameter validation and precede any
+        # ledger access: an exact lookup requires unrestricted operation
+        # and stage scopes and a key scope that is unrestricted or names
+        # the requested key; a paginated query requires all three scopes
+        # unrestricted. A forbidden request never opens the ledger.
+        if record is not None:
+            if record.ops is not None or record.stages is not None:
+                self._json(HTTPStatus.FORBIDDEN, {"error": "forbidden"})
+                return
+            if "key" in params:
+                if record.keys is not None \
+                        and params["key"] not in record.keys:
+                    self._json(HTTPStatus.FORBIDDEN,
+                               {"error": "forbidden"})
+                    return
+            elif record.keys is not None:
+                self._json(HTTPStatus.FORBIDDEN, {"error": "forbidden"})
+                return
+
+        ledger_dir = getattr(self.server, "acceptance_dir")
+        try:
+            if "key" in params:
+                result: object = acceptance.get(ledger_dir, params["key"])
+            else:
+                kwargs: dict[str, object] = {}
+                for name in ("cursor", "state"):
+                    if name in params:
+                        kwargs[name] = params[name]
+                if "limit" in params:
+                    kwargs["limit"] = int(params["limit"])
+                result = acceptance.search(ledger_dir, **kwargs)
+        except FileNotFoundError:
+            # Never leak the configured path or the system message.
+            self._json(HTTPStatus.NOT_FOUND,
+                       {"error": "acceptance_not_found"})
+        except KeyError:
+            self._json(HTTPStatus.NOT_FOUND,
+                       {"error": "acceptance_key_not_found"})
+        except ValueError:
+            self._json(HTTPStatus.CONFLICT, {"error": "acceptance_invalid"})
+        except OSError:
+            self._json(HTTPStatus.SERVICE_UNAVAILABLE,
+                       {"error": "acceptance_unavailable"})
+        else:
+            self._json(HTTPStatus.OK, result)
+
     def _raw(self, status: HTTPStatus, body: bytes, etag: str) -> None:
         # The snapshot bytes are served verbatim -- the original UTF-8
         # written by the exporter, with its field order intact -- and the
@@ -309,10 +394,12 @@ class Handler(BaseHTTPRequestHandler):
 
 def serve(host: str, port: int, audit_path: str | None = None,
           token: str | None = None, auth: str | None = None,
-          checkpoint: str | None = None) -> None:
+          checkpoint: str | None = None,
+          acceptance: str | None = None) -> None:
     with ThreadingHTTPServer((host, port), Handler) as server:
         server.audit_path = audit_path  # type: ignore[attr-defined]
         server.audit_token = token  # type: ignore[attr-defined]
         server.audit_auth = auth  # type: ignore[attr-defined]
         server.audit_checkpoint = checkpoint  # type: ignore[attr-defined]
+        server.acceptance_dir = acceptance  # type: ignore[attr-defined]
         server.serve_forever()
