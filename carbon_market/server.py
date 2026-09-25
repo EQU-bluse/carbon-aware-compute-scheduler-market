@@ -319,6 +319,21 @@ class Handler(BaseHTTPRequestHandler):
             self._json(HTTPStatus.BAD_REQUEST, {"error": "invalid_request"})
             return
 
+        # The conditional header is validated together with the query,
+        # before the scope decision and any ledger access: absent
+        # (allowed) or exactly one strong tag of the documented shape.
+        # A blank value, a repeated header, a weak tag, a list, a
+        # wildcard or any other shape is an invalid request that never
+        # opens the ledger.
+        conditions = self.headers.get_all("If-None-Match")
+        condition: str | None = None
+        if conditions is not None:
+            if len(conditions) != 1 or not _ETAG_RE.fullmatch(conditions[0]):
+                self._json(HTTPStatus.BAD_REQUEST,
+                           {"error": "invalid_request"})
+                return
+            condition = conditions[0][1:-1]
+
         # Scope checks follow parameter validation and precede any
         # ledger access: an exact lookup requires unrestricted operation
         # and stage scopes and a key scope that is unrestricted or names
@@ -341,7 +356,8 @@ class Handler(BaseHTTPRequestHandler):
         ledger_dir = getattr(self.server, "acceptance_dir")
         try:
             if "key" in params:
-                result: object = acceptance.get(ledger_dir, params["key"])
+                body, etag = acceptance.get_response(
+                    ledger_dir, params["key"], condition)
             else:
                 kwargs: dict[str, object] = {}
                 for name in ("cursor", "state"):
@@ -349,7 +365,8 @@ class Handler(BaseHTTPRequestHandler):
                         kwargs[name] = params[name]
                 if "limit" in params:
                     kwargs["limit"] = int(params["limit"])
-                result = acceptance.search(ledger_dir, **kwargs)
+                body, etag = acceptance.search_response(
+                    ledger_dir, condition=condition, **kwargs)
         except FileNotFoundError:
             # Never leak the configured path or the system message.
             self._json(HTTPStatus.NOT_FOUND,
@@ -363,7 +380,14 @@ class Handler(BaseHTTPRequestHandler):
             self._json(HTTPStatus.SERVICE_UNAVAILABLE,
                        {"error": "acceptance_unavailable"})
         else:
-            self._json(HTTPStatus.OK, result)
+            # The 304 decision was made under the ledger's shared lock
+            # against the same serialized bytes a 200 carries, so a
+            # concurrent submission can never mix an old tag with a new
+            # body.
+            if body is None:
+                self._raw(HTTPStatus.NOT_MODIFIED, b"", etag)
+            else:
+                self._raw(HTTPStatus.OK, body, etag)
 
     def _raw(self, status: HTTPStatus, body: bytes, etag: str) -> None:
         # The snapshot bytes are served verbatim -- the original UTF-8

@@ -162,6 +162,55 @@ class SubmitTest(_Fixture):
         self.assertEqual(record["state"], "active")
         self.assertEqual(self._ledger_bytes(), before)
 
+    def test_active_replay_with_wrong_claimed_tag_quarantines(self) -> None:
+        self._record("a")
+        self._export()
+        first, created = self._submit()
+        self.assertIs(created, True)
+        # The identical bundle bytes replayed under a tag that does not
+        # match the checkpoint's bytes cannot stand as accepted: the
+        # record quarantines atomically and the caller gets the same
+        # public mismatch the verification would have raised.
+        wrong_tag = '"' + "0" * 64 + '"'
+        with self.assertRaises(audit_proof.BundleMismatchError):
+            self._submit(etag=wrong_tag)
+        record = acceptance.get(self.ledger_dir, "k1")
+        self.assertEqual(record["state"], "quarantined")
+        self.assertEqual(record["error"], "BundleMismatchError")
+        # The record still carries the actual tag, and the
+        # content-addressed evidence of the bundle stays retained.
+        self.assertEqual(record["etag"], first["etag"])
+        self.assertTrue(os.path.exists(os.path.join(
+            self.ledger_dir, "checkpoints",
+            record["checkpoint_digest"] + ".json")))
+        self.assertTrue(os.path.exists(os.path.join(
+            self.ledger_dir, "proofs", record["proof_digest"] + ".json")))
+        # A later replay -- whatever tag it claims -- re-raises the
+        # recorded failure without rewriting the ledger.
+        before = self._ledger_bytes()
+        with self.assertRaises(audit_proof.BundleMismatchError):
+            self._submit()
+        with self.assertRaises(audit_proof.BundleMismatchError):
+            self._submit(etag=wrong_tag)
+        self.assertEqual(self._ledger_bytes(), before)
+
+    def test_active_replay_quarantine_commit_failure_preserves_ledger(
+            self) -> None:
+        self._record("a")
+        self._export()
+        self._submit()
+        before = self._ledger_bytes()
+        wrong_tag = '"' + "0" * 64 + '"'
+        with mock.patch.object(audit_proof, "_commit_checkpoint",
+                               side_effect=OSError("injected")):
+            with self.assertRaises(OSError):
+                self._submit(etag=wrong_tag)
+        # The failed quarantine commit left the old ledger untouched.
+        self.assertEqual(self._ledger_bytes(), before)
+        record = acceptance.get(self.ledger_dir, "k1")
+        self.assertEqual(record["state"], "active")
+        self.assertIsNone(record["error"])
+
     def test_pending_submission_resumes_to_active(self) -> None:
         self._record("a")
         self._export()
@@ -477,6 +526,72 @@ class QueryTest(_Fixture):
             acceptance.search("")
         with self.assertRaises(ValueError):
             acceptance.get(self.ledger_dir, "")
+
+
+class ResponseTest(_Fixture):
+    def _populate(self) -> None:
+        self._record("a")
+        self._export()
+        self._submit("k1")
+        self._record("b")
+        self._export()
+        self._submit("k2")
+
+    def test_get_response_serializes_and_tags_the_record(self) -> None:
+        self._populate()
+        body, etag = acceptance.get_response(self.ledger_dir, "k1")
+        expected = json.dumps(
+            acceptance.get(self.ledger_dir, "k1"),
+            ensure_ascii=False, separators=(",", ":")).encode("utf-8")
+        self.assertEqual(body, expected)
+        self.assertFalse(body.endswith(b"\n"))
+        self.assertEqual(etag, _digest(body))
+
+    def test_search_response_serializes_and_tags_the_page(self) -> None:
+        self._populate()
+        body, etag = acceptance.search_response(self.ledger_dir, limit=1)
+        expected = json.dumps(
+            acceptance.search(self.ledger_dir, limit=1),
+            ensure_ascii=False, separators=(",", ":")).encode("utf-8")
+        self.assertEqual(body, expected)
+        self.assertEqual(etag, _digest(body))
+        # A different page of the same ledger is a different tag.
+        other_body, other_etag = acceptance.search_response(
+            self.ledger_dir, limit=1, cursor="k1")
+        self.assertNotEqual(other_etag, etag)
+        self.assertNotEqual(other_body, body)
+
+    def test_matching_condition_returns_none_with_the_same_tag(self):
+        self._populate()
+        body, etag = acceptance.get_response(self.ledger_dir, "k1")
+        self.assertEqual(
+            acceptance.get_response(self.ledger_dir, "k1", etag),
+            (None, etag))
+        page_body, page_etag = acceptance.search_response(self.ledger_dir)
+        self.assertEqual(
+            acceptance.search_response(self.ledger_dir,
+                                       condition=page_etag),
+            (None, page_etag))
+        # A non-matching condition gets the full body back.
+        self.assertEqual(
+            acceptance.get_response(self.ledger_dir, "k1", "0" * 64),
+            (body, etag))
+
+    def test_response_errors_and_validation(self) -> None:
+        self._populate()
+        with self.assertRaises(FileNotFoundError):
+            acceptance.get_response(
+                os.path.join(self.tmp.name, "missing"), "k1")
+        with self.assertRaises(KeyError):
+            acceptance.get_response(self.ledger_dir, "unknown")
+        with self.assertRaises(ValueError):
+            acceptance.get_response(self.ledger_dir, "k1", "not-a-digest")
+        with self.assertRaises(ValueError):
+            acceptance.search_response(self.ledger_dir, condition="")
+        with self.assertRaises(ValueError):
+            acceptance.get_response(self.ledger_dir, "")
+        with self.assertRaises(ValueError):
+            acceptance.search_response(self.ledger_dir, limit=0)
 
 
 class ConcurrencyTest(_Fixture):

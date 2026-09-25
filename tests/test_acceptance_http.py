@@ -281,6 +281,127 @@ class AcceptanceHttpTest(unittest.TestCase):
             page, ensure_ascii=False,
             separators=(",", ":")).encode("utf-8"))
 
+    # -- conditional reads ---------------------------------------------------
+
+    def _get_h(self, path: str, headers: dict[str, str] | None = None,
+               raw_headers: list[tuple[str, str]] | None = None):
+        connection = HTTPConnection("127.0.0.1", self.server.server_port,
+                                    timeout=2)
+        if raw_headers is not None:
+            connection.putrequest("GET", path)
+            for name, value in raw_headers:
+                connection.putheader(name, value)
+            connection.endheaders()
+        else:
+            connection.request("GET", path, headers=headers or {})
+        response = connection.getresponse()
+        body = response.read()
+        result = (response.status, body, response.headers)
+        self.addCleanup(connection.close)
+        return result
+
+    def test_200_carries_strong_etag_of_the_response_bytes(self) -> None:
+        self._populate()
+        for path in ("/acceptance?key=k1", "/acceptance?limit=2"):
+            with self.subTest(path=path):
+                status, body, headers = self._get_h(
+                    path, headers={"X-Audit-Token": FULL_TOKEN})
+                self.assertEqual(status, 200)
+                # The strong tag is the SHA-256 of the exact response
+                # bytes, quoted; the body keeps its compact form.
+                self.assertEqual(
+                    headers.get("ETag"),
+                    '"' + hashlib.sha256(body).hexdigest() + '"')
+                self.assertFalse(body.endswith(b"\n"))
+
+    def test_matching_if_none_match_is_304_empty_with_same_etag(self):
+        self._populate()
+        for path in ("/acceptance?key=k1", "/acceptance"):
+            with self.subTest(path=path):
+                _, _, headers = self._get_h(
+                    path, headers={"X-Audit-Token": FULL_TOKEN})
+                tag = headers.get("ETag")
+                status, body, headers = self._get_h(
+                    path, headers={"X-Audit-Token": FULL_TOKEN,
+                                   "If-None-Match": tag})
+                self.assertEqual(status, 304)
+                self.assertEqual(body, b"")
+                self.assertEqual(headers.get("ETag"), tag)
+
+    def test_non_matching_if_none_match_is_200_with_full_body(self) -> None:
+        self._populate()
+        other = '"' + "0" * 64 + '"'
+        status, body, headers = self._get_h(
+            "/acceptance?key=k1",
+            headers={"X-Audit-Token": FULL_TOKEN, "If-None-Match": other})
+        self.assertEqual(status, 200)
+        self.assertEqual(json.loads(body),
+                         acceptance.get(self.ledger_dir, "k1"))
+        self.assertNotEqual(headers.get("ETag"), other)
+
+    def test_etag_changes_with_visible_record_order_and_cursor(self) -> None:
+        self._submit("k1")
+        _, _, headers = self._get_h(
+            "/acceptance", headers={"X-Audit-Token": FULL_TOKEN})
+        first_tag = headers.get("ETag")
+        # A new visible record changes the page's tag.
+        self._submit("k2")
+        _, body, headers = self._get_h(
+            "/acceptance", headers={"X-Audit-Token": FULL_TOKEN})
+        self.assertNotEqual(headers.get("ETag"), first_tag)
+        # A different cursor is a different response with its own tag.
+        _, cursor_body, cursor_headers = self._get_h(
+            "/acceptance?cursor=k1",
+            headers={"X-Audit-Token": FULL_TOKEN})
+        self.assertNotEqual(cursor_body, body)
+        self.assertEqual(
+            cursor_headers.get("ETag"),
+            '"' + hashlib.sha256(cursor_body).hexdigest() + '"')
+
+    def test_invalid_conditional_headers_are_400_without_reading(self):
+        # No ledger exists: a 400 (not 404) proves the ledger was never
+        # read.
+        good = hashlib.sha256(b"x").hexdigest()
+        for value in ("", " ",                                   # blank
+                      f'"{good[:63]}"',                          # too short
+                      f'"{good}a"',                              # too long
+                      f'"{good.upper()}"',                       # uppercase
+                      f'"{"g" * 64}"',                           # not hex
+                      good,                                      # unquoted
+                      f'"{good}", "{good}"',                     # list
+                      "*",                                       # wildcard
+                      f'W/"{good}"',                             # weak tag
+                      ):
+            with self.subTest(value=value):
+                status, body = self._json_get(
+                    "/acceptance",
+                    headers={"X-Audit-Token": FULL_TOKEN,
+                             "If-None-Match": value})
+                self.assertEqual(status, 400)
+                self.assertEqual(body, {"error": "invalid_request"})
+        tag = f'"{good}"'
+        status, body = self._json_get(
+            "/acceptance",
+            raw_headers=[("X-Audit-Token", FULL_TOKEN),
+                         ("If-None-Match", tag), ("If-None-Match", tag)])
+        self.assertEqual(status, 400)
+        self.assertEqual(body, {"error": "invalid_request"})
+
+    def test_conditional_validation_order(self) -> None:
+        self._populate()
+        # Authorization precedes conditional validation.
+        self.assertEqual(self._json_get(
+            "/acceptance", headers={"If-None-Match": "bad"})[0], 401)
+        # Conditional validation precedes the scope decision.
+        self.assertEqual(self._json_get(
+            "/acceptance", headers={"X-Audit-Token": OPS_TOKEN,
+                                    "If-None-Match": "bad"})[0], 400)
+        # A valid conditional does not rescue a scoped-out request.
+        self.assertEqual(self._json_get(
+            "/acceptance", headers={
+                "X-Audit-Token": OPS_TOKEN,
+                "If-None-Match": '"' + "0" * 64 + '"'})[0], 403)
+
     # -- ledger state errors ------------------------------------------------------
 
     def test_missing_ledger_is_404(self) -> None:
