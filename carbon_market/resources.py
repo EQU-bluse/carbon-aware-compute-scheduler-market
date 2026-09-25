@@ -36,9 +36,10 @@ import threading
 from typing import Any, Iterator
 
 from . import jobs as _jobs
+from . import signals as _signals
 from ._jsonio import finite_loads
 
-__all__ = ["publish", "get", "feasible"]
+__all__ = ["publish", "get", "feasible", "feasible_live"]
 
 _VERSION = 1
 _RESOURCE_FIELDS = ("resource_id", "region", "capacity", "start", "end",
@@ -157,6 +158,28 @@ def _check_sorted_keys(mapping: dict[Any, Any], label: str) -> None:
     keys = list(mapping)
     if keys != sorted(keys):
         raise ValueError(f"{label} must be ordered by key code point")
+
+
+def _latest_signal(
+    records: list[dict[str, Any]] | None,
+    at: int,
+) -> dict[str, Any] | None:
+    # The latest regional version observed no later than at and not yet
+    # expired at it; observation moments strictly increase, so the last
+    # matching record is the newest.
+    if not records:
+        return None
+    valid: dict[str, Any] | None = None
+    for record in records:
+        if record["observed_at"] <= at <= record["expires_at"]:
+            valid = record
+    return valid
+
+
+def _copy_signal(signal: dict[str, Any]) -> dict[str, Any]:
+    result = dict(signal)
+    result["energy_mix"] = dict(signal["energy_mix"])
+    return result
 
 
 def _validate_structure(data: object) -> tuple[
@@ -634,4 +657,113 @@ def feasible(
     candidates.sort(key=lambda entry: (entry["resource"]["carbon_intensity"],
                                        entry["resource"]["unit_cost"],
                                        entry["resource"]["resource_id"]))
+    return candidates
+
+
+def feasible_live(
+    job_path: str,
+    supply_path: str,
+    signal_path: str,
+    job_id: str,
+    at: int,
+) -> list[dict[str, object]]:
+    """Rank the resources that can serve one accepted job at ``at`` live.
+
+    Like :func:`feasible`, but the job, supply and signal files are read
+    as one snapshot while their shared locks are held together. Each
+    resource still contributes only its highest supply version valid at
+    ``at``, and region, capacity, residency and deadline constraints are
+    unchanged; the unit cost and carbon intensity used for the budgets,
+    the totals and the ranking, however, come from the latest signal of
+    the resource's region that has been observed and has not expired at
+    ``at``. A resource whose region has no valid signal at ``at`` is
+    simply excluded; it never raises.
+
+    The result is ordered by the signal carbon intensity, then the
+    signal unit cost, then resource id, each entry carrying the resource
+    record, the signal record and both totals (work times the signal's
+    unit cost and carbon intensity); with no candidate the list is
+    empty. An unknown job id raises ``KeyError``. A missing acceptance,
+    supply or signal file raises ``FileNotFoundError``; an invalid file
+    -- including non-canonical bytes -- raises ``ValueError``; any other
+    locking or I/O failure raises ``OSError``.
+    """
+    if not isinstance(job_path, str) or not job_path:
+        raise ValueError("job_path must be a non-empty string")
+    if not isinstance(supply_path, str) or not supply_path:
+        raise ValueError("supply_path must be a non-empty string")
+    if not isinstance(signal_path, str) or not signal_path:
+        raise ValueError("signal_path must be a non-empty string")
+    if not isinstance(job_id, str) or not job_id:
+        raise ValueError("job_id must be a non-empty string")
+    if not _is_plain_int(at) or at < 0:
+        raise ValueError("at must be a non-boolean non-negative integer")
+
+    job_real = os.path.realpath(job_path)
+    supply_real = os.path.realpath(supply_path)
+    signal_real = os.path.realpath(signal_path)
+    # Lock all snapshots together, in a path order shared by every
+    # caller, so concurrent calls can never deadlock.
+    with contextlib.ExitStack() as stack:
+        for locked in sorted({job_real, supply_real, signal_real}):
+            stack.enter_context(_process_lock(locked, shared=True))
+
+        accepted, _job_map, _job_events, job_raw = _jobs._load_submit_file(
+            job_real)
+        if job_raw is None:
+            raise FileNotFoundError(
+                f"acceptance file {job_real!r} does not exist")
+        history, _idempotency, _events, supply_raw = _load_file(supply_real)
+        if supply_raw is None:
+            raise FileNotFoundError(
+                f"supply file {supply_real!r} does not exist")
+        signal_history, _signal_map, _signal_events, signal_raw = \
+            _signals._load_file(signal_real)
+        if signal_raw is None:
+            raise FileNotFoundError(
+                f"signal file {signal_real!r} does not exist")
+
+        job = accepted.get(job_id)
+        if job is None:
+            raise KeyError(job_id)
+
+        work = job["work"]
+        regions = set(job["regions"])
+        residency = set(job["residency"])
+        candidates: list[dict[str, object]] = []
+        for records in history.values():
+            active: dict[str, Any] | None = None
+            for record in records:
+                if record["start"] <= at <= record["end"]:
+                    active = record
+            if active is None:
+                continue
+            if active["region"] not in regions:
+                continue
+            if active["capacity"] < work:
+                continue
+            if not residency <= set(active["residency"]):
+                continue
+            if active["end"] < job["deadline"]:
+                continue
+            signal = _latest_signal(signal_history.get(active["region"]), at)
+            # A missing live signal only excludes the resource.
+            if signal is None:
+                continue
+            total_cost = work * signal["unit_cost"]
+            total_carbon = work * signal["carbon_intensity"]
+            if total_cost > job["max_cost"] \
+                    or total_carbon > job["carbon_cap"]:
+                continue
+            candidates.append({
+                "resource": dict(active),
+                "signal": _copy_signal(signal),
+                "total_cost": total_cost,
+                "total_carbon": total_carbon,
+            })
+
+    candidates.sort(key=lambda entry: (
+        entry["signal"]["carbon_intensity"],
+        entry["signal"]["unit_cost"],
+        entry["resource"]["resource_id"]))
     return candidates
