@@ -9,6 +9,13 @@ market:
 * ``audit`` holds one publish event per first publication, binding the
   idempotency key, the resource id and the version it created.
 
+Every read entry requires the on-disk document to be exactly the
+canonical compact form :func:`_serialize` produces -- fields and keys
+in their fixed/code-point order, no whitespace beyond structural
+tokens, non-ASCII written through and one trailing newline. Any
+out-of-order section, extra whitespace, ``\\uXXXX``-escaped non-ASCII
+character, or missing or duplicated final newline is a ``ValueError``.
+
 :func:`publish` appends a new version under an idempotency key,
 :func:`get` reads one resource record back by id and optional version,
 and :func:`feasible` joins a ``jobs.submit`` acceptance file with the
@@ -264,6 +271,20 @@ def _validate_structure(data: object) -> tuple[
     return history, idempotency, events
 
 
+def _canonical_bytes(
+    history: dict[str, list[dict[str, Any]]],
+    idempotency: dict[str, str],
+    events: dict[str, dict[str, Any]],
+) -> bytes:
+    # The canonical wire form every reader accepts: compact UTF-8 JSON
+    # with non-ASCII written through, sections in their fixed field order
+    # and each section's primary keys in code-point order, terminated by
+    # exactly one newline. The round trip also rejects duplicate keys
+    # (json.loads keeps the last occurrence) and any escaping of
+    # non-ASCII characters that json.dumps would write through.
+    return _serialize(history, idempotency, events)
+
+
 def _load_file(realpath: str) -> tuple[
     dict[str, list[dict[str, Any]]], dict[str, str],
     dict[str, dict[str, Any]], bytes | None
@@ -286,6 +307,14 @@ def _load_file(realpath: str) -> tuple[
         raise ValueError(
             f"supply file {realpath!r} is not valid JSON") from exc
     history, idempotency, events = _validate_structure(data)
+    # Every read entry requires the on-disk bytes to be the canonical
+    # form: fields and keys in their original order, compact JSON with
+    # non-ASCII written through and exactly one trailing newline. Any
+    # extra whitespace, escaped non-ASCII character, reordered field or
+    # missing/duplicated final newline is a ValueError.
+    if raw != _canonical_bytes(history, idempotency, events):
+        raise ValueError(
+            f"supply file {realpath!r} is not in canonical compact form")
     return history, idempotency, events, raw
 
 
@@ -404,9 +433,9 @@ def publish(
 
     A missing parent directory raises ``FileNotFoundError``; an invalid
     existing file (encoding, JSON, negative-zero or non-finite numbers,
-    version, structure, ordering or references) raises ``ValueError``;
-    any other locking or I/O failure raises ``OSError``. Calls serialize
-    across threads and processes per resolved real path.
+    version, structure, ordering, canonical bytes or references) raises
+    ``ValueError``; any other locking or I/O failure raises ``OSError``.
+    Calls serialize across threads and processes per resolved real path.
     """
     if not isinstance(path, str) or not path:
         raise ValueError("path must be a non-empty string")
@@ -478,12 +507,13 @@ def get(
     ``version``, when given, a non-boolean positive integer, else
     ``ValueError``. Without ``version`` the latest record of the
     resource is returned. A missing supply file raises
-    ``FileNotFoundError``; an invalid file raises ``ValueError``; an
-    unknown resource id raises ``KeyError(resource_id)`` and an unknown
-    version ``KeyError(version)``; any other locking or I/O failure
-    raises ``OSError``. The call never writes, and the returned record
-    is a fresh copy with resource_id, version, region, capacity, start,
-    end, unit_cost, carbon_intensity and residency.
+    ``FileNotFoundError``; an invalid file -- including non-canonical
+    bytes -- raises ``ValueError``; an unknown resource id raises
+    ``KeyError(resource_id)`` and an unknown version
+    ``KeyError(version)``; any other locking or I/O failure raises
+    ``OSError``. The call never writes, and the returned record is a
+    fresh copy with resource_id, version, region, capacity, start, end,
+    unit_cost, carbon_intensity and residency.
     """
     if not isinstance(path, str) or not path:
         raise ValueError("path must be a non-empty string")
@@ -507,7 +537,6 @@ def get(
         raise KeyError(version)
     return dict(versions[version - 1])
 
-
 def feasible(
     job_path: str,
     supply_path: str,
@@ -524,7 +553,8 @@ def feasible(
     snapshots while their shared locks are held together.
 
     A missing acceptance or supply file raises ``FileNotFoundError``;
-    an invalid file raises ``ValueError``; an unknown job id raises
+    an invalid file -- including a supply file outside canonical
+    compact form -- raises ``ValueError``; an unknown job id raises
     ``KeyError(job_id)``; any other locking or I/O failure raises
     ``OSError``.
 
