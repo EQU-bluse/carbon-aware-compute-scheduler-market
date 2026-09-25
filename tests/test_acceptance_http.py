@@ -100,6 +100,21 @@ class AcceptanceHttpTest(unittest.TestCase):
         self.addCleanup(connection.close)
         return response.status, body
 
+    def _get_full(self, path: str,
+                  raw_headers: list[tuple[str, str]] | None = None,
+                  token: str = FULL_TOKEN):
+        connection = HTTPConnection("127.0.0.1", self.server.server_port,
+                                    timeout=5)
+        connection.putrequest("GET", path)
+        connection.putheader("X-Audit-Token", token)
+        for name, value in raw_headers or []:
+            connection.putheader(name, value)
+        connection.endheaders()
+        response = connection.getresponse()
+        body = response.read()
+        self.addCleanup(connection.close)
+        return response.status, response.getheader("ETag"), body
+
     def _json_get(self, path: str, **kwargs):
         status, body = self._get(path, **kwargs)
         return status, json.loads(body)
@@ -280,6 +295,153 @@ class AcceptanceHttpTest(unittest.TestCase):
         self.assertEqual(raw, json.dumps(
             page, ensure_ascii=False,
             separators=(",", ":")).encode("utf-8"))
+
+    # -- conditional caching ---------------------------------------------------
+
+    def _tag_of(self, raw: bytes) -> str:
+        return '"' + hashlib.sha256(raw).hexdigest() + '"'
+
+    def test_200_carries_strong_etag_of_exact_body_bytes(self) -> None:
+        self._populate()
+        status, etag, raw = self._get_full("/acceptance?key=k1")
+        self.assertEqual(status, 200)
+        self.assertEqual(etag, self._tag_of(raw))
+        self.assertRegex(etag, r'"[0-9a-f]{64}"')
+        self.assertFalse(raw.endswith(b"\n"))
+        status, page_etag, page_raw = self._get_full("/acceptance")
+        self.assertEqual(status, 200)
+        self.assertEqual(page_etag, self._tag_of(page_raw))
+        # The exact record and the page are hashed from their own
+        # response bytes; one tag never serves the other response.
+        self.assertNotEqual(etag, page_etag)
+        page2, etag2, raw2 = self._get_full("/acceptance?limit=2")
+        page3, etag3, raw3 = self._get_full(
+            "/acceptance?limit=2&cursor=k2")
+        self.assertEqual(page2, 200)
+        self.assertEqual(page3, 200)
+        self.assertEqual(etag2, self._tag_of(raw2))
+        self.assertEqual(etag3, self._tag_of(raw3))
+        self.assertNotEqual(etag2, etag3)
+
+    def test_matching_condition_returns_304_empty_same_etag(self) -> None:
+        self._populate()
+        status, etag, raw = self._get_full("/acceptance?key=k1")
+        self.assertEqual(status, 200)
+        status, etag_304, body_304 = self._get_full(
+            "/acceptance?key=k1", [("If-None-Match", etag)])
+        self.assertEqual(status, 304)
+        self.assertEqual(body_304, b"")
+        self.assertEqual(etag_304, etag)
+        # Same for pages, including a cursor page.
+        _, page_tag, full_raw = self._get_full("/acceptance?limit=2")
+        status, etag_304, body_304 = self._get_full(
+            "/acceptance?limit=2", [("If-None-Match", page_tag)])
+        self.assertEqual(status, 304)
+        self.assertEqual(body_304, b"")
+        self.assertEqual(etag_304, page_tag)
+        # A non-matching condition gives the full 200 body.
+        status, _, body = self._get_full(
+            "/acceptance?limit=2",
+            [("If-None-Match", '"' + "1" * 64 + '"')])
+        self.assertEqual(status, 200)
+        self.assertEqual(body, full_raw)
+
+    def test_etag_is_stable_then_changes_with_the_ledger(self) -> None:
+        self._submit("k1")
+        _, first, _ = self._get_full("/acceptance")
+        for _ in range(2):
+            status, again, raw = self._get_full("/acceptance")
+            self.assertEqual(status, 200)
+            self.assertEqual(again, first)
+        # A new visible record changes the page bytes and hence the tag.
+        self._submit("k2")
+        status, second, _ = self._get_full("/acceptance")
+        self.assertEqual(status, 200)
+        self.assertNotEqual(second, first)
+        # The stale tag no longer validates against the new snapshot.
+        status, _, body = self._get_full(
+            "/acceptance", [("If-None-Match", first)])
+        self.assertEqual(status, 200)
+        self.assertTrue(body)
+
+    def test_invalid_conditional_headers_are_400_without_ledger_read(self):
+        # No ledger exists yet: a read would answer 404, so the 400
+        # proves the condition was rejected before the ledger was read.
+        good = '"' + "0" * 64 + '"'
+        cases = (
+            [("If-None-Match", "")],               # empty
+            [("If-None-Match", "   ")],            # blank
+            [("If-None-Match", good),
+             ("If-None-Match", good)],             # repeated
+            [("If-None-Match", 'W/' + good)],      # weak
+            [("If-None-Match", "*")],              # wildcard
+            [("If-None-Match", good + ", " + ('"' + "1" * 64 + '"'))],
+            [("If-None-Match", '"' + "A" * 64 + '"')],  # uppercase hex
+            [("If-None-Match", '"' + "0" * 63 + '"')],  # short
+            [("If-None-Match", good + "x")],            # trailing junk
+            [("If-None-Match", "x" + good)],            # leading junk
+        )
+        for extra in cases:
+            with self.subTest(extra=extra):
+                status, body = self._get(
+                    "/acceptance",
+                    raw_headers=[("X-Audit-Token", FULL_TOKEN), *extra])
+                self.assertEqual(status, 400)
+                self.assertEqual(json.loads(body),
+                                 {"error": "invalid_request"})
+
+    def test_condition_validation_order_auth_then_scope(self) -> None:
+        # Authentication precedes condition validation.
+        status, body = self._json_get(
+            "/acceptance",
+            raw_headers=[("If-None-Match", "*")])
+        self.assertEqual(status, 401)
+        # A malformed condition (400) precedes the scope judgement
+        # (403) for a restricted token...
+        status, _ = self._get(
+            "/acceptance",
+            raw_headers=[("X-Audit-Token", OPS_TOKEN),
+                         ("If-None-Match", "*")])
+        self.assertEqual(status, 400)
+        # ...while a well-formed condition reaches the scope check.
+        status, _ = self._get(
+            "/acceptance",
+            raw_headers=[("X-Audit-Token", OPS_TOKEN),
+                         ("If-None-Match", '"' + "0" * 64 + '"')])
+        self.assertEqual(status, 403)
+        # A 400 query also precedes condition validation, and both
+        # precede the ledger read (no ledger exists here).
+        status, body = self._get(
+            "/acceptance?bogus=1",
+            raw_headers=[("X-Audit-Token", FULL_TOKEN),
+                         ("If-None-Match", "*")])
+        self.assertEqual(status, 400)
+        self.assertEqual(json.loads(body), {"error": "invalid_request"})
+
+    def test_condition_on_missing_ledger_and_unknown_key_is_404(self) -> None:
+        tag = '"' + "0" * 64 + '"'
+        status, _, body = self._get_full(
+            "/acceptance?key=k1", [("If-None-Match", tag)])
+        self.assertEqual(status, 404)
+        self.assertEqual(json.loads(body),
+                         {"error": "acceptance_not_found"})
+        self._populate()
+        status, _, body = self._get_full(
+            "/acceptance?key=nope", [("If-None-Match", tag)])
+        self.assertEqual(status, 404)
+        self.assertEqual(json.loads(body),
+                         {"error": "acceptance_key_not_found"})
+
+    def test_scoped_exact_lookup_supports_conditions(self) -> None:
+        self._populate()
+        _, etag, _ = self._get_full(
+            "/acceptance?key=k1", token=KEY_TOKEN)
+        status, etag_304, body = self._get_full(
+            "/acceptance?key=k1",
+            [("If-None-Match", etag)], token=KEY_TOKEN)
+        self.assertEqual(status, 304)
+        self.assertEqual(etag_304, etag)
+        self.assertEqual(body, b"")
 
     # -- ledger state errors ------------------------------------------------------
 

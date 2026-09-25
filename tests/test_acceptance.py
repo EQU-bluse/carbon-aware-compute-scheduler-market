@@ -261,6 +261,68 @@ class SubmitTest(_Fixture):
         with self.assertRaises(audit_proof.BundleMismatchError):
             self._submit(etag=wrong_tag)
 
+    def test_active_replay_with_wrong_tag_is_quarantined(self) -> None:
+        self._record("a")
+        self._export()
+        record, created = self._submit()
+        self.assertIs(created, True)
+        self.assertEqual(record["state"], "active")
+        wrong_tag = '"' + "0" * 64 + '"'
+        # The active replay claims a tag the bundle's bytes do not
+        # carry: the previously missed caller-error claim flips the
+        # record to quarantined atomically and raises the mismatch.
+        with mock.patch.object(audit_proof, "verify_bundle") as verify:
+            with self.assertRaises(audit_proof.BundleMismatchError):
+                self._submit(etag=wrong_tag)
+            verify.assert_not_called()
+        record = acceptance.get(self.ledger_dir, "k1")
+        self.assertEqual(record["state"], "quarantined")
+        self.assertEqual(record["error"], "BundleMismatchError")
+        # The etag and digests still describe the actual bytes and the
+        # content-addressed evidence stays retained.
+        self.assertEqual(record["etag"], self._etag())
+        self.assertTrue(os.path.exists(os.path.join(
+            self.ledger_dir, "checkpoints",
+            record["checkpoint_digest"] + ".json")))
+        self.assertTrue(os.path.exists(os.path.join(
+            self.ledger_dir, "proofs", record["proof_digest"] + ".json")))
+        # The quarantine is sticky: even the correct claimed tag now
+        # replays the recorded failure.
+        with self.assertRaises(audit_proof.BundleMismatchError):
+            self._submit()
+
+    def test_active_replay_wrong_tag_commit_is_atomic(self) -> None:
+        self._record("a")
+        self._export()
+        self._submit("k1")
+        self._record("b")
+        self._export()
+        self._submit("k2")
+        before = {
+            key: acceptance.get(self.ledger_dir, key) for key in ("k1", "k2")}
+        wrong_tag = '"' + "f" * 64 + '"'
+        # A failure while quarantining preserves the old ledger.
+        with mock.patch.object(audit_proof, "_commit_checkpoint",
+                               side_effect=OSError("injected")):
+            with self.assertRaises(OSError):
+                self._submit(etag=wrong_tag)
+        self.assertEqual(acceptance.get(self.ledger_dir, "k1"),
+                         before["k1"])
+        self.assertEqual(acceptance.get(self.ledger_dir, "k2"),
+                         before["k2"])
+
+    def test_active_replay_with_correct_tag_still_writes_nothing(self) -> None:
+        self._record("a")
+        self._export()
+        self._submit()
+        before = self._ledger_bytes()
+        with mock.patch.object(audit_proof, "verify_bundle") as verify:
+            record, created = self._submit()
+            verify.assert_not_called()
+        self.assertIs(created, False)
+        self.assertEqual(record["state"], "active")
+        self.assertEqual(self._ledger_bytes(), before)
+
     def test_conflict_retains_both_bundles_and_raises(self) -> None:
         self._record("a")
         self._export()
@@ -477,6 +539,109 @@ class QueryTest(_Fixture):
             acceptance.search("")
         with self.assertRaises(ValueError):
             acceptance.get(self.ledger_dir, "")
+
+
+def _strong_tag(raw: bytes) -> str:
+    return '"' + hashlib.sha256(raw).hexdigest() + '"'
+
+
+class ConditionalReadTest(_Fixture):
+    def _populate(self) -> None:
+        self._record("a")
+        self._export()
+        self._submit("k1")
+        self._record("b")
+        self._export()
+        self._submit("k2")
+        self._record("c")
+        self._export()
+        with self.assertRaises(audit_proof.BundleMismatchError):
+            self._submit("k3", etag='"' + "0" * 64 + '"')
+
+    def _compact(self, payload: object) -> bytes:
+        return json.dumps(payload, ensure_ascii=False,
+                          separators=(",", ":")).encode("utf-8")
+
+    def test_read_key_returns_body_strong_tag_and_false_without_condition(
+            self) -> None:
+        self._populate()
+        body, etag, not_modified = acceptance.read_key(self.ledger_dir, "k1")
+        self.assertEqual(body, self._compact(
+            acceptance.get(self.ledger_dir, "k1")))
+        self.assertEqual(etag, _strong_tag(body))
+        self.assertFalse(not_modified)
+        self.assertFalse(body.endswith(b"\n"))
+
+    def test_read_page_hashes_its_own_response_bytes(self) -> None:
+        self._populate()
+        body, etag, not_modified = acceptance.read_page(
+            self.ledger_dir, limit=2)
+        self.assertEqual(body, self._compact(
+            acceptance.search(self.ledger_dir, limit=2)))
+        self.assertEqual(etag, _strong_tag(body))
+        self.assertFalse(not_modified)
+        # Distinct pages carry distinct tags; so do full pages.
+        other, other_tag, _ = acceptance.read_page(
+            self.ledger_dir, cursor="k2", limit=2)
+        full, full_tag, _ = acceptance.read_page(self.ledger_dir)
+        self.assertEqual(other_tag, _strong_tag(other))
+        self.assertNotEqual(etag, other_tag)
+        self.assertNotIn(etag, (other_tag, full_tag))
+
+    def test_tag_changes_with_records_order_and_cursor(self) -> None:
+        self._record("a")
+        self._export()
+        self._submit("k1")
+        _, tag_before, _ = acceptance.read_page(self.ledger_dir)
+        self._record("b")
+        self._export()
+        self._submit("k2")
+        _, tag_after, _ = acceptance.read_page(self.ledger_dir)
+        self.assertNotEqual(tag_before, tag_after)
+
+    def test_condition_match_returns_not_modified_with_same_tag(self) -> None:
+        self._populate()
+        body, etag, _ = acceptance.read_key(self.ledger_dir, "k1")
+        again, same_etag, not_modified = acceptance.read_key(
+            self.ledger_dir, "k1", condition=etag)
+        self.assertIs(not_modified, True)
+        self.assertEqual(same_etag, etag)
+        self.assertEqual(again, body)
+        other_tag = '"' + "1" * 64 + '"'
+        _, _, not_modified = acceptance.read_key(
+            self.ledger_dir, "k1", condition=other_tag)
+        self.assertFalse(not_modified)
+        page, page_tag, _ = acceptance.read_page(
+            self.ledger_dir, limit=1, condition=etag)
+        # The key tag never happens to match a different page's tag.
+        self.assertFalse(page_tag == etag)
+        self.assertEqual(page, self._compact(
+            acceptance.search(self.ledger_dir, limit=1)))
+
+    def test_read_key_and_page_error_mapping(self) -> None:
+        # Argument and condition errors precede any file read.
+        missing = os.path.join(self.tmp.name, "missing-ledger")
+        with self.assertRaises(ValueError):
+            acceptance.read_key("", "k1")
+        with self.assertRaises(ValueError):
+            acceptance.read_key(self.ledger_dir, "")
+        with self.assertRaises(ValueError):
+            acceptance.read_key(missing, "k1", condition="not-a-tag")
+        with self.assertRaises(ValueError):
+            acceptance.read_key(missing, "k1", condition='W/"' + "0" * 64
+                                + '"')
+        with self.assertRaises(ValueError):
+            acceptance.read_page(missing, condition="*")
+        with self.assertRaises(ValueError):
+            acceptance.read_page(missing, limit=1001)
+        self.assertFalse(os.path.exists(missing))
+        self._populate()
+        with self.assertRaises(FileNotFoundError):
+            acceptance.read_key(os.path.join(self.tmp.name, "none"), "k1")
+        with self.assertRaises(KeyError):
+            acceptance.read_key(self.ledger_dir, "unknown")
+        with self.assertRaises(FileNotFoundError):
+            acceptance.read_page(os.path.join(self.tmp.name, "none"))
 
 
 class ConcurrencyTest(_Fixture):

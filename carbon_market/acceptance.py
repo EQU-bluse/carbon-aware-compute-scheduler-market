@@ -41,9 +41,13 @@ call always keeps the pre-call state.
 Submissions are idempotent. The same bundle under the same key -- the
 tag and both digests all equal -- replays: an ``active`` record returns
 its stored copy together with ``False`` and writes nothing (only the
-first successful completion returns ``True``), a ``pending`` record
-resumes and completes, and a ``quarantined`` record re-raises the
-recorded public exception type without touching the retained evidence.
+first successful completion returns ``True``) -- unless the replay
+claims a tag that does not match the bundle's own bytes: even an
+``active`` record then keeps its content-addressed evidence, flips to
+``quarantined`` with ``BundleMismatchError`` atomically and raises that
+same exception -- a ``pending`` record resumes and completes, and a
+``quarantined`` record re-raises the recorded public exception type
+without touching the retained evidence.
 The same key with a different bundle is a conflict: both bundles' raw
 bytes and summaries are retained -- the new bundle's evidence is stored
 content-addressed and its summary (carrying the actual tag, like the
@@ -70,6 +74,17 @@ cursor and matching an optional state filter, and returns one page of
 (or ``None`` on the last page). The page size defaults to 100 and is
 limited to 1..1000.
 
+:func:`read_key` and :func:`read_page` are the conditional variants for
+an HTTP GET: they run the same lookups but hold the ledger's shared
+flock across the whole read, business-object formation, response
+serialization and digest, and return the exact compact UTF-8 response
+bytes together with their strong entity tag -- one double-quoted
+SHA-256 of the complete response bytes. An optional ``If-None-Match``
+condition (a tag in that same strong form, validated by the caller) is
+compared against that tag under the same lock, so a request racing a
+submission decides 200 or 304 from one complete ledger version, never a
+mix.
+
 Invalid argument types, empty values, a malformed tag, an unknown state
 filter, an out-of-range page size or an invalid ledger raise
 ``ValueError``; a missing input file, ledger or parent directory raises
@@ -87,7 +102,7 @@ from typing import Any
 from . import audit_proof
 from ._jsonio import strict_loads
 
-__all__ = ["submit", "get", "search"]
+__all__ = ["submit", "get", "search", "read_key", "read_page"]
 
 _VERSION = 1
 _ROOT_FIELDS = ("version", "records", "conflicts")
@@ -293,7 +308,9 @@ def submit(checkpoint_path: str, proof_path: str, etag: str,
     the checkpoint's raw bytes, never the caller's claimed value; the
     same holds for every conflict summary. The same bundle under an
     existing key replays: an ``active`` record returns its copy with
-    ``False`` and writes nothing, a ``pending`` record resumes and
+    ``False`` and writes nothing -- except a replay that claims a
+    mismatching tag, which atomically quarantines the active record and
+    raises ``BundleMismatchError`` -- a ``pending`` record resumes and
     completes (returning ``True`` only when this call is the first
     successful completion), and a ``quarantined`` record re-raises the
     recorded public exception type without changing the retained
@@ -379,8 +396,25 @@ def submit(checkpoint_path: str, proof_path: str, etag: str,
                     raise ValueError("acceptance key was already used "
                                      "with a different bundle")
                 if existing["state"] == "active":
+                    # The bundle bytes match an active record, but the
+                    # caller's claimed tag is still checked: a same-bundle
+                    # replay with a wrong tag is the same mismatch a first
+                    # submission would raise. The retained evidence proves
+                    # the actual bytes, so the record is flipped to
+                    # quarantined atomically and the same exception type
+                    # the record now carries is raised.
+                    if etag != actual_tag:
+                        existing["state"] = "quarantined"
+                        existing["error"] = "BundleMismatchError"
+                        audit_proof._commit_checkpoint(
+                            ledger_path, ledger_real,
+                            _serialize(records, conflicts), old_bytes)
+                        _raise_quarantined(existing)
                     return dict(existing), False
                 if existing["state"] == "quarantined":
+                    # A wrong claimed tag against a quarantined record is
+                    # already a contradiction: the recorded failure replays
+                    # unchanged, whatever the caller now claims.
                     _raise_quarantined(existing)
                 # A pending record is resumed below: the identical
                 # bundle finishes its interrupted evidence write and
@@ -541,3 +575,132 @@ def search(ledger_dir: str, cursor: str | None = None,
         page = matches
         next_cursor = None
     return {"entries": page, "next": next_cursor}
+
+
+def _serialize_response(payload: object) -> bytes:
+    # The on-the-wire form the HTTP endpoint serves verbatim: compact
+    # UTF-8 JSON, non-ASCII written through, fields in the library's
+    # insertion order and no trailing newline.
+    return json.dumps(payload, ensure_ascii=False, separators=(",", ":"),
+                      allow_nan=False).encode("utf-8")
+
+
+def _validate_condition(condition: object) -> None:
+    # A conditional read accepts exactly one strong tag of the documented
+    # shape; a blank, weak, wildcard or list value is rejected before the
+    # ledger is ever opened.
+    if condition is not None \
+            and (not isinstance(condition, str)
+                 or not audit_proof._ETAG_RE.fullmatch(condition)):
+        raise ValueError("condition must be None or a single strong tag: "
+                         "a quoted 64-digit lowercase hexadecimal digest")
+
+
+def read_key(ledger_dir: str, key: str,
+             condition: str | None = None) -> tuple[bytes, str, bool]:
+    """Conditionally read one record as exact HTTP response bytes.
+
+    Mirrors :func:`get` but holds the ledger directory's shared flock
+    across the complete read, the record-object formation, the response
+    serialization and the strong-tag computation, and -- when
+    ``condition`` is given -- the comparison with it, all before the
+    lock is released. Returns ``(body, etag, not_modified)``: the exact
+    compact UTF-8 bytes a 200 would serve, their strong entity tag (one
+    double-quoted string of 64 lowercase hexadecimal digits, the
+    SHA-256 of those complete bytes), and whether ``condition`` equals
+    that tag. When it does, the caller answers 304 with an empty body
+    and the same tag; the bytes are still returned untouched.
+
+    ``ledger_dir`` and ``key`` must be non-empty strings and
+    ``condition`` must be ``None`` or a single strong tag, else
+    ``ValueError`` before any file is read. Error mapping otherwise
+    matches :func:`get`: a missing ledger raises ``FileNotFoundError``,
+    an unknown key ``KeyError(key)``, an invalid ledger ``ValueError``
+    and any other locking or I/O failure ``OSError``.
+    """
+    for value in (ledger_dir, key):
+        if not isinstance(value, str) or not value:
+            raise ValueError("ledger_dir and key must be non-empty "
+                             "strings")
+    _validate_condition(condition)
+
+    ledger_real = os.path.realpath(ledger_dir)
+    ledger_path = _ledger_path(ledger_real)
+    with audit_proof._file_lock(ledger_real, shared=True):
+        # One locked section from the byte read through the conditional
+        # comparison: body and tag come from the same complete ledger
+        # version, so a racing submit can never pair an old body with a
+        # new tag or vice versa.
+        with open(ledger_path, "rb") as handle:
+            raw = handle.read()
+        ledger = _parse_ledger(ledger_path, raw)
+        records = ledger["records"]
+        if key not in records:
+            raise KeyError(key)
+        body = _serialize_response(dict(records[key]))
+        etag = audit_proof._strong_tag(body)
+        not_modified = condition is not None and condition == etag
+    return body, etag, not_modified
+
+
+def read_page(ledger_dir: str, cursor: str | None = None,
+              limit: int = _DEFAULT_LIMIT, state: str | None = None,
+              condition: str | None = None) -> tuple[bytes, str, bool]:
+    """Conditionally read one page as exact HTTP response bytes.
+
+    Mirrors :func:`search` with the same locking as :func:`read_key`:
+    the shared flock covers the byte read, parsing, filtering and page
+    formation, the response serialization and the strong-tag
+    computation, plus the ``condition`` comparison, so the 200/304
+    decision and the served bytes are always based on one complete
+    ledger version. Returns ``(body, etag, not_modified)`` where
+    ``body`` serializes ``{"entries": [[key, record], ...], "next":
+    ...}`` in the library's field and key code-point order.
+
+    Arguments and errors validate exactly like :func:`search`; in
+    addition a malformed ``condition`` raises ``ValueError`` before the
+    ledger is opened. A missing ledger raises ``FileNotFoundError``, an
+    invalid ledger ``ValueError`` and any other locking or I/O failure
+    ``OSError``.
+    """
+    if not isinstance(ledger_dir, str) or not ledger_dir:
+        raise ValueError("ledger_dir must be a non-empty string")
+    if cursor is not None and (not isinstance(cursor, str) or not cursor):
+        raise ValueError("cursor must be None or a non-empty string")
+    # bool is a subclass of int and must be rejected as a page size.
+    if not isinstance(limit, int) or isinstance(limit, bool) \
+            or not 1 <= limit <= _MAX_LIMIT:
+        raise ValueError("limit must be an integer between 1 and 1000")
+    if state is not None and state not in _STATES:
+        raise ValueError("state filter must be pending, active or "
+                         "quarantined")
+    _validate_condition(condition)
+
+    ledger_real = os.path.realpath(ledger_dir)
+    ledger_path = _ledger_path(ledger_real)
+    with audit_proof._file_lock(ledger_real, shared=True):
+        with open(ledger_path, "rb") as handle:
+            raw = handle.read()
+        ledger = _parse_ledger(ledger_path, raw)
+
+        matches: list[list[Any]] = []
+        for record_key, record in ledger["records"].items():
+            if cursor is not None and record_key <= cursor:
+                continue
+            if state is not None and record["state"] != state:
+                continue
+            matches.append([record_key, dict(record)])
+            if len(matches) > limit:
+                break
+
+        if len(matches) > limit:
+            page = matches[:limit]
+            next_cursor: str | None = page[-1][0]
+        else:
+            page = matches
+            next_cursor = None
+        body = _serialize_response(
+            {"entries": page, "next": next_cursor})
+        etag = audit_proof._strong_tag(body)
+        not_modified = condition is not None and condition == etag
+    return body, etag, not_modified
