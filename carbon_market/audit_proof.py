@@ -76,7 +76,9 @@ proof validation as :func:`verify` against the single locked snapshot
 it read, so a racing same-directory replacement can only yield a
 self-consistent old or new combination. The passed tag, the recomputed
 tag and the proof's bound ``checkpoint_etag`` must all three agree, so
-a tag carried by another download response never verifies. Structural
+a tag carried by another download response never verifies. The success
+result is :func:`verify`'s result plus ``etag`` -- the strong tag
+actually recomputed from the verified checkpoint bytes. Structural
 failures (encoding, JSON grammar, field shapes, and version 1 proofs,
 which predate the snapshot binding) raise ``BundleFormatError`` while
 every tag, digest-chain, generation, anchor, closed-state, page or
@@ -1638,8 +1640,12 @@ def verify_bundle(checkpoint_path: str, proof_path: str,
     decision and a content address holding unexpected bytes is never
     overwritten or repaired from the bundle in hand.
 
-    Returns the same result dict as :func:`verify`. A missing file or a
-    missing trust-directory parent raises ``FileNotFoundError``; an
+    Returns the same result dict as :func:`verify` together with
+    ``etag``: the strong tag actually recomputed from the checkpoint
+    bytes in hand -- equal to both the passed tag and the proof's bound
+    ``checkpoint_etag`` on every success branch, so callers that only
+    forwarded a tag still receive the tag of the verified snapshot. A
+    missing file or a missing trust-directory parent raises ``FileNotFoundError``; an
     encoding, JSON or structural error in either file or in the trust
     metadata -- including a version 1 proof, which predates the
     snapshot binding -- raises ``BundleFormatError``; a tag,
@@ -1684,6 +1690,10 @@ def verify_bundle(checkpoint_path: str, proof_path: str,
         # The existing single-bundle verification is complete; only now
         # compare and advance the persistent sequence.
         _update_trust(trust_dir, etag, raw, generations)
+    # Every success branch carries the tag actually recomputed from the
+    # verified snapshot -- equal to the passed tag and the proof's bound
+    # checkpoint_etag -- alongside verify's existing fields.
+    result["etag"] = tag
     return result
 
 
