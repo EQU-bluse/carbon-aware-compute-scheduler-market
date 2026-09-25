@@ -80,7 +80,34 @@ complete request and the committed intent. A first reservation returns
 ``(record, True)``; replaying the same key with the same job, advice
 key and moment returns the stored record with ``False`` without
 writing, while the same key with a changed request, or a job already
-reserved under another key, raises ``ValueError``. Every read requires the on-disk bytes to be exactly the
+reserved under another key, raises ``ValueError``.
+
+:func:`start`, :func:`record` and :func:`recover` close the migration
+loop over the reserved intents. :func:`start` claims one intent that is
+still ``reserved`` -- neither finished nor occupied -- and freezes the
+intent's source and target resource versions into a migration plan
+bound to an owner and a lease end that must not pass the job deadline;
+the target capacity stays exclusively held by the intent for the whole
+execution. :func:`record` lets the current owner, inside the lease,
+commit the non-empty receipt of the next pending step -- ``copy`` then
+``switch``, never skipped or repeated: a successful ``switch`` turns
+the plan ``migrated`` and releases the source capacity the trade froze,
+while any ``failed`` step turns it ``failed`` and releases the target
+reservation immediately, leaving the source trade occupancy untouched.
+:func:`recover` turns an active plan whose lease has strictly expired
+into ``interrupted``, preserving every receipt and releasing the target
+reservation. Capacity accounting recognizes the plan states: a
+``reserved`` or ``active`` intent occupies both source and target, a
+``migrated`` one only the target, a ``failed`` or ``interrupted`` one
+only the source.
+
+The three calls share one idempotency key space with :func:`apply`:
+replaying a key with the same request returns the current plan snapshot
+with ``False`` and writes nothing, while the same key with a changed
+request raises ``ValueError``. The ledger upgrade to version 2 keeps
+every recorded intent and appends the ``plans`` section keyed by job
+id; only the first change of a call commits the plan, its state, the
+idempotency binding and the audit event atomically. Every read requires the on-disk bytes to be exactly the
 canonical compact form :func:`_canonical_bytes` produces -- compact
 UTF-8 JSON with non-ASCII written through, no negative-zero or
 non-finite number literals and exactly one trailing newline -- and
@@ -109,7 +136,7 @@ from . import resources as _resources
 from . import signals as _signals
 from ._jsonio import finite_loads
 
-__all__ = ["evaluate", "apply"]
+__all__ = ["evaluate", "apply", "start", "record", "recover"]
 
 _VERSION = 1
 _ROOT_FIELDS = ("version", "records", "audit")
@@ -126,11 +153,26 @@ _RECOMMENDATIONS = ("keep", "migrate")
 _LOCK_SUFFIX = ".lock"
 
 _INTENT_VERSION = 1
+_INTENT_VERSION_V2 = 2
 _INTENT_ROOT_FIELDS = ("version", "intents", "idempotency", "audit")
+_INTENT_ROOT_FIELDS_V2 = ("version", "intents", "plans", "idempotency",
+                          "audit")
 _INTENT_FIELDS = ("job_id", "advice_key", "at", "source", "target",
                   "supply", "signal", "dispatch", "execution", "reserved")
 _INTENT_REQUEST_FIELDS = ("job_id", "advice_key", "at")
 _RESERVED_STATES = ("reserved",)
+_PLAN_FIELDS = ("job_id", "source", "target", "owner", "lease_end", "at",
+                "state", "steps")
+_RECEIPT_FIELDS = ("step", "result", "receipt", "at")
+_PLAN_STEPS = ("copy", "switch")
+_PLAN_STATES = ("active", "migrated", "failed", "interrupted")
+_STEP_RESULTS = ("succeeded", "failed")
+_ACTION_REQUEST_FIELDS = {
+    "start": ("action", "job_id", "owner", "lease_end", "at"),
+    "record": ("action", "job_id", "owner", "step", "result", "receipt",
+               "at"),
+    "recover": ("action", "job_id", "owner", "at"),
+}
 
 
 class _Store:
@@ -1026,6 +1068,156 @@ def _validate_intent_request(request: object) -> dict[str, Any]:
     return {"job_id": job_id, "advice_key": advice_key, "at": at}
 
 
+def _validate_plan(
+    record: object,
+    intents: dict[str, dict[str, Any]],
+    accepted: dict[str, dict[str, Any]],
+) -> dict[str, Any]:
+    if not isinstance(record, dict) \
+            or set(record.keys()) != set(_PLAN_FIELDS):
+        raise ValueError("plan record has invalid fields")
+    job_id = record["job_id"]
+    if not isinstance(job_id, str) or not job_id:
+        raise ValueError("plan job_id must be a non-empty string")
+    source = _validate_selection(record["source"], "plan source selection")
+    target = _validate_selection(record["target"], "plan target selection")
+    if source == target:
+        raise ValueError("a plan must migrate to another resource version")
+    owner = record["owner"]
+    if not isinstance(owner, str) or not owner:
+        raise ValueError("plan owner must be a non-empty string")
+    lease_end = record["lease_end"]
+    if not _is_plain_int(lease_end) or lease_end < 1:
+        raise ValueError("plan lease_end must be a positive integer")
+    at = record["at"]
+    if not _is_plain_int(at) or at < 0:
+        raise ValueError("plan at must be a non-boolean non-negative "
+                         "integer")
+    if at > lease_end:
+        raise ValueError("plan start moment must lie inside the lease")
+    state = record["state"]
+    if state not in _PLAN_STATES:
+        raise ValueError("plan state is invalid")
+
+    steps_raw = record["steps"]
+    if not isinstance(steps_raw, list) or len(steps_raw) > len(_PLAN_STEPS):
+        raise ValueError("plan steps must be a list within the step "
+                         "sequence")
+    steps: list[dict[str, Any]] = []
+    for index, receipt_raw in enumerate(steps_raw):
+        if not isinstance(receipt_raw, dict) \
+                or set(receipt_raw.keys()) != set(_RECEIPT_FIELDS):
+            raise ValueError("step receipt has invalid fields")
+        if receipt_raw["step"] != _PLAN_STEPS[index]:
+            raise ValueError("step receipts must follow the copy/switch "
+                             "sequence")
+        result = receipt_raw["result"]
+        if result not in _STEP_RESULTS:
+            raise ValueError("step receipt result is invalid")
+        token = receipt_raw["receipt"]
+        if not isinstance(token, str) or not token:
+            raise ValueError("step receipt must carry a non-empty receipt "
+                             "string")
+        receipt_at = receipt_raw["at"]
+        if not _is_plain_int(receipt_at) or receipt_at < 0:
+            raise ValueError("step receipt at must be a non-boolean "
+                             "non-negative integer")
+        if receipt_at > lease_end:
+            raise ValueError("step receipt must be recorded inside the "
+                             "lease")
+        steps.append({"step": receipt_raw["step"], "result": result,
+                      "receipt": token, "at": receipt_at})
+
+    # The state must be exactly what the recorded receipts imply: a
+    # failed receipt terminates the plan and must be the last one, a
+    # complete successful copy/switch sequence terminates it as migrated,
+    # and anything else is active or recovered-interrupted.
+    failed = [receipt for receipt in steps if receipt["result"] == "failed"]
+    if failed:
+        if steps[-1]["result"] != "failed" or len(failed) != 1:
+            raise ValueError("a failed step must terminate the plan")
+        if state != "failed":
+            raise ValueError("a plan with a failed step must be failed")
+    elif len(steps) == len(_PLAN_STEPS):
+        if state != "migrated":
+            raise ValueError("a fully recorded plan must be migrated")
+    elif state not in ("active", "interrupted"):
+        raise ValueError("an unfinished plan must be active or "
+                         "interrupted")
+
+    intent = intents.get(job_id)
+    if intent is None:
+        raise ValueError("plan must reference a recorded intent")
+    if source != intent["source"] or target != intent["target"]:
+        raise ValueError("plan selections must match its intent")
+    # The intent validation guarantees the job is accepted.
+    if lease_end > accepted[job_id]["deadline"]:
+        raise ValueError("plan lease end must not pass the job deadline")
+
+    return {
+        "job_id": job_id,
+        "source": source,
+        "target": target,
+        "owner": owner,
+        "lease_end": lease_end,
+        "at": at,
+        "state": state,
+        "steps": steps,
+    }
+
+
+def _validate_action_request(request: object) -> dict[str, Any]:
+    if not isinstance(request, dict):
+        raise ValueError("request must be an object")
+    action = request.get("action")
+    if not isinstance(action, str) or action not in _ACTION_REQUEST_FIELDS:
+        raise ValueError("request action is invalid")
+    if set(request.keys()) != set(_ACTION_REQUEST_FIELDS[action]):
+        raise ValueError("request has invalid fields")
+    job_id = request["job_id"]
+    if not isinstance(job_id, str) or not job_id:
+        raise ValueError("request job_id must be a non-empty string")
+    owner = request["owner"]
+    if not isinstance(owner, str) or not owner:
+        raise ValueError("request owner must be a non-empty string")
+    at = request["at"]
+    if not _is_plain_int(at) or at < 0:
+        raise ValueError("request at must be a non-boolean non-negative "
+                         "integer")
+    normalized: dict[str, Any] = {"action": action, "job_id": job_id,
+                                  "owner": owner}
+    if action == "start":
+        lease_end = request["lease_end"]
+        if not _is_plain_int(lease_end) or lease_end < 1:
+            raise ValueError("request lease_end must be a positive "
+                             "integer")
+        normalized["lease_end"] = lease_end
+    if action == "record":
+        step = request["step"]
+        if step not in _PLAN_STEPS:
+            raise ValueError("request step is invalid")
+        normalized["step"] = step
+        result = request["result"]
+        if result not in _STEP_RESULTS:
+            raise ValueError("request result is invalid")
+        normalized["result"] = result
+        receipt = request["receipt"]
+        if not isinstance(receipt, str) or not receipt:
+            raise ValueError("request receipt must be a non-empty string")
+        normalized["receipt"] = receipt
+    normalized["at"] = at
+    return {field: normalized[field]
+            for field in _ACTION_REQUEST_FIELDS[action]}
+
+
+def _validate_any_request(request: object) -> dict[str, Any]:
+    # The idempotency key space is shared: apply bindings carry no
+    # action, the migration lifecycle bindings carry one.
+    if isinstance(request, dict) and "action" in request:
+        return _validate_action_request(request)
+    return _validate_intent_request(request)
+
+
 def _validate_intent_ledger(
     data: object,
     accepted: dict[str, dict[str, Any]],
@@ -1034,13 +1226,22 @@ def _validate_intent_ledger(
     signal_history: dict[str, list[dict[str, Any]]],
     advice_records: dict[str, dict[str, Any]],
 ) -> tuple[dict[str, dict[str, Any]], dict[str, dict[str, Any]],
-           dict[str, dict[str, Any]]]:
-    if not isinstance(data, dict) \
-            or set(data.keys()) != set(_INTENT_ROOT_FIELDS):
+           dict[str, dict[str, Any]], dict[str, dict[str, Any]], int]:
+    if not isinstance(data, dict):
+        raise ValueError("intent ledger root must be an object")
+    keys = set(data.keys())
+    if keys == set(_INTENT_ROOT_FIELDS):
+        plans_raw: object = None
+        expected = _INTENT_VERSION
+    elif keys == set(_INTENT_ROOT_FIELDS_V2):
+        plans_raw = data["plans"]
+        expected = _INTENT_VERSION_V2
+    else:
         raise ValueError("intent ledger root must be an object with keys "
-                         "version, intents, idempotency and audit")
+                         "version, intents, idempotency and audit, plus "
+                         "plans once upgraded")
     version = data["version"]
-    if not _is_plain_int(version) or version != _INTENT_VERSION:
+    if not _is_plain_int(version) or version != expected:
         raise ValueError("unsupported intent ledger version")
 
     intents_raw = data["intents"]
@@ -1065,24 +1266,42 @@ def _validate_intent_ledger(
             raise ValueError("intent record id does not match its key")
         intents[job_id] = record
 
+    plans: dict[str, dict[str, Any]] = {}
+    if plans_raw is not None:
+        if not isinstance(plans_raw, dict):
+            raise ValueError("plans must be an object")
+        _check_sorted_keys(plans_raw, "plans")
+        for job_id, plan_raw in plans_raw.items():
+            if not isinstance(job_id, str) or not job_id:
+                raise ValueError("plan job ids must be non-empty strings")
+            plan = _validate_plan(plan_raw, intents, accepted)
+            if plan["job_id"] != job_id:
+                raise ValueError("plan record id does not match its key")
+            plans[job_id] = plan
+
     idempotency: dict[str, dict[str, Any]] = {}
     bound: dict[str, str] = {}
     for key, request_raw in idempotency_raw.items():
         if not isinstance(key, str) or not key:
             raise ValueError("idempotency keys must be non-empty strings")
-        request = _validate_intent_request(request_raw)
-        record = intents.get(request["job_id"])
-        if record is None:
-            raise ValueError("idempotency entry must reference a "
-                             "recorded intent")
-        if request["advice_key"] != record["advice_key"] \
-                or request["at"] != record["at"]:
-            raise ValueError("idempotency entry does not match its "
-                             "intent")
-        if request["job_id"] in bound:
-            raise ValueError("job reserved under more than one "
-                             "idempotency key")
-        bound[request["job_id"]] = key
+        request = _validate_any_request(request_raw)
+        if "action" in request:
+            if request["job_id"] not in plans:
+                raise ValueError("action idempotency entry must reference "
+                                 "a recorded plan")
+        else:
+            record = intents.get(request["job_id"])
+            if record is None:
+                raise ValueError("idempotency entry must reference a "
+                                 "recorded intent")
+            if request["advice_key"] != record["advice_key"] \
+                    or request["at"] != record["at"]:
+                raise ValueError("idempotency entry does not match its "
+                                 "intent")
+            if request["job_id"] in bound:
+                raise ValueError("job reserved under more than one "
+                                 "idempotency key")
+            bound[request["job_id"]] = key
         idempotency[key] = request
     if set(bound) != set(intents):
         raise ValueError("every intent must be bound to an idempotency "
@@ -1097,43 +1316,135 @@ def _validate_intent_ledger(
             raise ValueError("intent audit event has invalid fields")
         if event_raw["key"] != key or not isinstance(event_raw["key"], str):
             raise ValueError("audit event key does not match its map key")
-        request = _validate_intent_request(event_raw["request"])
-        result = _validate_intent(
-            event_raw["result"], accepted, trades, history,
-            signal_history, advice_records)
+        request = _validate_any_request(event_raw["request"])
         if key not in idempotency:
             raise ValueError("audit event must reference an idempotency "
                              "entry")
         if request != idempotency[key]:
             raise ValueError("audit event does not match its idempotency "
                              "entry")
-        if result != intents[request["job_id"]]:
-            raise ValueError("audit event result does not match its "
-                             "intent")
+        if "action" in request:
+            result: dict[str, Any] = _validate_plan(
+                event_raw["result"], intents, accepted)
+            if result["job_id"] != request["job_id"]:
+                raise ValueError("audit event result does not match its "
+                                 "request")
+        else:
+            result = _validate_intent(
+                event_raw["result"], accepted, trades, history,
+                signal_history, advice_records)
+            if result != intents[request["job_id"]]:
+                raise ValueError("audit event result does not match its "
+                                 "intent")
         events[key] = {"key": key, "request": request, "result": result}
 
-    # The three sections describe one reservation history: one binding
-    # and one audit event per intent, and vice versa.
+    # The sections describe one reservation history: one binding and one
+    # audit event per intent, and vice versa.
     if set(events) != set(idempotency):
         raise ValueError("idempotency keys and audit events do not match")
-    return intents, idempotency, events
+
+    # The plans and the action history describe one migration lifecycle:
+    # a plan's selections, owner, lease end and start moment never change
+    # after the plan is created, so every committed snapshot must agree
+    # with them; every plan is started exactly once, its steps are
+    # exactly the receipts the record requests committed and it is
+    # interrupted exactly when one recovery was recorded.
+    fixed = ("source", "target", "owner", "lease_end", "at")
+    starts: dict[str, str] = {}
+    recordings: dict[str, list[dict[str, Any]]] = {}
+    recoveries: dict[str, int] = {}
+    for key, request in idempotency.items():
+        if "action" not in request:
+            continue
+        result = events[key]["result"]
+        job_id = request["job_id"]
+        plan = plans[job_id]
+        for field in fixed:
+            if result[field] != plan[field]:
+                raise ValueError("audit event result does not match its "
+                                 "plan")
+        action = request["action"]
+        if action == "start":
+            if job_id in starts:
+                raise ValueError("plan started under more than one "
+                                 "idempotency key")
+            starts[job_id] = key
+            if result["state"] != "active" or result["steps"] != []:
+                raise ValueError("start audit result must be a fresh "
+                                 "active plan")
+            if request["owner"] != result["owner"] \
+                    or request["lease_end"] != result["lease_end"] \
+                    or request["at"] != result["at"]:
+                raise ValueError("start audit result does not match its "
+                                 "request")
+        elif action == "record":
+            if request["owner"] != result["owner"]:
+                raise ValueError("record audit result does not match its "
+                                 "request")
+            if not result["steps"]:
+                raise ValueError("record audit result must carry the "
+                                 "recorded step")
+            receipt = result["steps"][-1]
+            if receipt != {"step": request["step"],
+                           "result": request["result"],
+                           "receipt": request["receipt"],
+                           "at": request["at"]}:
+                raise ValueError("record audit result does not match its "
+                                 "request")
+            recordings.setdefault(job_id, []).append(receipt)
+        else:  # recover
+            if request["owner"] != result["owner"]:
+                raise ValueError("recover audit result does not match "
+                                 "its request")
+            if result["state"] != "interrupted":
+                raise ValueError("recover audit result must be an "
+                                 "interrupted plan")
+            if request["at"] <= result["lease_end"]:
+                raise ValueError("recover request must lie past the "
+                                 "lease end")
+            recoveries[job_id] = recoveries.get(job_id, 0) + 1
+
+    if set(starts) != set(plans):
+        raise ValueError("every plan must be bound to a start request")
+    for job_id, plan in plans.items():
+        committed = sorted(json.dumps(receipt, sort_keys=True)
+                           for receipt in recordings.get(job_id, []))
+        held = sorted(json.dumps(receipt, sort_keys=True)
+                      for receipt in plan["steps"])
+        if committed != held:
+            raise ValueError("plan steps do not match the record "
+                             "history")
+        if (plan["state"] == "interrupted") \
+                != (recoveries.get(job_id, 0) == 1):
+            raise ValueError("plan state does not match the recover "
+                             "history")
+        if recoveries.get(job_id, 0) > 1:
+            raise ValueError("plan recovered more than once")
+
+    return intents, plans, idempotency, events, version
 
 
 def _intent_canonical_bytes(
     intents: dict[str, dict[str, Any]],
+    plans: dict[str, dict[str, Any]],
     idempotency: dict[str, dict[str, Any]],
     events: dict[str, dict[str, Any]],
+    version: int,
 ) -> bytes:
     # Compact UTF-8 JSON, non-ASCII written through, sections in their
-    # fixed field order, intents keyed by job id and bindings/events by
-    # idempotency key, each in code-point order, terminated by exactly
-    # one newline.
-    payload = {
-        "version": _INTENT_VERSION,
-        "intents": {job_id: intents[job_id] for job_id in sorted(intents)},
-        "idempotency": {key: idempotency[key] for key in sorted(idempotency)},
-        "audit": {key: events[key] for key in sorted(events)},
-    }
+    # fixed field order, intents and plans keyed by job id and
+    # bindings/events by idempotency key, each in code-point order,
+    # terminated by exactly one newline. Version 1 predates the plans
+    # section; version 2 keeps every intent and appends it.
+    payload: dict[str, Any] = {"version": version}
+    payload["intents"] = {job_id: intents[job_id]
+                          for job_id in sorted(intents)}
+    if version == _INTENT_VERSION_V2:
+        payload["plans"] = {job_id: plans[job_id]
+                            for job_id in sorted(plans)}
+    payload["idempotency"] = {key: idempotency[key]
+                              for key in sorted(idempotency)}
+    payload["audit"] = {key: events[key] for key in sorted(events)}
     text = json.dumps(payload, ensure_ascii=False, separators=(",", ":"),
                       allow_nan=False) + "\n"
     return text.encode("utf-8")
@@ -1147,12 +1458,13 @@ def _load_intent_ledger(
     signal_history: dict[str, list[dict[str, Any]]],
     advice_records: dict[str, dict[str, Any]],
 ) -> tuple[dict[str, dict[str, Any]], dict[str, dict[str, Any]],
-           dict[str, dict[str, Any]], bytes | None]:
+           dict[str, dict[str, Any]], dict[str, dict[str, Any]], int,
+           bytes | None]:
     try:
         with open(realpath, "rb") as handle:
             raw = handle.read()
     except FileNotFoundError:
-        return {}, {}, {}, None
+        return {}, {}, {}, {}, _INTENT_VERSION, None
     try:
         text = raw.decode("utf-8")
     except UnicodeDecodeError as exc:
@@ -1164,15 +1476,16 @@ def _load_intent_ledger(
     except ValueError as exc:
         raise ValueError(
             f"intent ledger {realpath!r} is not valid JSON") from exc
-    intents, idempotency, events = _validate_intent_ledger(
+    intents, plans, idempotency, events, version = _validate_intent_ledger(
         data, accepted, trades, history, signal_history, advice_records)
     # As for the other ledgers, the ledger is accepted only in canonical
     # compact form with a single trailing newline.
-    if raw != _intent_canonical_bytes(intents, idempotency, events):
+    if raw != _intent_canonical_bytes(intents, plans, idempotency, events,
+                                      version):
         raise ValueError(
             f"intent ledger {realpath!r} is not in canonical compact "
             "form")
-    return intents, idempotency, events, raw
+    return intents, plans, idempotency, events, version, raw
 
 
 def apply(
@@ -1217,7 +1530,13 @@ def apply(
     ``at`` and keeps the job's regions, residency, deadline and budgets
     -- except that capacity is now also deducted per exact resource
     version for every other job's recorded intent, while this job's own
-    source occupancy is never deducted against itself. The advice
+    source occupancy is never deducted against itself. The deduction
+    recognizes the migration plan states: a ``reserved`` or ``active``
+    intent occupies both its source (through its trade) and its target,
+    a ``migrated`` intent has released the source trade occupancy and
+    occupies only the target, and a ``failed`` or ``interrupted``
+    intent has released the target reservation and occupies only the
+    source. The advice
     target must still be the first ordered candidate: a changed target,
     an empty feasible set or insufficient remaining capacity raises
     ``LookupError`` and reserves nothing.
@@ -1229,7 +1548,9 @@ def apply(
     missing intent ledger is created only by the first reservation, the
     intent, its idempotency binding and the audit event -- the complete
     request plus the committed intent -- committed together in one
-    synced atomic write. Replaying the same key with the same job,
+    synced atomic write; a ledger already upgraded to version 2 keeps
+    its version and its recorded plans, a version 1 ledger stays a
+    version 1 ledger. Replaying the same key with the same job,
     advice key and moment returns the stored record with ``False``
     without writing; the same key with a changed request, or a job
     already reserved under another key, raises ``ValueError`` and
@@ -1314,8 +1635,8 @@ def apply(
             if advice_raw is None:
                 raise FileNotFoundError(
                     f"advice ledger {advice_real!r} does not exist")
-            intents, idempotency, events, old_bytes = \
-                _load_intent_ledger(
+            intents, migration_plans, idempotency, events, \
+                ledger_version, old_bytes = _load_intent_ledger(
                     ledger_real, accepted, cleared, history,
                     signal_history, advice_records)
 
@@ -1383,15 +1704,29 @@ def apply(
             # Capacity already booked per exact resource version by
             # every OTHER job's trade and by every OTHER job's recorded
             # intent; this job's own frozen source occupancy is never
-            # deducted against itself.
+            # deducted against itself. The plan states decide what an
+            # intent still holds: reserved or active intents occupy both
+            # source (through the trade) and target, a migrated intent
+            # has released the source trade occupancy and holds only the
+            # target, and a failed or interrupted intent has released
+            # the target reservation and holds only the source.
             booked: dict[tuple[str, int], int] = {}
             for other_id, other in cleared.items():
                 if other_id == job_id:
+                    continue
+                other_plan = migration_plans.get(other_id)
+                if other_plan is not None \
+                        and other_plan["state"] == "migrated":
                     continue
                 slot = (other["resource_id"], other["version"])
                 booked[slot] = booked.get(slot, 0) + other["work"]
             for other_id, intent in intents.items():
                 if other_id == job_id:
+                    continue
+                other_plan = migration_plans.get(other_id)
+                if other_plan is not None \
+                        and other_plan["state"] in ("failed",
+                                                    "interrupted"):
                     continue
                 other_target = intent["target"]
                 slot = (other_target["resource_id"],
@@ -1486,8 +1821,511 @@ def apply(
             idempotency[key] = request
             events[key] = {"key": key, "request": dict(request),
                            "result": copy.deepcopy(record)}
+            # A ledger that already carries migration plans keeps its
+            # version 2 form; anything else stays a version 1 ledger.
             _commit_file(ledger_real,
-                         _intent_canonical_bytes(intents, idempotency,
-                                                 events),
+                         _intent_canonical_bytes(intents, migration_plans,
+                                                 idempotency, events,
+                                                 ledger_version),
                          old_bytes, prefix=".rebalance-apply-")
             return copy.deepcopy(record), True
+
+
+# ---------------------------------------------------------------------------
+# Migration lifecycle: claim, execute and release over reserved intents
+# ---------------------------------------------------------------------------
+
+
+def _load_snapshot_layers(
+    job_real: str,
+    supply_real: str,
+    signal_real: str,
+    trades_real: str,
+    dispatch_real: str,
+    execution_real: str,
+    advice_real: str,
+) -> tuple[dict[str, dict[str, Any]], dict[str, list[dict[str, Any]]],
+           dict[str, list[dict[str, Any]]], dict[str, dict[str, Any]],
+           dict[str, dict[str, Any]],
+           dict[str, dict[str, dict[str, Any]]],
+           dict[str, dict[str, Any]]]:
+    # The seven input layers read as one consistent snapshot, exactly as
+    # in apply: the acceptance, supply, signal, clearing, dispatch,
+    # execution and advice files, each required to exist.
+    accepted, job_map, job_events, job_raw = \
+        _jobs._load_submit_file(job_real)
+    if job_raw is None:
+        raise FileNotFoundError(
+            f"acceptance file {job_real!r} does not exist")
+    if job_raw != _jobs._serialize_submit_file(
+            accepted, job_map, job_events):
+        raise ValueError(
+            f"acceptance file {job_real!r} is not in canonical "
+            "compact form")
+    history, _supply_map, _supply_events, supply_raw = \
+        _resources._load_file(supply_real)
+    if supply_raw is None:
+        raise FileNotFoundError(
+            f"supply file {supply_real!r} does not exist")
+    signal_history, _signal_map, _signal_events, signal_raw = \
+        _signals._load_file(signal_real)
+    if signal_raw is None:
+        raise FileNotFoundError(
+            f"signal file {signal_real!r} does not exist")
+    cleared, _clear_keys, trades_raw = _market._load_clear_ledger(
+        trades_real, accepted, history, signal_history)
+    if trades_raw is None:
+        raise FileNotFoundError(
+            f"clearing ledger {trades_real!r} does not exist")
+    decisions, _dispatch_keys, _dispatch_events, dispatch_raw = \
+        _dispatch._load_ledger(dispatch_real)
+    if dispatch_raw is None:
+        raise FileNotFoundError(
+            f"dispatch ledger {dispatch_real!r} does not exist")
+    exec_plans, _plan_keys, _plan_events = \
+        _execution._load_existing_ledger(execution_real)[:3]
+    advice_records, _advice_events, advice_raw = _load_ledger(
+        advice_real, accepted, cleared, history, signal_history)
+    if advice_raw is None:
+        raise FileNotFoundError(
+            f"advice ledger {advice_real!r} does not exist")
+    return (accepted, history, signal_history, cleared, decisions,
+            exec_plans, advice_records)
+
+
+def _resolve_lifecycle_paths(
+    jobs: str,
+    supply: str,
+    signals: str,
+    trades: str,
+    dispatch: str,
+    execution: str,
+    advice: str,
+    ledger: str,
+) -> tuple[str, str, str, str, str, str, str, str]:
+    reals = tuple(os.path.realpath(path)
+                  for path in (jobs, supply, signals, trades, dispatch,
+                               execution, advice, ledger))
+    if len(set(reals)) != 8:
+        raise ValueError("the eight paths must be distinct real paths")
+    return reals  # type: ignore[return-value]
+
+
+def start(
+    jobs: str,
+    supply: str,
+    signals: str,
+    trades: str,
+    dispatch: str,
+    execution: str,
+    advice: str,
+    ledger: str,
+    job_id: str,
+    key: str,
+    owner: str,
+    lease_end: int,
+    at: int,
+) -> tuple[dict[str, object], bool]:
+    """Claim one reserved intent as an active migration plan.
+
+    The eight paths, ``job_id``, ``key`` and ``owner`` must be non-empty
+    strings, ``lease_end`` a non-boolean positive integer and ``at`` a
+    non-boolean non-negative integer start moment; the eight paths must
+    also resolve to distinct real locations. Any violation raises
+    ``ValueError`` before a business file is read.
+
+    The seven input files are read as one snapshot under their shared
+    locks together with the intent ledger's exclusive lock, all eight
+    taken in resolved real-path order. Only an intent that is still
+    ``reserved`` -- neither finished nor occupied -- can be claimed: an
+    intent whose plan is already active raises ``PermissionError`` and
+    one whose plan reached a terminal state raises ``ValueError``. The
+    booking must also be unfinished and not in flight, refused in a
+    fixed order: a succeeded dispatch decision or a completed execution
+    plan raises ``ValueError``, a claimed decision or an active
+    execution plan raises ``PermissionError`` and a start moment past
+    the job deadline raises ``TimeoutError`` -- none of them writes.
+    The lease end must not pass the job deadline (``ValueError``) and
+    the start moment must lie inside the lease (``TimeoutError``).
+
+    A successful claim freezes the intent's source and target resource
+    versions, the owner, the lease end and the start moment into an
+    ``active`` migration plan with the step sequence ``copy`` then
+    ``switch``; the target capacity stays exclusively held by the
+    intent for the whole execution. Returns ``(plan, created)``; the
+    plan, its idempotency binding and the audit event are committed in
+    one synced atomic write that upgrades the ledger to version 2 while
+    keeping every recorded intent. Replaying the same key with the same
+    job, owner, lease end and moment returns the current plan with
+    ``False`` without writing; the same key with a changed request
+    raises ``ValueError`` and leaves the ledger untouched.
+
+    An unknown job, intent or dispatch decision raises ``KeyError``.
+    Missing input files or the ledger parent raise
+    ``FileNotFoundError``; invalid arguments, structure, ordering,
+    references or non-canonical bytes raise ``ValueError``; other
+    locking, read/write or sync failures raise ``OSError``.
+    """
+    for value in (jobs, supply, signals, trades, dispatch, execution,
+                  advice, ledger, job_id, key, owner):
+        if not isinstance(value, str) or not value:
+            raise ValueError("the eight paths, job_id, key and owner "
+                             "must be non-empty strings")
+    if not _is_plain_int(lease_end) or lease_end < 1:
+        raise ValueError("lease_end must be a non-boolean positive "
+                         "integer")
+    if not _is_plain_int(at) or at < 0:
+        raise ValueError("at must be a non-boolean non-negative integer")
+
+    (job_real, supply_real, signal_real, trades_real, dispatch_real,
+     execution_real, advice_real, ledger_real) = \
+        _resolve_lifecycle_paths(jobs, supply, signals, trades, dispatch,
+                                 execution, advice, ledger)
+
+    store = _get_store(ledger)
+    with store.lock:
+        # Locks are taken in one resolved-real-path order shared by
+        # every caller, so concurrent calls can never deadlock; the
+        # intent ledger lock is exclusive, the seven snapshot locks
+        # shared.
+        with contextlib.ExitStack() as stack:
+            for locked in sorted({job_real, supply_real, signal_real,
+                                  trades_real, dispatch_real,
+                                  execution_real, advice_real,
+                                  ledger_real}):
+                stack.enter_context(
+                    _lock(locked, shared=(locked != ledger_real)))
+
+            (accepted, history, signal_history, cleared, decisions,
+             exec_plans, advice_records) = _load_snapshot_layers(
+                job_real, supply_real, signal_real, trades_real,
+                dispatch_real, execution_real, advice_real)
+            intents, plans, idempotency, events, _version, old_bytes = \
+                _load_intent_ledger(
+                    ledger_real, accepted, cleared, history,
+                    signal_history, advice_records)
+
+            request = {"action": "start", "job_id": job_id,
+                       "owner": owner, "lease_end": lease_end, "at": at}
+            binding = idempotency.get(key)
+            if binding is not None:
+                if binding != request:
+                    raise ValueError("idempotency key was already used "
+                                     "with a different request")
+                # An equivalent replay returns the current plan without
+                # rewriting a byte.
+                return copy.deepcopy(plans[job_id]), False
+
+            job = accepted.get(job_id)
+            if job is None:
+                raise KeyError(job_id)
+            intent = intents.get(job_id)
+            if intent is None:
+                raise KeyError(job_id)
+            decision = decisions.get(job_id)
+            if decision is None:
+                raise KeyError(job_id)
+
+            plan = plans.get(job_id)
+            if plan is not None:
+                # An active plan is occupied; a terminal one is finished.
+                if plan["state"] == "active":
+                    raise PermissionError("the intent already holds an "
+                                          "active migration plan")
+                raise ValueError("the intent's migration plan is "
+                                 "finished")
+            job_plans = exec_plans.get(job_id, {})
+            # Refusal order is fixed: a finished booking is a
+            # ValueError, work claimed or in flight is a
+            # PermissionError, and a moment past the deadline is a
+            # TimeoutError.
+            if decision["state"] == "succeeded" \
+                    or any(item["state"] == "completed"
+                           for item in job_plans.values()):
+                raise ValueError("a finished booking cannot be "
+                                 "migrated")
+            if decision["state"] == "claimed" \
+                    or any(item["state"] == "active"
+                           for item in job_plans.values()):
+                raise PermissionError("the booking is claimed or has an "
+                                      "active execution plan")
+            if at > job["deadline"]:
+                raise TimeoutError("start moment exceeds the job "
+                                   "deadline")
+            if lease_end > job["deadline"]:
+                raise ValueError("lease end must not pass the job "
+                                 "deadline")
+            if at > lease_end:
+                raise TimeoutError("the lease has already expired")
+
+            new_plan: dict[str, Any] = {
+                "job_id": job_id,
+                "source": copy.deepcopy(intent["source"]),
+                "target": copy.deepcopy(intent["target"]),
+                "owner": owner,
+                "lease_end": lease_end,
+                "at": at,
+                "state": "active",
+                "steps": [],
+            }
+            plans[job_id] = new_plan
+            idempotency[key] = request
+            events[key] = {"key": key, "request": dict(request),
+                           "result": copy.deepcopy(new_plan)}
+            _commit_file(ledger_real,
+                         _intent_canonical_bytes(intents, plans,
+                                                 idempotency, events,
+                                                 _INTENT_VERSION_V2),
+                         old_bytes, prefix=".rebalance-start-")
+            return copy.deepcopy(new_plan), True
+
+
+def record(
+    jobs: str,
+    supply: str,
+    signals: str,
+    trades: str,
+    dispatch: str,
+    execution: str,
+    advice: str,
+    ledger: str,
+    job_id: str,
+    key: str,
+    owner: str,
+    step: str,
+    result: str,
+    receipt: str,
+    at: int,
+) -> tuple[dict[str, object], bool]:
+    """Record one step receipt for an active migration plan.
+
+    The eight paths, ``job_id``, ``key``, ``owner`` and ``receipt``
+    must be non-empty strings, ``step`` the plan's next pending step
+    (``copy`` then ``switch``), ``result`` exactly ``succeeded`` or
+    ``failed`` and ``at`` a non-boolean non-negative integer moment;
+    the eight paths must also resolve to distinct real locations. Any
+    violation raises ``ValueError`` before a business file is read.
+
+    The seven input files are read as one snapshot under their shared
+    locks together with the intent ledger's exclusive lock, all eight
+    taken in resolved real-path order. Only the plan's owner acting
+    inside the lease may record: a plan that is not active raises
+    ``ValueError``, a different owner raises ``PermissionError`` and a
+    moment past the lease end raises ``TimeoutError``. Steps advance
+    only on success and are never skipped or repeated: a receipt naming
+    anything but the next pending step raises ``ValueError``. A
+    successful ``switch`` turns the plan ``migrated`` and releases the
+    source capacity the trade froze; any ``failed`` step turns the plan
+    ``failed`` and releases the target reservation immediately, leaving
+    the source trade occupancy untouched. Terminal plans accept no
+    further receipts.
+
+    Returns ``(plan, created)``; the new plan state, the idempotency
+    binding and the audit event are committed in one synced atomic
+    write. Replaying the same key with the same job, owner, step,
+    result, receipt and moment returns the current plan with ``False``
+    without writing; the same key with a changed request raises
+    ``ValueError`` and leaves the ledger untouched.
+
+    An unknown job or intent raises ``KeyError``; an intent without a
+    migration plan raises ``ValueError``. Missing input files or the
+    ledger parent raise ``FileNotFoundError``; invalid arguments,
+    structure, ordering, references or non-canonical bytes raise
+    ``ValueError``; other locking, read/write or sync failures raise
+    ``OSError``.
+    """
+    for value in (jobs, supply, signals, trades, dispatch, execution,
+                  advice, ledger, job_id, key, owner, receipt):
+        if not isinstance(value, str) or not value:
+            raise ValueError("the eight paths, job_id, key, owner and "
+                             "receipt must be non-empty strings")
+    if step not in _PLAN_STEPS:
+        raise ValueError("step must be copy or switch")
+    if result not in _STEP_RESULTS:
+        raise ValueError("result must be succeeded or failed")
+    if not _is_plain_int(at) or at < 0:
+        raise ValueError("at must be a non-boolean non-negative integer")
+
+    (job_real, supply_real, signal_real, trades_real, dispatch_real,
+     execution_real, advice_real, ledger_real) = \
+        _resolve_lifecycle_paths(jobs, supply, signals, trades, dispatch,
+                                 execution, advice, ledger)
+
+    store = _get_store(ledger)
+    with store.lock:
+        with contextlib.ExitStack() as stack:
+            for locked in sorted({job_real, supply_real, signal_real,
+                                  trades_real, dispatch_real,
+                                  execution_real, advice_real,
+                                  ledger_real}):
+                stack.enter_context(
+                    _lock(locked, shared=(locked != ledger_real)))
+
+            (accepted, history, signal_history, cleared, _decisions,
+             _exec_plans, advice_records) = _load_snapshot_layers(
+                job_real, supply_real, signal_real, trades_real,
+                dispatch_real, execution_real, advice_real)
+            intents, plans, idempotency, events, _version, old_bytes = \
+                _load_intent_ledger(
+                    ledger_real, accepted, cleared, history,
+                    signal_history, advice_records)
+
+            request = {"action": "record", "job_id": job_id,
+                       "owner": owner, "step": step, "result": result,
+                       "receipt": receipt, "at": at}
+            binding = idempotency.get(key)
+            if binding is not None:
+                if binding != request:
+                    raise ValueError("idempotency key was already used "
+                                     "with a different request")
+                # An equivalent replay returns the current plan without
+                # rewriting a byte.
+                return copy.deepcopy(plans[job_id]), False
+
+            if job_id not in accepted:
+                raise KeyError(job_id)
+            if job_id not in intents:
+                raise KeyError(job_id)
+            plan = plans.get(job_id)
+            if plan is None:
+                raise ValueError("the intent has no migration plan yet")
+            if plan["state"] != "active":
+                raise ValueError("plan is not active")
+            if plan["owner"] != owner:
+                raise PermissionError("record requires the plan owner")
+            if at > plan["lease_end"]:
+                raise TimeoutError("the lease has already expired")
+            if step != _PLAN_STEPS[len(plan["steps"])]:
+                raise ValueError("step is not the plan's next pending "
+                                 "step")
+
+            plan["steps"].append({"step": step, "result": result,
+                                  "receipt": receipt, "at": at})
+            if result == "failed":
+                plan["state"] = "failed"
+            elif len(plan["steps"]) == len(_PLAN_STEPS):
+                plan["state"] = "migrated"
+            idempotency[key] = request
+            events[key] = {"key": key, "request": dict(request),
+                           "result": copy.deepcopy(plan)}
+            _commit_file(ledger_real,
+                         _intent_canonical_bytes(intents, plans,
+                                                 idempotency, events,
+                                                 _INTENT_VERSION_V2),
+                         old_bytes, prefix=".rebalance-record-")
+            return copy.deepcopy(plan), True
+
+
+def recover(
+    jobs: str,
+    supply: str,
+    signals: str,
+    trades: str,
+    dispatch: str,
+    execution: str,
+    advice: str,
+    ledger: str,
+    job_id: str,
+    key: str,
+    owner: str,
+    at: int,
+) -> tuple[dict[str, object], bool]:
+    """Interrupt an active migration plan whose lease has expired.
+
+    The eight paths, ``job_id``, ``key`` and ``owner`` must be
+    non-empty strings and ``at`` a non-boolean non-negative integer
+    moment; the eight paths must also resolve to distinct real
+    locations. Any violation raises ``ValueError`` before a business
+    file is read.
+
+    The seven input files are read as one snapshot under their shared
+    locks together with the intent ledger's exclusive lock, all eight
+    taken in resolved real-path order. Only the plan's owner may
+    recover and only once the lease has strictly expired: a plan that
+    is not active raises ``ValueError``, a different owner or a lease
+    that has not expired yet raises ``PermissionError``. A successful
+    recovery turns the plan ``interrupted``, preserves every recorded
+    receipt and releases the target reservation, leaving the source
+    trade occupancy untouched.
+
+    Returns ``(plan, created)``; the new plan state, the idempotency
+    binding and the audit event are committed in one synced atomic
+    write. Replaying the same key with the same job, owner and moment
+    returns the current plan with ``False`` without writing; the same
+    key with a changed request raises ``ValueError`` and leaves the
+    ledger untouched.
+
+    An unknown job or intent raises ``KeyError``; an intent without a
+    migration plan raises ``ValueError``. Missing input files or the
+    ledger parent raise ``FileNotFoundError``; invalid arguments,
+    structure, ordering, references or non-canonical bytes raise
+    ``ValueError``; other locking, read/write or sync failures raise
+    ``OSError``.
+    """
+    for value in (jobs, supply, signals, trades, dispatch, execution,
+                  advice, ledger, job_id, key, owner):
+        if not isinstance(value, str) or not value:
+            raise ValueError("the eight paths, job_id, key and owner "
+                             "must be non-empty strings")
+    if not _is_plain_int(at) or at < 0:
+        raise ValueError("at must be a non-boolean non-negative integer")
+
+    (job_real, supply_real, signal_real, trades_real, dispatch_real,
+     execution_real, advice_real, ledger_real) = \
+        _resolve_lifecycle_paths(jobs, supply, signals, trades, dispatch,
+                                 execution, advice, ledger)
+
+    store = _get_store(ledger)
+    with store.lock:
+        with contextlib.ExitStack() as stack:
+            for locked in sorted({job_real, supply_real, signal_real,
+                                  trades_real, dispatch_real,
+                                  execution_real, advice_real,
+                                  ledger_real}):
+                stack.enter_context(
+                    _lock(locked, shared=(locked != ledger_real)))
+
+            (accepted, history, signal_history, cleared, _decisions,
+             _exec_plans, advice_records) = _load_snapshot_layers(
+                job_real, supply_real, signal_real, trades_real,
+                dispatch_real, execution_real, advice_real)
+            intents, plans, idempotency, events, _version, old_bytes = \
+                _load_intent_ledger(
+                    ledger_real, accepted, cleared, history,
+                    signal_history, advice_records)
+
+            request = {"action": "recover", "job_id": job_id,
+                       "owner": owner, "at": at}
+            binding = idempotency.get(key)
+            if binding is not None:
+                if binding != request:
+                    raise ValueError("idempotency key was already used "
+                                     "with a different request")
+                # An equivalent replay returns the current plan without
+                # rewriting a byte.
+                return copy.deepcopy(plans[job_id]), False
+
+            if job_id not in accepted:
+                raise KeyError(job_id)
+            if job_id not in intents:
+                raise KeyError(job_id)
+            plan = plans.get(job_id)
+            if plan is None:
+                raise ValueError("the intent has no migration plan yet")
+            if plan["state"] != "active":
+                raise ValueError("plan is not active")
+            if plan["owner"] != owner:
+                raise PermissionError("recover requires the plan owner")
+            if at <= plan["lease_end"]:
+                raise PermissionError("the lease has not expired yet")
+
+            plan["state"] = "interrupted"
+            idempotency[key] = request
+            events[key] = {"key": key, "request": dict(request),
+                           "result": copy.deepcopy(plan)}
+            _commit_file(ledger_real,
+                         _intent_canonical_bytes(intents, plans,
+                                                 idempotency, events,
+                                                 _INTENT_VERSION_V2),
+                         old_bytes, prefix=".rebalance-recover-")
+            return copy.deepcopy(plan), True
