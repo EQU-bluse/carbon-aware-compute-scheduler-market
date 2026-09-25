@@ -288,10 +288,12 @@ def _validate_signal(
     resource_region: str,
     at: int,
     signal_history: dict[str, list[dict[str, Any]]] | None,
-) -> tuple[dict[str, Any], int, int]:
-    # A live candidate freezes the exact published signal record --
-    # region, version and all observations -- so a later signal publish
-    # cannot change what an earlier trade was decided under. When the
+) -> tuple[int, int]:
+    # Returns the binary numeric pair (unit_cost, carbon_intensity) the
+    # caller prices on, never the signal record itself. A live candidate
+    # freezes the exact published signal record -- region, version and
+    # all observations -- so a later signal publish cannot change what an
+    # earlier trade was decided under. When the
     # signal snapshot is available (clear_live), the frozen record must
     # be the exact published version. Readers that never take the signal
     # file (static clear, dispatch, execution) still validate the frozen
