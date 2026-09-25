@@ -90,7 +90,7 @@ def _verify_bundle(args: argparse.Namespace) -> None:
             args.checkpoint, args.proof, args.etag,
             trust_dir=args.trust_dir)
         payload = json.dumps(
-            {"valid": True, "etag": args.etag,
+            {"valid": True, "etag": result["etag"],
              "generation": result["generation"],
              "closed": result["closed"],
              "events": result["events"], "next": result["next"]},

@@ -1638,7 +1638,10 @@ def verify_bundle(checkpoint_path: str, proof_path: str,
     decision and a content address holding unexpected bytes is never
     overwritten or repaired from the bundle in hand.
 
-    Returns the same result dict as :func:`verify`. A missing file or a
+    Returns the same result dict as :func:`verify`, plus ``etag``: the
+    actual strong tag recomputed from the verified checkpoint bytes (the
+    three agreeing tags are equal by then, so every success branch
+    reports the one true tag). A missing file or a
     missing trust-directory parent raises ``FileNotFoundError``; an
     encoding, JSON or structural error in either file or in the trust
     metadata -- including a version 1 proof, which predates the
@@ -1684,6 +1687,9 @@ def verify_bundle(checkpoint_path: str, proof_path: str,
         # The existing single-bundle verification is complete; only now
         # compare and advance the persistent sequence.
         _update_trust(trust_dir, etag, raw, generations)
+    # Every success branch reports the actual strong tag recomputed from
+    # the verified checkpoint bytes alongside the proof's own fields.
+    result["etag"] = tag
     return result
 
 
