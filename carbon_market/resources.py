@@ -286,6 +286,14 @@ def _load_file(realpath: str) -> tuple[
         raise ValueError(
             f"supply file {realpath!r} is not valid JSON") from exc
     history, idempotency, events = _validate_structure(data)
+    # Canonical-byte gate: every read entry point only accepts the exact
+    # compact layout publish() writes. Re-serializing the parsed document
+    # rejects extra whitespace, escaped non-ASCII and out-of-order fields
+    # or map keys, while the byte comparison enforces the single trailing
+    # newline (a missing or duplicated one no longer round-trips).
+    if _serialize(history, idempotency, events) != raw:
+        raise ValueError(
+            f"supply file {realpath!r} is not canonical compact UTF-8 JSON")
     return history, idempotency, events, raw
 
 

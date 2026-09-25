@@ -514,5 +514,78 @@ class FeasibleTest(unittest.TestCase):
             feasible(self.jobs_path, self.supply_path, "j-1", 1.5)  # type: ignore[arg-type]
 
 
+class CanonicalSupplyReadTest(unittest.TestCase):
+    def setUp(self) -> None:
+        self.tmp = TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.jobs_path = os.path.join(self.tmp.name, "jobs.json")
+        self.supply_path = os.path.join(self.tmp.name, "supply.json")
+        jobs_module.submit(self.jobs_path, _job(), "jk-1")
+        publish(self.supply_path, _resource(), "k1")
+        self.canonical = Path(self.supply_path).read_bytes()
+
+    def _corrupt(self, transform: object) -> None:
+        raw = self.canonical.decode("utf-8")
+        Path(self.supply_path).write_text(transform(raw), encoding="utf-8")
+
+    def test_canonical_bytes_read_fine(self) -> None:
+        self.assertEqual(get(self.supply_path, "r-1")["resource_id"], "r-1")
+        self.assertTrue(feasible(self.jobs_path, self.supply_path, "j-1", 50))
+
+    def test_non_canonical_bytes_rejected_by_every_entry(self) -> None:
+        cases = [
+            lambda text: text[:-1],                      # missing newline
+            lambda text: text + "\n",                    # extra newline
+            lambda text: text.replace("{", "{ ", 1),     # extra whitespace
+            lambda text: "{ " + text[1:],
+            lambda text: text.replace(",", ", ", 1),
+            lambda text: "\n" + text,                    # leading newline
+        ]
+        for transform in cases:
+            self._corrupt(transform)
+            with self.subTest(raw=Path(self.supply_path).read_bytes()[:20]):
+                with self.assertRaises(ValueError):
+                    get(self.supply_path, "r-1")
+                with self.assertRaises(ValueError):
+                    feasible(self.jobs_path, self.supply_path, "j-1", 50)
+                with self.assertRaises(ValueError):
+                    publish(self.supply_path, _resource(), "k2")
+
+    def test_escaped_non_ascii_rejected(self) -> None:
+        publish(self.supply_path, _resource(resource_id="r-中"), "键")
+        raw = Path(self.supply_path).read_text(encoding="utf-8")
+        escaped = json.dumps(json.loads(raw), ensure_ascii=True) + "\n"
+        self.assertIn("\\u", escaped)
+        Path(self.supply_path).write_text(escaped, encoding="utf-8")
+        with self.assertRaises(ValueError):
+            get(self.supply_path, "r-中")
+
+    def test_out_of_order_fields_rejected(self) -> None:
+        data = json.loads(self.canonical)
+        record = data["history"]["r-1"][0]
+        reordered = {name: record[name]
+                     for name in ("version", "resource_id", "region",
+                                  "capacity", "start", "end", "unit_cost",
+                                  "carbon_intensity", "residency")}
+        data["history"]["r-1"][0] = reordered
+        Path(self.supply_path).write_text(
+            json.dumps(data, ensure_ascii=False,
+                       separators=(",", ":")) + "\n", encoding="utf-8")
+        with self.assertRaises(ValueError):
+            get(self.supply_path, "r-1")
+
+    def test_out_of_order_section_keys_rejected(self) -> None:
+        publish(self.supply_path, _resource("r-2"), "k2")
+        data = json.loads(Path(self.supply_path).read_bytes())
+        history = data["history"]
+        data["history"] = {name: history[name]
+                           for name in sorted(history, reverse=True)}
+        Path(self.supply_path).write_text(
+            json.dumps(data, ensure_ascii=False,
+                       separators=(",", ":")) + "\n", encoding="utf-8")
+        with self.assertRaises(ValueError):
+            get(self.supply_path, "r-1")
+
+
 if __name__ == "__main__":
     unittest.main()
