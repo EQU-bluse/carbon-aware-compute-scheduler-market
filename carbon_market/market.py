@@ -14,9 +14,10 @@ from typing import Any, Callable, Iterator
 from . import jobs as _jobs
 from . import offers as _offers
 from . import resources as _resources
+from . import signals as _signals
 from ._jsonio import finite_loads, strict_loads
 
-__all__ = ["match", "clear"]
+__all__ = ["match", "clear", "clear_live"]
 
 _VERSION = 1
 _MATCH_FIELDS = ("job_id", "resource_id")
@@ -253,6 +254,9 @@ _TRADE_FIELDS = ("job_id", "at", "work", "resource_id", "version",
                  "candidates", "selection")
 _SELECTION_FIELDS = ("resource_id", "version")
 _EVENT_FIELDS = ("key", "job_id", "at", "resource_id", "version")
+_STATIC_CANDIDATE_FIELDS = ("resource", "total_cost", "total_carbon")
+_LIVE_CANDIDATE_FIELDS = ("resource", "signal", "total_cost",
+                          "total_carbon")
 _LOCK_SUFFIX = ".lock"
 
 
@@ -279,18 +283,64 @@ def _check_sorted_keys(mapping: dict[Any, Any], label: str) -> None:
         raise ValueError(f"{label} must be ordered by key code point")
 
 
+def _validate_signal(
+    signal: object,
+    resource_region: str,
+    at: int,
+    signal_history: dict[str, list[dict[str, Any]]] | None,
+) -> tuple[dict[str, Any], int, int]:
+    # A live candidate freezes the exact published signal record --
+    # region, version and all observations -- so a later signal publish
+    # cannot change what an earlier trade was decided under. When the
+    # signal snapshot is available (clear_live), the frozen record must
+    # be the exact published version. Readers that never take the signal
+    # file (static clear, dispatch, execution) still validate the frozen
+    # record structurally and arithmetically: its totals, window and
+    # budget relations are all decidable from the frozen bytes, so their
+    # invariants hold without resolving the reference.
+    if not isinstance(signal, dict) \
+            or set(signal.keys()) != set(_signals._RECORD_FIELDS):
+        raise ValueError("trade candidate signal has invalid fields")
+    region = signal["region"]
+    version = signal["version"]
+    if region != resource_region:
+        raise ValueError("trade candidate signal must cover the resource "
+                         "region")
+    if not _is_plain_int(version) or version < 1:
+        raise ValueError("candidate signal version must be a positive "
+                         "integer")
+    # Validate a copy: _check_values normalizes the mix order in place,
+    # and the parsed record's raw key order must be left untouched so the
+    # ledger's canonical-byte comparison still rejects a reordered mix.
+    signal_copy = dict(signal)
+    signal_copy["mix"] = dict(signal["mix"])
+    _signals._check_values(signal_copy)
+    if signal_history is not None:
+        records = signal_history.get(region)
+        if records is None or version > len(records) \
+                or dict(signal) != records[version - 1]:
+            raise ValueError("trade candidate signal must reference a "
+                             "published signal version")
+    if not (signal["observed"] <= at <= signal["expires"]):
+        raise ValueError("trade candidate signal must be valid at the "
+                         "trade's evaluation moment")
+    return signal["unit_cost"], signal["carbon_intensity"]
+
+
 def _validate_candidate(
     entry: object,
     work: int,
     at: int,
     job: dict[str, Any],
     history: dict[str, list[dict[str, Any]]],
+    signal_history: dict[str, list[dict[str, Any]]] | None,
     seen: set[str],
-) -> tuple[int, int, str]:
+) -> tuple[bool, int, int, str]:
     if not isinstance(entry, dict) \
-            or set(entry.keys()) != {"resource", "total_cost",
-                                     "total_carbon"}:
+            or set(entry.keys()) not in (set(_STATIC_CANDIDATE_FIELDS),
+                                         set(_LIVE_CANDIDATE_FIELDS)):
         raise ValueError("trade candidate has invalid fields")
+    live = "signal" in entry
     resource = entry["resource"]
     if not isinstance(resource, dict) \
             or set(resource.keys()) != set(_resources._RECORD_FIELDS):
@@ -316,13 +366,21 @@ def _validate_candidate(
     if not (resource["start"] <= at <= resource["end"]):
         raise ValueError("trade candidate must be valid at the trade's "
                          "evaluation moment")
+    # Static trades price on the version's baked-in figures; live trades
+    # price on the frozen signal for the same region.
+    if live:
+        unit_cost, carbon_intensity = _validate_signal(
+            entry["signal"], resource["region"], at, signal_history)
+    else:
+        unit_cost = resource["unit_cost"]
+        carbon_intensity = resource["carbon_intensity"]
     total_cost = entry["total_cost"]
     total_carbon = entry["total_carbon"]
     if not _is_plain_int(total_cost) or total_cost < 0 \
-            or total_cost != work * resource["unit_cost"]:
+            or total_cost != work * unit_cost:
         raise ValueError("trade candidate total_cost is invalid")
     if not _is_plain_int(total_carbon) or total_carbon < 0 \
-            or total_carbon != work * resource["carbon_intensity"]:
+            or total_carbon != work * carbon_intensity:
         raise ValueError("trade candidate total_carbon is invalid")
     # The snapshot must still describe the same feasibility the trade
     # was decided under; published versions and accepted jobs never
@@ -336,13 +394,14 @@ def _validate_candidate(
     if total_cost > job["max_cost"] \
             or total_carbon > job["carbon_cap"]:
         raise ValueError("trade candidate exceeds a job budget")
-    return resource["carbon_intensity"], resource["unit_cost"], resource_id
+    return live, carbon_intensity, unit_cost, resource_id
 
 
 def _validate_trade(
     record: object,
     accepted: dict[str, dict[str, Any]],
     history: dict[str, list[dict[str, Any]]],
+    signal_history: dict[str, list[dict[str, Any]]] | None,
 ) -> dict[str, Any]:
     if not isinstance(record, dict) \
             or set(record.keys()) != set(_TRADE_FIELDS):
@@ -388,12 +447,26 @@ def _validate_trade(
     candidates: list[dict[str, Any]] = []
     last_rank: tuple[int, int, str] | None = None
     seen: set[str] = set()
+    live_kind: bool | None = None
     for entry_raw in candidates_raw:
-        rank = _validate_candidate(entry_raw, work, at, job, history, seen)
+        live, carbon, unit_cost, candidate_id = _validate_candidate(
+            entry_raw, work, at, job, history, signal_history, seen)
+        # A trade is decided under exactly one pricing mode: static
+        # trades never carry a signal, live trades always carry one.
+        if live_kind is None:
+            live_kind = live
+        elif live != live_kind:
+            raise ValueError("trade candidates must all be static or all "
+                             "live")
+        rank = (carbon, unit_cost, candidate_id)
         if last_rank is not None and rank < last_rank:
             raise ValueError("trade candidates must be ordered by carbon "
                              "intensity, unit cost and resource id")
         last_rank = rank
+        # Keep the parsed key order: the candidate's resource must equal
+        # the supply record field-for-field and its frozen signal -- when
+        # resolvable -- the published signal, while the ledger's
+        # canonical-byte comparison rejects any reordered nested object.
         candidates.append(copy.deepcopy(entry_raw))
 
     # The first ordered candidate is the unique winner.
@@ -416,6 +489,7 @@ def _validate_clear_ledger(
     data: object,
     accepted: dict[str, dict[str, Any]],
     history: dict[str, list[dict[str, Any]]],
+    signal_history: dict[str, list[dict[str, Any]]] | None = None,
 ) -> tuple[dict[str, dict[str, Any]], dict[str, dict[str, Any]]]:
     if not isinstance(data, dict) or set(data.keys()) != set(_CLEAR_ROOT_FIELDS):
         raise ValueError("clearing ledger root must be an object with keys "
@@ -439,7 +513,7 @@ def _validate_clear_ledger(
     for job_id, record in trades_raw.items():
         if not isinstance(job_id, str) or not job_id:
             raise ValueError("trade job ids must be non-empty strings")
-        trade = _validate_trade(record, accepted, history)
+        trade = _validate_trade(record, accepted, history, signal_history)
         if trade["job_id"] != job_id:
             raise ValueError("trade record id does not match its key")
         trades[job_id] = trade
@@ -553,6 +627,7 @@ def _load_clear_ledger(
     realpath: str,
     accepted: dict[str, dict[str, Any]],
     history: dict[str, list[dict[str, Any]]],
+    signal_history: dict[str, list[dict[str, Any]]] | None = None,
 ) -> tuple[dict[str, dict[str, Any]], dict[str, dict[str, Any]], bytes | None]:
     try:
         with open(realpath, "rb") as handle:
@@ -570,7 +645,8 @@ def _load_clear_ledger(
     except ValueError as exc:
         raise ValueError(
             f"clearing ledger {realpath!r} is not valid JSON") from exc
-    trades, idempotency = _validate_clear_ledger(data, accepted, history)
+    trades, idempotency = _validate_clear_ledger(
+        data, accepted, history, signal_history)
     # As for the supply file, the ledger is accepted only in canonical
     # compact form with a single trailing newline.
     if raw != _canonical_clear_bytes(trades, idempotency):
@@ -791,6 +867,207 @@ def clear(
             candidates.sort(key=lambda entry: (
                 entry["resource"]["carbon_intensity"],
                 entry["resource"]["unit_cost"],
+                entry["resource"]["resource_id"]))
+            if not candidates:
+                raise LookupError("no remaining feasible resource for job")
+
+            winner = candidates[0]["resource"]
+            resource_id = winner["resource_id"]
+            version = winner["version"]
+            trade: dict[str, Any] = {
+                "job_id": job_id,
+                "at": at,
+                "work": work,
+                "resource_id": resource_id,
+                "version": version,
+                "candidates": candidates,
+                "selection": {"resource_id": resource_id,
+                              "version": version},
+            }
+            trades[job_id] = trade
+            idempotency[key] = {"job_id": job_id, "at": at}
+            _commit_clear(ledger_real,
+                          _canonical_clear_bytes(trades, idempotency),
+                          old_bytes)
+            return copy.deepcopy(trade), True
+
+
+def clear_live(
+    jobs: str,
+    supply: str,
+    signals: str,
+    ledger: str,
+    job_id: str,
+    key: str,
+    at: int,
+) -> tuple[dict[str, object], bool]:
+    """Clear one accepted job against live signals idempotently.
+
+    This is the dynamic counterpart of :func:`clear` and shares the same
+    clearing ledger: trades booked by either call deduct capacity from
+    the same resource versions. ``jobs``, ``supply``, ``signals`` and
+    ``ledger`` paths, ``job_id`` and ``key`` must be non-empty strings
+    and ``at`` a non-boolean non-negative integer evaluation moment;
+    the four paths must also resolve to distinct real locations. Any
+    violation raises ``ValueError`` before a business file is read.
+
+    The acceptance file, the supply file and the live signal file are
+    read as one snapshot under their shared locks together with the
+    ledger's exclusive lock, all four taken in resolved real-path
+    order. Only each resource's highest supply version valid at ``at``
+    is considered, and region, residency, budget, deadline and capacity
+    already booked against the exact resource version -- by a static
+    :func:`clear` trade or a live one -- follow :func:`clear`. The unit
+    cost and carbon intensity, however, come from the resource region's
+    latest signal observed no later than ``at`` and not expired at it;
+    a region without such a signal contributes no candidate. Remaining
+    candidates are ordered by signal carbon intensity, signal unit cost
+    and resource id; the first one is the unique winner.
+
+    Returns ``(trade, created)``. The trade freezes the ordered
+    candidates with both their immutable resource version and their
+    immutable signal version (the selection keeps resource id and
+    version), so a signal published afterwards can never change an
+    earlier trade. A missing ledger is created only on the first trade;
+    the trade, the idempotency binding (key to job id and evaluation
+    moment) and the audit event are committed together in one synced
+    atomic write, byte-compatible with :func:`clear`. Replaying the same
+    key with the same job and evaluation moment returns the stored
+    trade -- static or live -- with ``False`` without reselecting,
+    appending an event or rewriting a byte. The same key with a changed
+    request, or a job already traded under another idempotency key,
+    raises ``ValueError`` and leaves the ledger byte-for-byte untouched.
+
+    An unknown job raises ``KeyError`` and no remaining feasible
+    resource raises ``LookupError``; neither creates the ledger. Missing
+    input files or a missing ledger parent raise ``FileNotFoundError``
+    without leaving a ledger or temporary fragment. Invalid structure,
+    references, ordering or non-canonical bytes raise ``ValueError``;
+    other locking, read/write or sync failures raise ``OSError``. The
+    existing :func:`match`, :func:`clear`, the ``resources`` interfaces,
+    serving and HTTP behavior are unchanged.
+    """
+    for value in (jobs, supply, signals, ledger, job_id, key):
+        if not isinstance(value, str) or not value:
+            raise ValueError("jobs, supply, signals, ledger, job_id and key "
+                             "must be non-empty strings")
+    if not _is_plain_int(at) or at < 0:
+        raise ValueError("at must be a non-boolean non-negative integer")
+
+    job_real = os.path.realpath(jobs)
+    supply_real = os.path.realpath(supply)
+    signal_real = os.path.realpath(signals)
+    ledger_real = os.path.realpath(ledger)
+    if len({job_real, supply_real, signal_real, ledger_real}) != 4:
+        raise ValueError("jobs, supply, signals and ledger paths must be "
+                         "distinct real paths")
+
+    store = _get_store(ledger)
+    with store.lock:
+        # Locks are taken in one resolved-real-path order shared by
+        # every caller, so concurrent clears can never deadlock; the
+        # ledger lock is exclusive, all three snapshots shared.
+        with contextlib.ExitStack() as stack:
+            for locked in sorted({job_real, supply_real, signal_real,
+                                  ledger_real}):
+                stack.enter_context(
+                    _clear_lock(locked, shared=(locked != ledger_real)))
+
+            accepted, job_map, job_events, job_raw = \
+                _jobs._load_submit_file(job_real)
+            if job_raw is None:
+                raise FileNotFoundError(
+                    f"acceptance file {job_real!r} does not exist")
+            if job_raw != _jobs._serialize_submit_file(
+                    accepted, job_map, job_events):
+                raise ValueError(
+                    f"acceptance file {job_real!r} is not in canonical "
+                    "compact form")
+            history, _supply_map, _supply_events, supply_raw = \
+                _resources._load_file(supply_real)
+            if supply_raw is None:
+                raise FileNotFoundError(
+                    f"supply file {supply_real!r} does not exist")
+            signal_history, _signal_map, _signal_events, signal_raw = \
+                _signals._load_file(signal_real)
+            if signal_raw is None:
+                raise FileNotFoundError(
+                    f"signal file {signal_real!r} does not exist")
+            # The ledger now accepts live trades, each freezing the
+            # signal version it priced on; static trades validate as
+            # before.
+            trades, idempotency, old_bytes = _load_clear_ledger(
+                ledger_real, accepted, history, signal_history)
+
+            job = accepted.get(job_id)
+            if job is None:
+                raise KeyError(job_id)
+
+            binding = idempotency.get(key)
+            if binding is not None:
+                if binding["job_id"] != job_id or binding["at"] != at:
+                    raise ValueError("idempotency key was already used with "
+                                     "a different request")
+                return copy.deepcopy(trades[job_id]), False
+            if job_id in trades:
+                raise ValueError("job is already traded under another "
+                                 "idempotency key")
+
+            # Capacity already sold per exact resource version counts
+            # every trade -- static and live alike -- so either clearing
+            # path can oversell, and bookings never cross versions.
+            sold: dict[tuple[str, int], int] = {}
+            for trade in trades.values():
+                slot = (trade["resource_id"], trade["version"])
+                sold[slot] = sold.get(slot, 0) + trade["work"]
+
+            work = job["work"]
+            regions = set(job["regions"])
+            residency = set(job["residency"])
+            candidates: list[dict[str, Any]] = []
+            for records in history.values():
+                active: dict[str, Any] | None = None
+                for record in records:
+                    if record["start"] <= at <= record["end"]:
+                        active = record
+                if active is None:
+                    continue
+                if active["region"] not in regions:
+                    continue
+                remaining = active["capacity"] - sold.get(
+                    (active["resource_id"], active["version"]), 0)
+                if remaining < work:
+                    continue
+                if not residency <= set(active["residency"]):
+                    continue
+                if active["end"] < job["deadline"]:
+                    continue
+                # Latest unexpired observation for the region; without
+                # one the resource is simply not a live candidate.
+                signal = None
+                for signal_record in signal_history.get(active["region"], ()):
+                    if signal_record["observed"] <= at \
+                            <= signal_record["expires"]:
+                        signal = signal_record
+                if signal is None:
+                    continue
+                total_cost = work * signal["unit_cost"]
+                total_carbon = work * signal["carbon_intensity"]
+                if total_cost > job["max_cost"] \
+                        or total_carbon > job["carbon_cap"]:
+                    continue
+                signal_copy = dict(signal)
+                signal_copy["mix"] = dict(signal["mix"])
+                candidates.append({
+                    "resource": dict(active),
+                    "signal": signal_copy,
+                    "total_cost": total_cost,
+                    "total_carbon": total_carbon,
+                })
+
+            candidates.sort(key=lambda entry: (
+                entry["signal"]["carbon_intensity"],
+                entry["signal"]["unit_cost"],
                 entry["resource"]["resource_id"]))
             if not candidates:
                 raise LookupError("no remaining feasible resource for job")
