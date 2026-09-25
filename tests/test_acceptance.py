@@ -1,13 +1,15 @@
 """Acceptance ledger of verified checkpoint/proof bundles.
 
 Covers ``carbon_market.acceptance``: the first submission's
-pending-then-verify sequence with content-addressed evidence, the
-active/quarantined replay rules, the same-key different-bundle conflict
-retention, the pending resume after an interrupted verification, the
-ledger's compact on-disk format and validation, the read-only ``get``
-and ``search`` queries, and the error mapping (ValueError,
-FileNotFoundError, OSError). Also covers the ``verify_bundle`` success
-result now carrying the actual etag.
+pending-record, evidence, then verification sequence with
+content-addressed evidence, the actual (recomputed) record and
+conflict tags, the active/quarantined replay rules, the same-key
+different-bundle conflict retention, the pending resume after an
+interrupted verification or evidence write, the ledger's compact
+on-disk format and validation, the read-only ``get`` and ``search``
+queries, and the error mapping (ValueError, FileNotFoundError,
+OSError). Also covers the ``verify_bundle`` success result now
+carrying the actual etag.
 """
 
 from __future__ import annotations
@@ -181,6 +183,29 @@ class SubmitTest(_Fixture):
         record, created = self._submit()
         self.assertIs(created, False)
 
+    def test_evidence_failure_leaves_pending_and_resumes(self) -> None:
+        self._record("a")
+        self._export()
+        # The pending record commits before the evidence write, so an
+        # evidence failure still leaves the submission recorded.
+        with mock.patch.object(acceptance, "_save_evidence",
+                               side_effect=OSError("injected")):
+            with self.assertRaises(OSError):
+                self._submit()
+        record = acceptance.get(self.ledger_dir, "k1")
+        self.assertEqual(record["state"], "pending")
+        self.assertIsNone(record["error"])
+        self.assertFalse(os.path.exists(
+            os.path.join(self.ledger_dir, "checkpoints")))
+        # The retry resumes from the stored pending record, re-stores
+        # the evidence and completes; it is not a fresh first submit.
+        record, created = self._submit()
+        self.assertIs(created, True)
+        self.assertEqual(record["state"], "active")
+        self.assertTrue(os.path.exists(os.path.join(
+            self.ledger_dir, "checkpoints",
+            record["checkpoint_digest"] + ".json")))
+
     def test_format_failure_quarantines_then_raises(self) -> None:
         self._record("a")
         self._export()
@@ -207,7 +232,9 @@ class SubmitTest(_Fixture):
         record = acceptance.get(self.ledger_dir, "k1")
         self.assertEqual(record["state"], "quarantined")
         self.assertEqual(record["error"], "BundleMismatchError")
-        self.assertEqual(record["etag"], wrong_tag)
+        # The record carries the actual tag recomputed from the
+        # checkpoint bytes, never the claimed value.
+        self.assertEqual(record["etag"], self._etag())
 
     def test_quarantined_replay_reraises_without_writing(self) -> None:
         self._record("a")
@@ -270,10 +297,19 @@ class SubmitTest(_Fixture):
         wrong_tag = '"' + "0" * 64 + '"'
         with self.assertRaises(audit_proof.BundleMismatchError):
             self._submit(etag=wrong_tag)
+        # The identical bundle -- whatever tag the call claims -- is a
+        # quarantined replay, not a conflict.
+        with self.assertRaises(audit_proof.BundleMismatchError):
+            self._submit()
+        # A genuinely different bundle under the same key conflicts.
+        self._record("b")
+        self._export()
         with self.assertRaises(ValueError):
-            self._submit()  # same key, the valid bundle: a conflict
+            self._submit()
         record = acceptance.get(self.ledger_dir, "k1")
         self.assertEqual(record["state"], "quarantined")
+        conflict = self._ledger()["conflicts"][0]
+        self.assertEqual(conflict["etag"], self._etag())
 
     def test_distinct_keys_share_the_ledger(self) -> None:
         self._record("a")

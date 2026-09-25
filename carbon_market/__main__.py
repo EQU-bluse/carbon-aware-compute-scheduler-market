@@ -45,6 +45,10 @@ def parser() -> argparse.ArgumentParser:
         "--checkpoint", action=_Once,
         help="proof checkpoint file to expose at GET /audit/proof, "
              "requires --audit")
+    server.add_argument(
+        "--acceptance", action=_Once,
+        help="acceptance ledger directory to expose at GET /acceptance, "
+             "requires --audit and --auth")
     bundle = subcommands.add_parser(
         "verify-bundle",
         help="verify a downloaded checkpoint/proof pair offline")
@@ -123,11 +127,16 @@ def main() -> None:
         # or a repeated option is a usage error and exits with
         # argparse's status 2. --checkpoint only ever accompanies
         # --audit: alone, empty or repeated it is a usage error too.
+        # --acceptance only ever accompanies --audit with the
+        # multi-token --auth method: alone, empty, repeated or paired
+        # with the single --token it is a usage error as well.
         if args.audit is None:
             if args.token is not None or args.auth is not None \
-                    or args.checkpoint is not None:
+                    or args.checkpoint is not None \
+                    or args.acceptance is not None:
                 command.error(
-                    "--token, --auth and --checkpoint require --audit")
+                    "--token, --auth, --checkpoint and --acceptance "
+                    "require --audit")
         else:
             if not args.audit:
                 command.error("--audit must be non-empty")
@@ -140,6 +149,11 @@ def main() -> None:
                 command.error("--auth must be non-empty")
             if args.checkpoint is not None and not args.checkpoint:
                 command.error("--checkpoint must be non-empty")
+            if args.acceptance is not None:
+                if not args.acceptance:
+                    command.error("--acceptance must be non-empty")
+                if args.auth is None:
+                    command.error("--acceptance requires --auth")
         if args.auth:
             # The whole configuration is validated before the port is
             # bound; any failure is a usage error with status 2.
@@ -148,7 +162,8 @@ def main() -> None:
             except (OSError, ValueError) as exc:
                 command.error(f"invalid --auth file: {exc}")
         serve(args.host, args.port, audit_path=args.audit, token=args.token,
-              auth=args.auth, checkpoint=args.checkpoint)
+              auth=args.auth, checkpoint=args.checkpoint,
+              acceptance=args.acceptance)
     elif args.command == "verify-bundle":
         _verify_bundle(args)
 

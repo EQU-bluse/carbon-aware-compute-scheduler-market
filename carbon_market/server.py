@@ -7,7 +7,7 @@ import urllib.parse
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
-from . import audit, audit_proof, auth
+from . import acceptance, audit, audit_proof, auth
 
 # Query parameters GET /audit accepts; anything else is an invalid request.
 _AUDIT_PARAMS = ("cursor", "limit", "op", "stage", "key")
@@ -15,6 +15,11 @@ _AUDIT_PARAMS = ("cursor", "limit", "op", "stage", "key")
 # the optional closing flag; the audit and checkpoint paths are fixed by
 # the server and can never be selected through the query.
 _PROOF_PARAMS = ("generation", "final") + _AUDIT_PARAMS
+# GET /acceptance takes the exact-match key or the pagination filters;
+# the ledger directory is fixed by the server and can never be selected
+# through the query.
+_ACCEPTANCE_PARAMS = ("key", "cursor", "limit", "state")
+_ACCEPTANCE_STATES = ("pending", "active", "quarantined")
 _OPS = ("copy", "restore")
 _STAGES = ("成功", "校验", "执行", "同步", "回滚")
 _MAX_LIMIT = 1000
@@ -81,6 +86,26 @@ def _parse_proof_params(query: str) -> dict[str, str]:
     return params
 
 
+def _parse_acceptance_params(query: str) -> dict[str, str]:
+    params = _parse_query(query, _ACCEPTANCE_PARAMS)
+    if "key" in params:
+        # The exact-match query stands alone: no cursor, page size or
+        # state filter may accompany it.
+        if len(params) != 1:
+            raise ValueError("key must not be combined with cursor, "
+                             "limit or state")
+        return params
+    limit = params.get("limit")
+    if limit is not None:
+        if not all("0" <= char <= "9" for char in limit):
+            raise ValueError("limit must be a decimal integer")
+        if not 1 <= int(limit) <= _MAX_LIMIT:
+            raise ValueError("limit must be between 1 and 1000")
+    if "state" in params and params["state"] not in _ACCEPTANCE_STATES:
+        raise ValueError("state must be pending, active or quarantined")
+    return params
+
+
 class Handler(BaseHTTPRequestHandler):
     server_version = "CarbonMarket/0.1"
 
@@ -102,6 +127,10 @@ class Handler(BaseHTTPRequestHandler):
             # The endpoint takes no parameters: the snapshot is always
             # the one checkpoint file fixed at startup.
             self._checkpoint(query)
+            return
+        if path == "/acceptance" \
+                and getattr(self.server, "acceptance_dir", None) is not None:
+            self._acceptance(query)
             return
         self._json(HTTPStatus.NOT_FOUND, {"error": "not_found"})
 
@@ -280,6 +309,76 @@ class Handler(BaseHTTPRequestHandler):
             else:
                 self._raw(HTTPStatus.OK, body, etag)
 
+    def _acceptance(self, query: str) -> None:
+        authorized, record = self._authorize()
+        if not authorized:
+            return
+
+        try:
+            params = _parse_acceptance_params(query)
+        except ValueError:
+            self._json(HTTPStatus.BAD_REQUEST, {"error": "invalid_request"})
+            return
+
+        ledger_dir = getattr(self.server, "acceptance_dir")
+        if "key" in params:
+            # The exact-match query reads one record: operation and
+            # stage scopes must be unrestricted, and the key scope must
+            # be unrestricted or name the requested key explicitly. The
+            # decision precedes any ledger access.
+            if record is not None and (
+                    record.ops is not None or record.stages is not None
+                    or (record.keys is not None
+                        and params["key"] not in record.keys)):
+                self._json(HTTPStatus.FORBIDDEN, {"error": "forbidden"})
+                return
+            try:
+                result = acceptance.get(ledger_dir, params["key"])
+            except KeyError:
+                self._json(HTTPStatus.NOT_FOUND,
+                           {"error": "acceptance_key_not_found"})
+            except FileNotFoundError:
+                self._json(HTTPStatus.NOT_FOUND,
+                           {"error": "acceptance_not_found"})
+            except ValueError:
+                self._json(HTTPStatus.CONFLICT,
+                           {"error": "acceptance_invalid"})
+            except OSError:
+                self._json(HTTPStatus.SERVICE_UNAVAILABLE,
+                           {"error": "acceptance_unavailable"})
+            else:
+                self._json(HTTPStatus.OK, result)
+            return
+
+        # The paginated query scans the ledger: every scope axis must be
+        # unrestricted, again decided before the ledger is ever opened.
+        if record is not None and (record.ops is not None
+                                   or record.stages is not None
+                                   or record.keys is not None):
+            self._json(HTTPStatus.FORBIDDEN, {"error": "forbidden"})
+            return
+
+        kwargs: dict[str, object] = {}
+        for name in ("cursor", "state"):
+            if name in params:
+                kwargs[name] = params[name]
+        if "limit" in params:
+            kwargs["limit"] = int(params["limit"])
+
+        try:
+            result = acceptance.search(ledger_dir, **kwargs)
+        except FileNotFoundError:
+            # Never leak the configured path or the system message.
+            self._json(HTTPStatus.NOT_FOUND,
+                       {"error": "acceptance_not_found"})
+        except ValueError:
+            self._json(HTTPStatus.CONFLICT, {"error": "acceptance_invalid"})
+        except OSError:
+            self._json(HTTPStatus.SERVICE_UNAVAILABLE,
+                       {"error": "acceptance_unavailable"})
+        else:
+            self._json(HTTPStatus.OK, result)
+
     def _raw(self, status: HTTPStatus, body: bytes, etag: str) -> None:
         # The snapshot bytes are served verbatim -- the original UTF-8
         # written by the exporter, with its field order intact -- and the
@@ -309,10 +408,12 @@ class Handler(BaseHTTPRequestHandler):
 
 def serve(host: str, port: int, audit_path: str | None = None,
           token: str | None = None, auth: str | None = None,
-          checkpoint: str | None = None) -> None:
+          checkpoint: str | None = None,
+          acceptance: str | None = None) -> None:
     with ThreadingHTTPServer((host, port), Handler) as server:
         server.audit_path = audit_path  # type: ignore[attr-defined]
         server.audit_token = token  # type: ignore[attr-defined]
         server.audit_auth = auth  # type: ignore[attr-defined]
         server.audit_checkpoint = checkpoint  # type: ignore[attr-defined]
+        server.acceptance_dir = acceptance  # type: ignore[attr-defined]
         server.serve_forever()
