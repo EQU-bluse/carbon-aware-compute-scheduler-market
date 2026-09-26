@@ -202,19 +202,22 @@ class RebalanceMigrateTest(unittest.TestCase):
                          ["version", "intents", "idempotency", "audit"])
         self._start()
         data = json.loads(Path(self.ledger).read_text(encoding="utf-8"))
-        self.assertEqual(data["version"], 2)
+        self.assertEqual(data["version"], 3)
         self.assertEqual(list(data.keys()),
-                         ["version", "intents", "plans", "idempotency",
-                          "audit"])
-        self.assertEqual(data["intents"], before["intents"])
+                         ["version", "intents", "plans", "settled",
+                          "idempotency", "audit"])
+        self.assertEqual(data["intents"]["j-1"]["r1"],
+                         before["intents"]["j-1"])
         self.assertEqual(list(data["plans"]), ["j-1"])
+        self.assertEqual(list(data["plans"]["j-1"]), ["m1"])
+        self.assertEqual(data["settled"], {})
         self.assertEqual(set(data["idempotency"]), {"r1", "m1"})
         self.assertEqual(set(data["audit"]), {"r1", "m1"})
         event = data["audit"]["m1"]
         self.assertEqual(event["request"],
                          {"action": "start", "job_id": "j-1",
                           "owner": "owner-1", "lease_end": 90, "at": 45})
-        self.assertEqual(event["result"], data["plans"]["j-1"])
+        self.assertEqual(event["result"], data["plans"]["j-1"]["m1"])
 
     def test_start_replay_returns_current_snapshot(self) -> None:
         self._prepare_reserved()
@@ -602,10 +605,13 @@ class RebalanceMigrateTest(unittest.TestCase):
         self.assertNotIn(b"\\u", raw)
         data = json.loads(raw.decode("utf-8"))
         self.assertEqual(list(data.keys()),
-                         ["version", "intents", "plans", "idempotency",
-                          "audit"])
+                         ["version", "intents", "plans", "settled",
+                          "idempotency", "audit"])
         self.assertEqual(list(data["intents"]), sorted(data["intents"]))
         self.assertEqual(list(data["plans"]), sorted(data["plans"]))
+        for job_plans in data["plans"].values():
+            self.assertEqual(list(job_plans), sorted(job_plans))
+        self.assertEqual(list(data["settled"]), sorted(data["settled"]))
         self.assertEqual(list(data["idempotency"]),
                          sorted(data["idempotency"]))
         self.assertEqual(list(data["audit"]), sorted(data["audit"]))
@@ -616,7 +622,7 @@ class RebalanceMigrateTest(unittest.TestCase):
         self._migrate()
         good = Path(self.ledger).read_bytes()
         data = json.loads(good.decode("utf-8"))
-        data["plans"]["j-1"]["state"] = "active"
+        data["plans"]["j-1"]["m1"]["state"] = "active"
         Path(self.ledger).write_text(
             json.dumps(data, ensure_ascii=False, separators=(",", ":"))
             + "\n", encoding="utf-8")
@@ -624,7 +630,7 @@ class RebalanceMigrateTest(unittest.TestCase):
             self._recover(at=95)
         Path(self.ledger).write_bytes(good)
         data = json.loads(good.decode("utf-8"))
-        data["plans"]["j-1"]["steps"][0]["receipt"] = "forged"
+        data["plans"]["j-1"]["m1"]["steps"][0]["receipt"] = "forged"
         Path(self.ledger).write_text(
             json.dumps(data, ensure_ascii=False, separators=(",", ":"))
             + "\n", encoding="utf-8")

@@ -194,11 +194,25 @@ class RebalanceSettleTest(unittest.TestCase):
         self._prepare_reserved()
         self._finish_migrated()
         snapshots = {path: Path(path).read_bytes()
-                     for path in self._args()}
+                     for path in self._args() if path != self.ledger}
+        intent_before = json.loads(
+            Path(self.ledger).read_text(encoding="utf-8"))
         self._settle()
         for path, raw in snapshots.items():
             self.assertEqual(Path(path).read_bytes(), raw,
                              f"{path} must not be rewritten")
+        # The intent ledger gains only the settlement marker; its plans,
+        # receipts, idempotency bindings and audit events are preserved.
+        intent_after = json.loads(
+            Path(self.ledger).read_text(encoding="utf-8"))
+        self.assertEqual(intent_after["plans"], intent_before["plans"])
+        self.assertEqual(intent_after["intents"], intent_before["intents"])
+        self.assertEqual(intent_after["idempotency"],
+                         intent_before["idempotency"])
+        self.assertEqual(intent_after["audit"], intent_before["audit"])
+        self.assertEqual(intent_after["settled"],
+                         {"m1": {"job_id": "j-1", "key": "s1",
+                                 "state": "settled"}})
         self.assertTrue(Path(self.settlements).exists())
 
     def test_settle_creates_canonical_ledger(self) -> None:
