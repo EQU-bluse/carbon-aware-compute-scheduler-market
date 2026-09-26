@@ -88,18 +88,57 @@ still ``reserved`` -- neither finished nor occupied -- and freezes the
 intent's source and target resource versions into a migration plan
 bound to an owner and a lease end that must not pass the job deadline;
 the target capacity stays exclusively held by the intent for the whole
-execution. :func:`record` lets the current owner, inside the lease,
-commit the non-empty receipt of the next pending step -- ``copy`` then
-``switch``, never skipped or repeated: a successful ``switch`` turns
-the plan ``migrated`` and releases the source capacity the trade froze,
-while any ``failed`` step turns it ``failed`` and releases the target
-reservation immediately, leaving the source trade occupancy untouched.
+execution. :func:`record` lets the current owner, inside the lease, commit the
+non-empty receipt of the next pending step -- ``copy`` then
+``switch``, never skipped or repeated, and its moment never earlier
+than the plan start or the previous receipt: a successful ``switch``
+turns the plan ``migrated`` and releases the source capacity the trade
+froze, while any ``failed`` step turns it ``failed`` and releases the
+target reservation immediately, leaving the source trade occupancy
+untouched.
 :func:`recover` turns an active plan whose lease has strictly expired
 into ``interrupted``, preserving every receipt and releasing the target
 reservation. Capacity accounting recognizes the plan states: a
 ``reserved`` or ``active`` intent occupies both source and target, a
 ``migrated`` one only the target, a ``failed`` or ``interrupted`` one
 only the source.
+
+Claim, receipts and expiry recovery still leave no durable terminal
+occupancy for the rest of the system to dispatch and execute against.
+:func:`settle` closes that gap by writing the terminal plan into an
+independent settlement ledger read from the same eight snapshot layers
+(the acceptance, supply, signal, clearing, dispatch, execution, advice
+and intent files) under their shared locks together with the
+settlement ledger's exclusive lock, all nine taken in resolved
+real-path order. A ``migrated`` plan confirms the target version as
+the job's current occupancy and leaves the source as the previous
+generation's binding; a ``failed`` or ``interrupted`` plan forms a
+compensation that keeps the current occupancy on the source version,
+the target reservation already released by the plan lifecycle. Each
+record freezes the continuous running generation, the source terminal
+state, the before and after selections, the settlement moment, the
+state and its audit association (the intent and plan idempotency
+keys). A first request first durably writes a ``pending`` record with
+its idempotency binding and only then advances the same record to
+``active`` or ``compensated`` together with its audit event; a crash
+between the two commits is resumed by a same-key same-request re-entry,
+which finishes the second phase, still returns ``True`` and never
+repeats a committed occupancy, generation or audit action, while only
+an already completed replay returns the stored record with ``False``
+without writing a byte. A plan still ``active`` refuses settlement
+with ``PermissionError`` and creates no record; an unknown job, intent
+or plan raises ``KeyError``; the same key with a changed request,
+another key settling the same plan, a broken generation chain,
+contradictory terminal evidence or snapshot references, or a
+settlement moment earlier than the terminal evidence moment raise
+``ValueError`` -- though a legal late recovery past the job deadline
+still settles, because its evidence is recorded history.
+:func:`current` is the read-only companion: over the same nine files
+locked shared, it returns the job's latest resource binding -- the
+target of the latest ``active`` settlement, the source of the latest
+``compensated`` one and the trade's frozen version without a
+settlement -- without ever writing; an unknown job raises
+``KeyError``.
 
 The three calls share one idempotency key space with :func:`apply`:
 replaying a key with the same request returns the current plan snapshot
@@ -136,7 +175,8 @@ from . import resources as _resources
 from . import signals as _signals
 from ._jsonio import finite_loads
 
-__all__ = ["evaluate", "apply", "start", "record", "recover"]
+__all__ = ["evaluate", "apply", "start", "record", "recover", "settle",
+           "current"]
 
 _VERSION = 1
 _ROOT_FIELDS = ("version", "records", "audit")
@@ -1125,6 +1165,11 @@ def _validate_plan(
         if receipt_at > lease_end:
             raise ValueError("step receipt must be recorded inside the "
                              "lease")
+        if receipt_at < at:
+            raise ValueError("step receipt must not precede the plan "
+                             "start moment")
+        if steps and receipt_at < steps[-1]["at"]:
+            raise ValueError("step receipts must be in moment order")
         steps.append({"step": receipt_raw["step"], "result": result,
                       "receipt": token, "at": receipt_at})
 
@@ -2113,7 +2158,9 @@ def record(
     ``ValueError``, a different owner raises ``PermissionError`` and a
     moment past the lease end raises ``TimeoutError``. Steps advance
     only on success and are never skipped or repeated: a receipt naming
-    anything but the next pending step raises ``ValueError``. A
+    anything but the next pending step raises ``ValueError``, and so
+    does a receipt whose moment precedes the plan start or the previous
+    receipt. A
     successful ``switch`` turns the plan ``migrated`` and releases the
     source capacity the trade froze; any ``failed`` step turns the plan
     ``failed`` and releases the target reservation immediately, leaving
@@ -2195,6 +2242,12 @@ def record(
                 raise PermissionError("record requires the plan owner")
             if at > plan["lease_end"]:
                 raise TimeoutError("the lease has already expired")
+            if at < plan["at"]:
+                raise ValueError("a receipt cannot precede the plan start "
+                                 "moment")
+            if plan["steps"] and at < plan["steps"][-1]["at"]:
+                raise ValueError("a receipt cannot precede the previous "
+                                 "receipt moment")
             if step != _PLAN_STEPS[len(plan["steps"])]:
                 raise ValueError("step is not the plan's next pending "
                                  "step")
@@ -2329,3 +2382,753 @@ def recover(
                                                  _INTENT_VERSION_V2),
                          old_bytes, prefix=".rebalance-recover-")
             return copy.deepcopy(plan), True
+
+# ---------------------------------------------------------------------------
+# Terminal settlement: durable occupancy of finished migration plans
+# ---------------------------------------------------------------------------
+#
+# Claim, receipts and expiry recovery all live in the intent ledger, but
+# none of them is a readable terminal occupancy the rest of the system
+# can dispatch and execute against: a ``migrated`` plan and a
+# ``failed``/``interrupted`` one look alike to any reader that does not
+# replay the receipts. The settlement ledger is that terminal state:
+# :func:`settle` reads the same snapshot the migration lifecycle uses
+# -- jobs, supply, signals, trades, dispatch, execution, advice and the
+# intent ledger -- and writes one durable settlement per terminal plan
+# into an independent ledger, while :func:`current` answers a read-only
+# lookup of the job's latest resource binding.
+
+_SETTLE_VERSION = 1
+_SETTLE_ROOT_FIELDS = ("version", "settlements", "idempotency", "audit")
+_SETTLE_REQUEST_FIELDS = ("job_id", "plan_key", "at")
+_SETTLE_FIELDS = ("job_id", "plan_key", "generation", "source_state",
+                  "before", "after", "at", "state", "audit")
+_SETTLE_AUDIT_FIELDS = ("intent", "plan")
+_SETTLE_STATES = ("pending", "active", "compensated")
+_SETTLE_OUTCOMES = ("migrated", "failed", "interrupted")
+_SETTLE_TERMINAL_STATES = ("active", "compensated")
+
+
+def _intent_action_key(
+    idempotency: dict[str, dict[str, Any]],
+    job_id: str,
+    action: str,
+) -> str | None:
+    # The intent ledger validation already guarantees that each plan is
+    # started exactly once and recovered at most once, so the action key
+    # for a job is unique when it exists.
+    found: str | None = None
+    for bound_key, request in idempotency.items():
+        if request.get("action") == action \
+                and request.get("job_id") == job_id:
+            found = bound_key
+    return found
+
+
+def _intent_binding_key(
+    idempotency: dict[str, dict[str, Any]],
+    job_id: str,
+) -> str | None:
+    # The apply binding is the one idempotency entry without an action.
+    for bound_key, request in idempotency.items():
+        if "action" not in request and request.get("job_id") == job_id:
+            return bound_key
+    return None
+
+
+def _validate_settle_request(request: object) -> dict[str, Any]:
+    if not isinstance(request, dict) \
+            or set(request.keys()) != set(_SETTLE_REQUEST_FIELDS):
+        raise ValueError("settle request has invalid fields")
+    job_id = request["job_id"]
+    plan_key = request["plan_key"]
+    at = request["at"]
+    if not isinstance(job_id, str) or not job_id:
+        raise ValueError("settle request job_id must be a non-empty string")
+    if not isinstance(plan_key, str) or not plan_key:
+        raise ValueError("settle request plan_key must be a non-empty "
+                         "string")
+    if not _is_plain_int(at) or at < 0:
+        raise ValueError("settle request at must be a non-boolean "
+                         "non-negative integer")
+    return {"job_id": job_id, "plan_key": plan_key, "at": at}
+
+
+def _settlement_evidence_at(
+    source_state: str,
+    plan: dict[str, Any],
+    intent_idempotency: dict[str, dict[str, Any]],
+) -> int:
+    # The terminal evidence moment is history, never the settle clock:
+    # the successful ``switch`` receipt for a migrated plan, the failed
+    # receipt for a failed one, and the recorded recovery moment for an
+    # interrupted one. A plan whose receipts do not imply its claimed
+    # terminal state is contradictory evidence.
+    job_id = plan["job_id"]
+    if source_state == "migrated":
+        steps = plan["steps"]
+        if len(steps) != len(_PLAN_STEPS) \
+                or any(receipt["result"] != "succeeded" for receipt in steps):
+            raise ValueError("terminal evidence does not match a migrated "
+                             "plan")
+        return steps[-1]["at"]
+    if source_state == "failed":
+        steps = plan["steps"]
+        if not steps or steps[-1]["result"] != "failed":
+            raise ValueError("terminal evidence does not match a failed "
+                             "plan")
+        return steps[-1]["at"]
+    recover_key = _intent_action_key(intent_idempotency, job_id, "recover")
+    if recover_key is None:
+        raise ValueError("an interrupted plan must reference a recorded "
+                         "recovery")
+    return intent_idempotency[recover_key]["at"]
+
+
+def _validate_settlement_record(
+    record: object,
+    accepted: dict[str, dict[str, Any]],
+    trades: dict[str, dict[str, Any]],
+    intents: dict[str, dict[str, Any]],
+    plans: dict[str, dict[str, Any]],
+    intent_idempotency: dict[str, dict[str, Any]],
+) -> dict[str, Any]:
+    if not isinstance(record, dict) \
+            or set(record.keys()) != set(_SETTLE_FIELDS):
+        raise ValueError("settlement record has invalid fields")
+    job_id = record["job_id"]
+    if not isinstance(job_id, str) or not job_id:
+        raise ValueError("settlement job_id must be a non-empty string")
+    plan_key = record["plan_key"]
+    if not isinstance(plan_key, str) or not plan_key:
+        raise ValueError("settlement plan_key must be a non-empty string")
+    generation = record["generation"]
+    if not _is_plain_int(generation) or generation < 1:
+        raise ValueError("settlement generation must be a positive "
+                         "integer")
+    source_state = record["source_state"]
+    if source_state not in _SETTLE_OUTCOMES:
+        raise ValueError("settlement source_state is invalid")
+    before = _validate_selection(record["before"], "settlement before "
+                                 "selection")
+    after = _validate_selection(record["after"], "settlement after "
+                                "selection")
+    if before == after:
+        raise ValueError("a settlement must move between resource versions")
+    at = record["at"]
+    if not _is_plain_int(at) or at < 0:
+        raise ValueError("settlement at must be a non-boolean non-negative "
+                         "integer")
+    state = record["state"]
+    if state not in _SETTLE_STATES:
+        raise ValueError("settlement state is invalid")
+    if state == "active" and source_state != "migrated":
+        raise ValueError("an active settlement must confirm a migrated "
+                         "plan")
+    if state == "compensated" \
+            and source_state not in ("failed", "interrupted"):
+        raise ValueError("a compensated settlement must follow a failed or "
+                         "interrupted plan")
+    audit_ref = record["audit"]
+    if not isinstance(audit_ref, dict) \
+            or set(audit_ref.keys()) != set(_SETTLE_AUDIT_FIELDS):
+        raise ValueError("settlement audit reference has invalid fields")
+    if not isinstance(audit_ref["intent"], str) or not audit_ref["intent"] \
+            or not isinstance(audit_ref["plan"], str) or not audit_ref["plan"]:
+        raise ValueError("settlement audit references must be non-empty "
+                         "strings")
+
+    # Every frozen reference is revalidated against the snapshot layers:
+    # the accepted job, the recorded trade, the recorded intent and the
+    # recorded plan, with the start/intent idempotency keys the plan was
+    # actually committed under.
+    if job_id not in accepted:
+        raise ValueError("settlement record must reference an accepted job")
+    trade = trades.get(job_id)
+    if trade is None:
+        raise ValueError("settlement record must reference a recorded trade")
+    intent = intents.get(job_id)
+    if intent is None:
+        raise ValueError("settlement record must reference a recorded "
+                         "intent")
+    plan = plans.get(job_id)
+    if plan is None:
+        raise ValueError("settlement record must reference a recorded plan")
+    start_key = _intent_action_key(intent_idempotency, job_id, "start")
+    if start_key is None or start_key != plan_key \
+            or audit_ref["plan"] != start_key:
+        raise ValueError("settlement plan key must reference the plan's "
+                         "start request")
+    intent_key = _intent_binding_key(intent_idempotency, job_id)
+    if intent_key is None or audit_ref["intent"] != intent_key:
+        raise ValueError("settlement intent key must reference the "
+                         "intent's reservation request")
+    if plan["source"] != intent["source"] \
+            or plan["target"] != intent["target"]:
+        raise ValueError("settlement plan selections must match its intent")
+    if before != plan["source"]:
+        raise ValueError("settlement before selection must match the plan "
+                         "source")
+    if after != plan["target"]:
+        raise ValueError("settlement after selection must match the plan "
+                         "target")
+    if plan["state"] != source_state:
+        raise ValueError("settlement source_state must match the plan "
+                         "state")
+    evidence_at = _settlement_evidence_at(
+        source_state, plan, intent_idempotency)
+    if at < evidence_at:
+        raise ValueError("settlement moment must not precede the terminal "
+                         "evidence moment")
+
+    return {
+        "job_id": job_id,
+        "plan_key": plan_key,
+        "generation": generation,
+        "source_state": source_state,
+        "before": before,
+        "after": after,
+        "at": at,
+        "state": state,
+        "audit": {"intent": audit_ref["intent"], "plan": audit_ref["plan"]},
+    }
+
+
+def _validate_settlement_ledger(
+    data: object,
+    accepted: dict[str, dict[str, Any]],
+    trades: dict[str, dict[str, Any]],
+    intents: dict[str, dict[str, Any]],
+    plans: dict[str, dict[str, Any]],
+    intent_idempotency: dict[str, dict[str, Any]],
+) -> tuple[dict[str, dict[str, Any]], dict[str, dict[str, Any]],
+           dict[str, dict[str, Any]]]:
+    if not isinstance(data, dict) or set(data.keys()) != set(_SETTLE_ROOT_FIELDS):
+        raise ValueError("settlement ledger root must be an object with "
+                         "keys version, settlements, idempotency and audit")
+    version = data["version"]
+    if not _is_plain_int(version) or version != _SETTLE_VERSION:
+        raise ValueError("unsupported settlement ledger version")
+
+    settlements_raw = data["settlements"]
+    idempotency_raw = data["idempotency"]
+    audit_raw = data["audit"]
+    if not isinstance(settlements_raw, dict) \
+            or not isinstance(idempotency_raw, dict) \
+            or not isinstance(audit_raw, dict):
+        raise ValueError("settlements, idempotency and audit must be "
+                         "objects")
+    _check_sorted_keys(settlements_raw, "settlements")
+    _check_sorted_keys(idempotency_raw, "idempotency")
+    _check_sorted_keys(audit_raw, "audit")
+
+    settlements: dict[str, dict[str, Any]] = {}
+    for key, record_raw in settlements_raw.items():
+        if not isinstance(key, str) or not key:
+            raise ValueError("idempotency keys must be non-empty strings")
+        settlements[key] = _validate_settlement_record(
+            record_raw, accepted, trades, intents, plans,
+            intent_idempotency)
+
+    requests: dict[str, dict[str, Any]] = {}
+    for key, request_raw in idempotency_raw.items():
+        if not isinstance(key, str) or not key:
+            raise ValueError("idempotency keys must be non-empty strings")
+        request = _validate_settle_request(request_raw)
+        if key not in settlements:
+            raise ValueError("idempotency entry must reference a recorded "
+                             "settlement")
+        record = settlements[key]
+        if request["job_id"] != record["job_id"] \
+                or request["plan_key"] != record["plan_key"] \
+                or request["at"] != record["at"]:
+            raise ValueError("idempotency entry does not match its "
+                             "settlement")
+        requests[key] = request
+
+    events: dict[str, dict[str, Any]] = {}
+    for key, event_raw in audit_raw.items():
+        if not isinstance(key, str) or not key:
+            raise ValueError("audit keys must be non-empty strings")
+        if not isinstance(event_raw, dict) \
+                or set(event_raw.keys()) != set(_EVENT_FIELDS):
+            raise ValueError("settlement audit event has invalid fields")
+        if event_raw["key"] != key or not isinstance(event_raw["key"], str):
+            raise ValueError("audit event key does not match its map key")
+        request = _validate_settle_request(event_raw["request"])
+        result = _validate_settlement_record(
+            event_raw["result"], accepted, trades, intents, plans,
+            intent_idempotency)
+        if request != requests.get(key):
+            raise ValueError("audit event does not match its idempotency "
+                             "entry")
+        if result != settlements[key]:
+            raise ValueError("audit event result does not match its "
+                             "settlement")
+        if result["state"] not in _SETTLE_TERMINAL_STATES:
+            raise ValueError("an audit event may only confirm a terminal "
+                             "settlement")
+        events[key] = {"key": key, "request": request, "result": result}
+
+    # Every binding describes one settlement and vice versa; a pending
+    # settlement (a crash between the durable pending write and the
+    # phase-two commit) is exactly a binding without an audit event yet.
+    if set(requests) != set(settlements):
+        raise ValueError("settlement bindings and records do not match")
+    terminal = {key for key, record in settlements.items()
+                if record["state"] in _SETTLE_TERMINAL_STATES}
+    if set(events) != terminal:
+        raise ValueError("settlement audit events must match the terminal "
+                         "settlements")
+
+    # Per job the generations form one continuous running chain: 1, 2,
+    # ... with no gaps or repeats, each plan settled at most once, the
+    # first generation rooted at the trade, and every later one rooted
+    # at the occupancy the previous generation actually left behind --
+    # the target after a migration, the unchanged source after a
+    # compensation. A pending generation stays unconfirmed; a later
+    # generation may only extend one that is already terminal.
+    chains: dict[str, list[dict[str, Any]]] = {}
+    for record in settlements.values():
+        chains.setdefault(record["job_id"], []).append(record)
+    for job_id, chain in chains.items():
+        ordered = sorted(chain, key=lambda item: item["generation"])
+        generations = [item["generation"] for item in ordered]
+        if generations != list(range(1, len(ordered) + 1)):
+            raise ValueError("settlement generations must be continuous "
+                             "for a job")
+        plan_keys = [item["plan_key"] for item in ordered]
+        if len(set(plan_keys)) != len(plan_keys):
+            raise ValueError("a plan may be settled under at most one "
+                             "idempotency key")
+        for item in ordered[:-1]:
+            if item["state"] == "pending":
+                raise ValueError("a later settlement cannot extend a "
+                                 "generation still pending")
+        trade = trades[job_id]
+        trade_selection = {"resource_id": trade["resource_id"],
+                           "version": trade["version"]}
+        if ordered[0]["before"] != trade_selection:
+            raise ValueError("the first settlement generation must be "
+                             "rooted at the trade")
+        for index in range(1, len(ordered)):
+            previous = ordered[index - 1]
+            occupancy = (previous["after"] if previous["state"] == "active"
+                         else previous["before"])
+            if ordered[index]["before"] != occupancy:
+                raise ValueError("settlement generations must chain the "
+                                 "same running resource binding")
+
+    return settlements, requests, events
+
+
+def _settlement_canonical_bytes(
+    settlements: dict[str, dict[str, Any]],
+    requests: dict[str, dict[str, Any]],
+    events: dict[str, dict[str, Any]],
+) -> bytes:
+    # Compact UTF-8 JSON, non-ASCII written through, sections in their
+    # fixed field order and settlements/bindings/events keyed by
+    # idempotency key in code-point order, terminated by exactly one
+    # newline.
+    payload = {
+        "version": _SETTLE_VERSION,
+        "settlements": {key: settlements[key] for key in sorted(settlements)},
+        "idempotency": {key: requests[key] for key in sorted(requests)},
+        "audit": {key: events[key] for key in sorted(events)},
+    }
+    text = json.dumps(payload, ensure_ascii=False, separators=(",", ":"),
+                      allow_nan=False) + "\n"
+    return text.encode("utf-8")
+
+
+def _load_settlement_ledger(
+    realpath: str,
+    accepted: dict[str, dict[str, Any]],
+    trades: dict[str, dict[str, Any]],
+    intents: dict[str, dict[str, Any]],
+    plans: dict[str, dict[str, Any]],
+    intent_idempotency: dict[str, dict[str, Any]],
+) -> tuple[dict[str, dict[str, Any]], dict[str, dict[str, Any]],
+           dict[str, dict[str, Any]], bytes | None]:
+    try:
+        with open(realpath, "rb") as handle:
+            raw = handle.read()
+    except FileNotFoundError:
+        return {}, {}, {}, None
+    try:
+        text = raw.decode("utf-8")
+    except UnicodeDecodeError as exc:
+        raise ValueError(
+            f"settlement ledger {realpath!r} is not valid UTF-8") from exc
+    try:
+        # Negative-zero and non-finite literals are format errors.
+        data = finite_loads(text)
+    except ValueError as exc:
+        raise ValueError(
+            f"settlement ledger {realpath!r} is not valid JSON") from exc
+    settlements, requests, events = _validate_settlement_ledger(
+        data, accepted, trades, intents, plans, intent_idempotency)
+    # As for the other ledgers, the ledger is accepted only in canonical
+    # compact form with a single trailing newline.
+    if raw != _settlement_canonical_bytes(settlements, requests, events):
+        raise ValueError(
+            f"settlement ledger {realpath!r} is not in canonical compact "
+            "form")
+    return settlements, requests, events, raw
+
+
+def _validate_settle_paths(
+    jobs: str,
+    supply: str,
+    signals: str,
+    trades: str,
+    dispatch: str,
+    execution: str,
+    advice: str,
+    intents: str,
+    ledger: str,
+) -> tuple[str, str, str, str, str, str, str, str, str]:
+    for value in (jobs, supply, signals, trades, dispatch, execution,
+                  advice, intents, ledger):
+        if not isinstance(value, str) or not value:
+            raise ValueError("the nine paths must be non-empty strings")
+    reals = tuple(os.path.realpath(path)
+                  for path in (jobs, supply, signals, trades, dispatch,
+                               execution, advice, intents, ledger))
+    if len(set(reals)) != 9:
+        raise ValueError("the nine paths must be distinct real paths")
+    return reals  # type: ignore[return-value]
+
+
+def _verify_pending_settlement(
+    record: dict[str, Any],
+    accepted: dict[str, dict[str, Any]],
+    trades: dict[str, dict[str, Any]],
+    intents: dict[str, dict[str, Any]],
+    plans: dict[str, dict[str, Any]],
+    intent_idempotency: dict[str, dict[str, Any]],
+) -> str:
+    # Re-derive the terminal outcome from the current snapshot so a
+    # crash re-entry never advances against contradictory evidence;
+    # returns the terminal settlement state.
+    _validate_settlement_record(
+        record, accepted, trades, intents, plans, intent_idempotency)
+    if record["source_state"] == "migrated":
+        return "active"
+    return "compensated"
+
+
+def settle(
+    jobs: str,
+    supply: str,
+    signals: str,
+    trades: str,
+    dispatch: str,
+    execution: str,
+    advice: str,
+    intents: str,
+    ledger: str,
+    job_id: str,
+    plan_key: str,
+    key: str,
+    at: int,
+) -> tuple[dict[str, object], bool]:
+    """Settle one terminal migration plan as durable resource occupancy.
+
+    The nine paths -- the seven snapshot layers, the intent ledger and
+    the independent settlement ledger -- must be non-empty strings
+    resolving to nine distinct real locations; ``job_id``, ``plan_key``
+    and ``key`` must be non-empty strings and ``at`` a non-boolean
+    non-negative integer settlement moment. Any violation raises
+    ``ValueError`` before a business file is read.
+
+    All nine files are read as one snapshot: the eight inputs under
+    shared locks and the settlement ledger under its exclusive lock,
+    all taken in resolved real-path order. ``plan_key`` names the
+    idempotency key the plan was started under in the intent ledger.
+    The plan must be terminal: a plan still ``active`` raises
+    ``PermissionError`` and creates no record. An unknown job, intent
+    or plan raises ``KeyError``.
+
+    A ``migrated`` plan confirms the target version as the job's
+    current occupancy (state ``active``) and the source version becomes
+    the previous generation's binding; a ``failed`` or ``interrupted``
+    plan forms a compensation (state ``compensated``): the current
+    occupancy stays the source version and the target reservation is
+    already released by the plan lifecycle. The record freezes the
+    continuous running generation, the source terminal state, the
+    before and after resource selections, the settlement moment, the
+    state and the audit association (the intent and plan idempotency
+    keys). Contradictory terminal evidence, a settlement moment earlier
+    than the terminal evidence moment, the same key with a changed
+    request, the same plan settled under another key, a broken
+    generation chain or contradictory snapshot references raise
+    ``ValueError``; a legal late recovery past the job deadline still
+    settles, because the evidence is recorded history.
+
+    A first request first durably writes a ``pending`` settlement and
+    its idempotency binding, and only then advances the record to
+    ``active`` or ``compensated`` together with its audit event; each
+    phase is one synced atomic commit. If the process dies after the
+    pending write, re-entering with the same key and request resumes
+    the unfinished phase, still returns ``True`` on completion and
+    never repeats a committed occupancy, generation or audit action.
+    Only an already completed same-key same-request replay returns the
+    current record with ``False`` without writing a byte.
+
+    Missing input files or the ledger parent raise
+    ``FileNotFoundError``; invalid arguments or ledger bytes raise
+    ``ValueError``; other locking or I/O failures raise ``OSError``.
+    """
+    for value in (job_id, plan_key, key):
+        if not isinstance(value, str) or not value:
+            raise ValueError("job_id, plan_key and key must be non-empty "
+                             "strings")
+    if not _is_plain_int(at) or at < 0:
+        raise ValueError("at must be a non-boolean non-negative integer")
+    (job_real, supply_real, signal_real, trades_real, dispatch_real,
+     execution_real, advice_real, intents_real, ledger_real) = \
+        _validate_settle_paths(jobs, supply, signals, trades, dispatch,
+                               execution, advice, intents, ledger)
+
+    store = _get_store(ledger)
+    with store.lock:
+        with contextlib.ExitStack() as stack:
+            for locked in sorted({job_real, supply_real, signal_real,
+                                  trades_real, dispatch_real,
+                                  execution_real, advice_real, intents_real,
+                                  ledger_real}):
+                stack.enter_context(
+                    _lock(locked, shared=(locked != ledger_real)))
+
+            (accepted, history, signal_history, cleared, _decisions,
+             _exec_plans, advice_records) = _load_snapshot_layers(
+                job_real, supply_real, signal_real, trades_real,
+                dispatch_real, execution_real, advice_real)
+            intent_map, plans, intent_idempotency, _intent_events, \
+                _intent_version, intent_raw = _load_intent_ledger(
+                    intents_real, accepted, cleared, history,
+                    signal_history, advice_records)
+            # The intent ledger is a required snapshot input here, not
+            # the mutable ledger: a job without a recorded migration
+            # intent surfaces as KeyError, while the missing file itself
+            # is FileNotFoundError.
+            if intent_raw is None:
+                raise FileNotFoundError(
+                    f"intent ledger {intents_real!r} does not exist")
+            settlements, requests, events, old_bytes = \
+                _load_settlement_ledger(
+                    ledger_real, accepted, cleared, intent_map, plans,
+                    intent_idempotency)
+
+            request = {"job_id": job_id, "plan_key": plan_key, "at": at}
+            existing = settlements.get(key)
+            if existing is not None:
+                if requests[key] != request:
+                    raise ValueError("idempotency key was already used "
+                                     "with a different request")
+                if existing["state"] in _SETTLE_TERMINAL_STATES:
+                    # A completed same-key same-request replay returns
+                    # the stored record without rewriting a byte.
+                    return copy.deepcopy(existing), False
+
+            if existing is None:
+                job = accepted.get(job_id)
+                if job is None:
+                    raise KeyError(job_id)
+                intent = intent_map.get(job_id)
+                if intent is None:
+                    raise KeyError(job_id)
+                plan = plans.get(job_id)
+                start_key = _intent_action_key(
+                    intent_idempotency, job_id, "start")
+                if plan is None or start_key is None \
+                        or start_key != plan_key:
+                    raise KeyError(plan_key)
+                if plan["state"] == "active":
+                    raise PermissionError("the migration plan is still "
+                                          "active")
+                source_state = plan["state"]
+                evidence_at = _settlement_evidence_at(
+                    source_state, plan, intent_idempotency)
+                if at < evidence_at:
+                    raise ValueError("settlement moment precedes the "
+                                     "terminal evidence moment")
+                before = copy.deepcopy(plan["source"])
+                after = copy.deepcopy(plan["target"])
+
+                # The same plan may never be settled twice, not even
+                # under another key; generations chain per job from the
+                # trade through every previous *terminal* settlement,
+                # linking at the occupancy each generation actually left
+                # behind: the target after a migration, the unchanged
+                # source after a compensation.
+                prior = sorted(
+                    (item for item in settlements.values()
+                     if item["job_id"] == job_id),
+                    key=lambda item: item["generation"])
+                for item in prior:
+                    if item["plan_key"] == plan_key:
+                        raise ValueError("the plan was already settled "
+                                         "under another idempotency key")
+                    if item["state"] == "pending":
+                        raise ValueError("a prior settlement generation "
+                                         "is still pending")
+                if prior:
+                    if any(item["generation"] != index + 1
+                           for index, item in enumerate(prior)):
+                        raise ValueError("the settlement generation chain "
+                                         "is broken")
+                    generation = prior[-1]["generation"] + 1
+                    occupancy = (prior[-1]["after"]
+                                 if prior[-1]["state"] == "active"
+                                 else prior[-1]["before"])
+                    if before != occupancy:
+                        raise ValueError("the plan source does not chain "
+                                         "from the running occupancy")
+                else:
+                    trade = cleared.get(job_id)
+                    if trade is None:
+                        raise ValueError("settlement must reference a "
+                                         "recorded trade")
+                    generation = 1
+                    if before != {"resource_id": trade["resource_id"],
+                                  "version": trade["version"]}:
+                        raise ValueError("the first settlement must be "
+                                         "rooted at the trade")
+                intent_key = _intent_binding_key(intent_idempotency, job_id)
+                # intent_key is necessarily present: the intent ledger
+                # validation binds every intent to its reservation key.
+                assert intent_key is not None
+                pending: dict[str, Any] = {
+                    "job_id": job_id,
+                    "plan_key": plan_key,
+                    "generation": generation,
+                    "source_state": source_state,
+                    "before": before,
+                    "after": after,
+                    "at": at,
+                    "state": "pending",
+                    "audit": {"intent": intent_key, "plan": start_key},
+                }
+                settlements[key] = pending
+                requests[key] = request
+                # Phase one: the pending settlement and its binding are
+                # durable before any terminal state can be observed.
+                pending_bytes = _settlement_canonical_bytes(
+                    settlements, requests, events)
+                _commit_file(ledger_real, pending_bytes, old_bytes,
+                             prefix=".rebalance-settle-pending-")
+                old_bytes = pending_bytes
+                current_record = pending
+            else:
+                # Crash re-entry: the durable pending record fixes the
+                # request, generation and selections; re-derive the
+                # outcome from the current snapshot and finish phase
+                # two without re-creating anything.
+                current_record = existing
+
+            terminal_state = _verify_pending_settlement(
+                current_record, accepted, cleared, intent_map, plans,
+                intent_idempotency)
+            terminal = dict(current_record)
+            terminal["state"] = terminal_state
+            settlements[key] = terminal
+            events[key] = {"key": key, "request": dict(request),
+                           "result": copy.deepcopy(terminal)}
+            payload = _settlement_canonical_bytes(settlements, requests,
+                                                  events)
+            # Revalidate the complete terminal document before the
+            # atomic replace, exactly as the coordination ledger does
+            # for its terminal commit.
+            _validate_settlement_ledger(
+                json.loads(payload.decode("utf-8")), accepted, cleared,
+                intent_map, plans, intent_idempotency)
+            _commit_file(ledger_real, payload, old_bytes,
+                         prefix=".rebalance-settle-")
+            return copy.deepcopy(terminal), True
+
+
+def current(
+    jobs: str,
+    supply: str,
+    signals: str,
+    trades: str,
+    dispatch: str,
+    execution: str,
+    advice: str,
+    intents: str,
+    ledger: str,
+    job_id: str,
+) -> dict[str, object]:
+    """Return the job's latest settled resource binding, read-only.
+
+    The nine paths must be non-empty strings resolving to nine
+    distinct real locations and ``job_id`` a non-empty string; any
+    violation raises ``ValueError`` before a business file is read.
+    All nine files are read under shared locks taken in resolved
+    real-path order; the call never writes.
+
+    The answer is the ``after`` selection of the latest ``active``
+    settlement and the ``before`` selection of the latest
+    ``compensated`` one -- a pending settlement has not confirmed an
+    occupancy yet and leaves the binding where it was -- and without a
+    settlement the binding is the exact version the job's trade froze.
+    An unknown job raises ``KeyError`` and a known job without a
+    recorded trade raises ``LookupError``; invalid arguments or an
+    invalid ledger raise ``ValueError``; missing input files raise
+    ``FileNotFoundError``; other locking or I/O failures raise
+    ``OSError``.
+    """
+    if not isinstance(job_id, str) or not job_id:
+        raise ValueError("job_id must be a non-empty string")
+    (job_real, supply_real, signal_real, trades_real, dispatch_real,
+     execution_real, advice_real, intents_real, ledger_real) = \
+        _validate_settle_paths(jobs, supply, signals, trades, dispatch,
+                               execution, advice, intents, ledger)
+
+    store = _get_store(ledger)
+    with store.lock:
+        with contextlib.ExitStack() as stack:
+            # A pure read: every lock, the settlement ledger included,
+            # is shared.
+            for locked in sorted({job_real, supply_real, signal_real,
+                                  trades_real, dispatch_real,
+                                  execution_real, advice_real, intents_real,
+                                  ledger_real}):
+                stack.enter_context(_lock(locked, shared=True))
+
+            (accepted, history, signal_history, cleared, _decisions,
+             _exec_plans, advice_records) = _load_snapshot_layers(
+                job_real, supply_real, signal_real, trades_real,
+                dispatch_real, execution_real, advice_real)
+            if job_id not in accepted:
+                raise KeyError(job_id)
+            trade = cleared.get(job_id)
+            if trade is None:
+                raise LookupError("job has no recorded trade")
+            intent_map, plans, intent_idempotency, _intent_events, \
+                _intent_version, intent_raw = _load_intent_ledger(
+                    intents_real, accepted, cleared, history,
+                    signal_history, advice_records)
+            if intent_raw is None:
+                raise FileNotFoundError(
+                    f"intent ledger {intents_real!r} does not exist")
+            settlements, _requests, _events, _raw = \
+                _load_settlement_ledger(
+                    ledger_real, accepted, cleared, intent_map, plans,
+                    intent_idempotency)
+
+            binding = {"resource_id": trade["resource_id"],
+                       "version": trade["version"]}
+            for record in sorted(
+                    (item for item in settlements.values()
+                     if item["job_id"] == job_id),
+                    key=lambda item: item["generation"]):
+                if record["state"] == "active":
+                    binding = record["after"]
+                elif record["state"] == "compensated":
+                    binding = record["before"]
+                # A pending settlement confirms no occupancy yet.
+            return copy.deepcopy(binding)
