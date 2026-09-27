@@ -493,5 +493,213 @@ class ServeMigrationBatchesArgumentsTest(unittest.TestCase):
             process.wait(timeout=10)
 
 
+class MigrationBatchesEventsHttpTest(unittest.TestCase):
+    """GET /migration-batches/events -- the incremental event stream."""
+
+    def setUp(self) -> None:
+        self.fx = MigrationBatchTest(
+            "test_get_returns_copy_and_unknown_key_raises")
+        self.fx.setUp()
+        self.addCleanup(self.fx.doCleanups)
+        self.coord = self.fx.paths["coord"]
+        self.config = os.path.join(self.fx.tmp.name, "auth.jsonl")
+        with open(self.config, "w", encoding="utf-8") as handle:
+            handle.write(
+                _line("full", FULL_TOKEN) + "\n"
+                + _line("key", KEY_TOKEN, keys=["aaa"]) + "\n"
+                + _line("ops", OPS_TOKEN, ops=["copy"]) + "\n"
+                + _line("stage", STAGE_TOKEN, stages=["成功"]) + "\n")
+        self.server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+        self.server.audit_path = os.path.join(self.fx.tmp.name, "audit.json")
+        self.server.audit_token = None
+        self.server.audit_auth = self.config
+        self.server.migration_batches = self.coord
+        thread = threading.Thread(target=self.server.serve_forever,
+                                  daemon=True)
+        thread.start()
+        self.addCleanup(self.server.shutdown)
+        self.addCleanup(self.server.server_close)
+        self.addCleanup(thread.join, 2)
+
+    def _get(self, path: str, headers=None):
+        connection = HTTPConnection("127.0.0.1", self.server.server_port,
+                                    timeout=2)
+        connection.request("GET", path, headers=headers or {})
+        response = connection.getresponse()
+        body = response.read()
+        connection.close()
+        return response.status, body
+
+    def _json_get(self, path: str, token: str = FULL_TOKEN):
+        status, body = self._get(path, headers={"X-Audit-Token": token})
+        return status, json.loads(body)
+
+    def _populate(self) -> None:
+        fx = self.fx
+        fx._prepare_migrate()
+        fx._run(key="aaa", owner="负责人-1", now=30)
+        fx._run(key="zzz", now=31)
+        fx._run(key="aaa", owner="负责人-1", now=32,
+                receipts={"j-1": fx._receipt(
+                    "copy", "succeeded", "复制完成", 33)})
+        fx._run(key="aaa", owner="负责人-1", now=34,
+                receipts={"j-1": fx._receipt(
+                    "switch", "succeeded", "切换完成", 35)})
+
+    def test_identity_and_param_order(self) -> None:
+        # No token: 401 even with a bogus query. Unknown token: 403.
+        self.assertEqual(self._get("/migration-batches/events?bogus=1")[0],
+                         401)
+        self.assertEqual(
+            self._json_get("/migration-batches/events?bogus=1",
+                          token="wrong")[0], 403)
+
+    def test_invalid_parameters_are_400(self) -> None:
+        self._populate()
+        for path in (
+            "/migration-batches/events?bogus=1",
+            "/migration-batches/events?cursor=",
+            "/migration-batches/events?cursor=abc",
+            "/migration-batches/events?cursor=-1",
+            "/migration-batches/events?cursor=1.5",
+            "/migration-batches/events?cursor=true",
+            "/migration-batches/events?limit=",
+            "/migration-batches/events?limit=0",
+            "/migration-batches/events?limit=1001",
+            "/migration-batches/events?key=",
+            "/migration-batches/events?job=",
+            "/migration-batches/events?key=a&key=b",
+        ):
+            with self.subTest(path=path):
+                status, body = self._json_get(path)
+                self.assertEqual((status, body),
+                                 (400, {"error": "invalid_request"}))
+
+    def test_scope_rules(self) -> None:
+        self._populate()
+        # A batch-key filter: ops/stage scopes forbid, a matching key
+        # scope passes, a mismatching one forbids.
+        self.assertEqual(
+            self._json_get("/migration-batches/events?key=zzz",
+                           token=OPS_TOKEN)[0], 403)
+        self.assertEqual(
+            self._json_get("/migration-batches/events?key=zzz",
+                           token=STAGE_TOKEN)[0], 403)
+        self.assertEqual(
+            self._json_get("/migration-batches/events?key=aaa",
+                           token=KEY_TOKEN)[0], 200)
+        self.assertEqual(
+            self._json_get("/migration-batches/events?key=zzz",
+                           token=KEY_TOKEN)[0], 403)
+        # Cross-batch reads (no key, even with only a job filter) need
+        # all three scopes unrestricted.
+        self.assertEqual(
+            self._json_get("/migration-batches/events",
+                           token=KEY_TOKEN)[0], 403)
+        self.assertEqual(
+            self._json_get("/migration-batches/events?job=j-1",
+                           token=KEY_TOKEN)[0], 403)
+        self.assertEqual(
+            self._json_get("/migration-batches/events")[0], 200)
+
+    def test_page_shape_filters_and_compact_body(self) -> None:
+        self._populate()
+        status, body = self._json_get("/migration-batches/events?limit=4")
+        self.assertEqual(status, 200)
+        self.assertEqual(list(body), ["events", "next"])
+        self.assertEqual([e["position"] for e in body["events"]],
+                         [0, 1, 2, 3])
+        self.assertEqual(body["next"], 3)
+        first = body["events"][0]
+        self.assertEqual(
+            list(first),
+            ["position", "at", "key", "job_id", "category", "batch"])
+        self.assertEqual(
+            (first["key"], first["job_id"], first["category"]),
+            ("aaa", None, "created"))
+        # Exclusive decimal cursor resumes by position.
+        status, body = self._json_get(
+            "/migration-batches/events?cursor=3&limit=4")
+        self.assertEqual(status, 200)
+        self.assertEqual([e["position"] for e in body["events"]][:2],
+                         [4, 5])
+        # key + job filters combine by AND and never cost page capacity.
+        status, body = self._json_get(
+            "/migration-batches/events?key=aaa&job=j-1")
+        self.assertEqual(status, 200)
+        self.assertTrue(body["events"])
+        self.assertTrue(all(e["key"] == "aaa" and e["job_id"] == "j-1"
+                            for e in body["events"]))
+        self.assertIsNone(body["next"])
+        # A cursor beyond the stream is an empty final page.
+        status, body = self._json_get("/migration-batches/events?cursor=99")
+        self.assertEqual(body, {"events": [], "next": None})
+        # The wire body is the lock-holding serializer's compact bytes
+        # with non-ASCII written through and no trailing newline.
+        status, raw = self._get(
+            "/migration-batches/events?key=aaa",
+            headers={"X-Audit-Token": FULL_TOKEN})
+        self.assertEqual(status, 200)
+        self.assertEqual(
+            raw, migration_batch.events_response(self.coord, key="aaa"))
+        self.assertFalse(raw.endswith(b"\n"))
+        self.assertIn("复制完成".encode("utf-8"), raw)
+        self.assertNotIn(b"\\u", raw)
+
+    def test_missing_ledger_is_404(self) -> None:
+        missing = os.path.join(self.fx.tmp.name, "absent.json")
+        self.server.migration_batches = missing
+        self.assertEqual(
+            self._json_get("/migration-batches/events"),
+            (404, {"error": "migration_batches_not_found"}))
+
+    def test_non_canonical_ledger_is_409(self) -> None:
+        self._populate()
+        with open(self.coord, "wb") as handle:
+            handle.write(b"{broken\n")
+        self.assertEqual(
+            self._json_get("/migration-batches/events"),
+            (409, {"error": "migration_batches_invalid"}))
+
+    def test_missing_business_ledger_is_409(self) -> None:
+        self._populate()
+        os.unlink(self.fx.paths["jobs"])
+        self.assertEqual(
+            self._json_get("/migration-batches/events"),
+            (409, {"error": "migration_batches_invalid"}))
+
+    def test_baseline_ledger_reads_as_empty_stream(self) -> None:
+        self._populate()
+        good = Path(self.coord).read_bytes()
+        data = json.loads(good.decode("utf-8"))
+        del data["events"]
+        with open(self.coord, "wb") as handle:
+            handle.write(json.dumps(
+                data, ensure_ascii=False,
+                separators=(",", ":")).encode("utf-8") + b"\n")
+        status, body = self._json_get("/migration-batches/events")
+        self.assertEqual((status, body),
+                         (200, {"events": [], "next": None}))
+
+    def test_path_is_404_when_unconfigured(self) -> None:
+        server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+        try:
+            connection = HTTPConnection("127.0.0.1", server.server_port,
+                                      timeout=2)
+            connection.request("GET", "/migration-batches/events",
+                               headers={"X-Audit-Token": "anything"})
+            response = connection.getresponse()
+            self.assertEqual(response.status, 404)
+            self.assertEqual(json.loads(response.read()),
+                             {"error": "not_found"})
+            connection.close()
+        finally:
+            server.shutdown()
+            server.server_close()
+            thread.join(timeout=2)
+
+
 if __name__ == "__main__":
     unittest.main()

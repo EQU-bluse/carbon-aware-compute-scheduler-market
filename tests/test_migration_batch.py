@@ -659,8 +659,24 @@ class MigrationBatchTest(unittest.TestCase):
         self.assertIn("复制完成".encode("utf-8"), raw)
         self.assertNotIn(b"\\u", raw)
         data = json.loads(raw.decode("utf-8"))
-        self.assertEqual(list(data), ["version", "batches", "audit"])
+        self.assertEqual(list(data),
+                         ["version", "batches", "audit", "events"])
         self.assertEqual(data["version"], 1)
+        # Every durable observable change this run made is recorded in
+        # position order, each with a complete post-commit snapshot.
+        self.assertTrue(data["events"])
+        self.assertEqual([event["position"] for event in data["events"]],
+                         list(range(len(data["events"]))))
+        for event in data["events"]:
+            self.assertEqual(
+                list(event),
+                ["position", "at", "key", "job_id", "category", "batch"])
+            self.assertIn(
+                event["category"],
+                ("created", "taken_over", "item", "receipt", "completed"))
+            self.assertEqual(list(event["batch"]),
+                             ["key", "owner", "until", "status", "inputs",
+                              "items"])
         self.assertEqual(list(data["batches"]), ["bk-1"])
         self.assertEqual(list(data["batches"]["bk-1"]["items"]),
                          ["j-1", "j-z"])
@@ -770,6 +786,262 @@ class MigrationBatchTest(unittest.TestCase):
                                  "intents", "settlements")],
                 os.path.join(self.tmp.name, "nested", "coord.json"),
                 "owner", "bk", 30, 100)
+
+
+    # -- incremental progress events ----------------------------------------
+
+    def _progress(self):
+        return migration_batch.events(
+            self.paths["coord"], limit=1000)["events"]
+
+    def test_progress_records_the_full_lifecycle_in_position_order(self) \
+            -> None:
+        self._prepare_migrate()
+        self._run(now=30)
+        self._run(key="zz", now=31)
+        self._run(now=33, receipts={"j-1": self._receipt(
+            "copy", "succeeded", "复制完成", 34)})
+        self._run(now=40, receipts={"j-1": self._receipt(
+            "switch", "succeeded", "切换完成", 41)})
+        events = self._progress()
+        self.assertEqual([event["position"] for event in events],
+                         list(range(len(events))))
+        self.assertEqual([(event["key"], event["category"])
+                          for event in events], [
+            ("bk-1", "created"),
+            ("bk-1", "item"),
+            ("bk-1", "item"),
+            ("bk-1", "item"),
+            ("zz", "created"),
+            ("zz", "completed"),
+            ("bk-1", "item"),
+            ("bk-1", "receipt"),
+            ("bk-1", "item"),
+            ("bk-1", "receipt"),
+            ("bk-1", "item"),
+            ("bk-1", "item"),
+            ("bk-1", "completed"),
+        ])
+        # Batch-scoped changes carry no job id; item changes name one.
+        for event in events:
+            if event["category"] in ("created", "taken_over", "completed"):
+                self.assertIsNone(event["job_id"])
+            else:
+                self.assertEqual(event["job_id"], "j-1")
+        # Every event snapshot is the batch state right after that
+        # commit, and the closing one equals the stored batch.
+        self.assertEqual(events[0]["batch"]["status"], "pending")
+        self.assertEqual(events[0]["batch"]["items"]["j-1"]["phase"],
+                         "evaluating")
+        self.assertEqual(events[7]["category"], "receipt")
+        self.assertEqual(
+            events[7]["batch"]["items"]["j-1"]["receipts"][0]["receipt"],
+            "复制完成")
+        closing = events[-1]
+        self.assertEqual(closing["batch"]["status"], "completed")
+        self.assertEqual(closing["batch"],
+                         migration_batch.get(self.paths["coord"], "bk-1"))
+
+    def test_progress_appends_nothing_for_renewal_or_equivalent_replay(
+            self) -> None:
+        self._prepare_migrate()
+        self._run(now=30)
+        self._run(now=33, receipts={"j-1": self._receipt(
+            "copy", "succeeded", "copied", 34)})
+        count = len(self._progress())
+        # A wait inside the lease renews only the coordination lease.
+        self._run(now=35)
+        self.assertEqual(len(self._progress()), count)
+        # An equivalent receipt replay returns the progress unchanged.
+        self._run(now=36, receipts={"j-1": self._receipt(
+            "copy", "succeeded", "copied", 34)})
+        self.assertEqual(len(self._progress()), count)
+        # A completed batch replay appends nothing either.
+        self._run(now=131)
+        after_close = self._progress()
+        self.assertEqual(after_close[-1]["category"], "completed")
+        closed_count = len(after_close)
+        self._run(now=500, owner="someone-else")
+        self.assertEqual(len(self._progress()), closed_count)
+
+    def test_progress_records_takeover(self) -> None:
+        self._prepare_migrate()
+        self._run(owner="owner-a", now=30, lease=100)
+        self._run(owner="owner-b", now=131)
+        owners = [(event["category"], event["batch"]["owner"])
+                  for event in self._progress()]
+        self.assertIn(("taken_over", "owner-b"), owners)
+        takeover = next(event for event in self._progress()
+                        if event["category"] == "taken_over")
+        self.assertIsNone(takeover["job_id"])
+
+    def test_progress_pagination_filters_and_exclusive_cursor(self) -> None:
+        self._prepare_migrate()
+        self._run(now=30)
+        self._run(key="zz", now=31)
+        coord = self.paths["coord"]
+        first = migration_batch.events(coord, limit=3)
+        self.assertEqual(list(first), ["events", "next"])
+        self.assertEqual([e["position"] for e in first["events"]], [0, 1, 2])
+        self.assertEqual(first["next"], 2)
+        second = migration_batch.events(coord, cursor=2, limit=3)
+        self.assertEqual([e["position"] for e in second["events"]], [3, 4, 5])
+        self.assertIsNone(second["next"])
+        # A cursor past the end is an empty final page.
+        tail = migration_batch.events(coord, cursor=5, limit=100)
+        self.assertEqual(tail, {"events": [], "next": None})
+        # A cursor past the end is an empty final page.
+        self.assertEqual(migration_batch.events(coord, cursor=99),
+                         {"events": [], "next": None})
+        # Filters combine by AND and skipped positions never take page
+        # capacity away from the matches.
+        only_zz = migration_batch.events(coord, key="zz")
+        self.assertTrue(only_zz["events"])
+        self.assertTrue(all(e["key"] == "zz"
+                            for e in only_zz["events"]))
+        self.assertIsNone(only_zz["next"])
+        jobs = migration_batch.events(coord, job_id="j-1")
+        self.assertTrue(all(e["job_id"] == "j-1"
+                            for e in jobs["events"]))
+        neither = migration_batch.events(coord, key="zz", job_id="j-1")
+        self.assertEqual(neither, {"events": [], "next": None})
+        # Filtered pagination's next points at the page's last match,
+        # even though unmatched positions sit between pages.
+        page = migration_batch.events(coord, key="bk-1", limit=2)
+        self.assertEqual([e["position"] for e in page["events"]], [0, 1])
+        self.assertEqual(page["next"], 1)
+        resumed = migration_batch.events(
+            coord, cursor=1, key="bk-1", limit=2)
+        self.assertEqual([e["position"] for e in resumed["events"]], [2, 3])
+
+    def test_events_validates_arguments(self) -> None:
+        self._prepare_migrate()
+        coord = self.paths["coord"]
+        for bad_cursor in (True, False, -1, 1.5, "1", ""):
+            with self.subTest(bad_cursor=bad_cursor):
+                with self.assertRaises(ValueError):
+                    migration_batch.events(coord, cursor=bad_cursor)  # type: ignore[arg-type]
+        for bad_limit in (0, 1001, True, False, "10", 1.5, None):
+            with self.subTest(bad_limit=bad_limit):
+                with self.assertRaises(ValueError):
+                    migration_batch.events(coord, limit=bad_limit)  # type: ignore[arg-type]
+        for kwargs in ({"key": ""}, {"job_id": ""}, {"key": 1},
+                       {"job_id": False}):
+            with self.subTest(kwargs=kwargs):
+                with self.assertRaises(ValueError):
+                    migration_batch.events(coord, **kwargs)  # type: ignore[arg-type]
+        with self.assertRaises(ValueError):
+            migration_batch.events("")
+
+    def test_events_missing_ledger_is_file_not_found(self) -> None:
+        missing = os.path.join(self.tmp.name, "absent-coord.json")
+        with self.assertRaises(FileNotFoundError):
+            migration_batch.events(missing)
+        with self.assertRaises(FileNotFoundError):
+            migration_batch.events_response(missing)
+
+    # -- legacy (baseline) ledger compatibility ------------------------------
+
+    def _strip_events_section(self) -> None:
+        coord = self.paths["coord"]
+        data = json.loads(Path(coord).read_text("utf-8"))
+        del data["events"]
+        Path(coord).write_bytes(
+            json.dumps(data, ensure_ascii=False,
+                       separators=(",", ":")).encode("utf-8") + b"\n")
+
+    def test_baseline_ledger_stays_read_only_byte_compatible(self) -> None:
+        self._prepare_migrate()
+        self._run(now=30)
+        self._run(key="zz", now=31)
+        raw = Path(self.paths["coord"]).read_bytes()
+        self._strip_events_section()
+        baseline = Path(self.paths["coord"]).read_bytes()
+        self.assertNotEqual(raw, baseline)
+        self.assertEqual(list(json.loads(baseline)),
+                         ["version", "batches", "audit"])
+        # Read-only calls accept the baseline document unchanged and
+        # its event stream simply reads as empty.
+        self.assertEqual(
+            sorted(b["key"] for b
+                   in migration_batch.search(self.paths["coord"])["entries"]),
+            ["bk-1", "zz"])
+        self.assertEqual(migration_batch.events(self.paths["coord"]),
+                         {"events": [], "next": None})
+        self.assertEqual(Path(self.paths["coord"]).read_bytes(), baseline)
+
+    def test_first_write_to_baseline_ledger_seeds_events_from_audit(
+            self) -> None:
+        self._prepare_migrate()
+        self._run(key="old", now=30)
+        self._run(key="zz", now=31)        # closes empty while old waits
+        self._strip_events_section()
+        # A renewal of the pending baseline batch is the first write:
+        # the stream is seeded with zz's completion (audit order) and
+        # this run appends the pending batch's first new event.
+        self._run(key="old", owner="owner-1", now=35)
+        events = self._progress()
+        self.assertEqual(
+            [(e["position"], e["key"], e["category"]) for e in events],
+            [(0, "zz", "completed"), (1, "old", "created")])
+        self.assertEqual(events[0]["batch"]["status"], "completed")
+        self.assertEqual(events[0]["batch"],
+                         migration_batch.get(self.paths["coord"], "zz"))
+        self.assertEqual(list(self._coord()),
+                         ["version", "batches", "audit", "events"])
+
+    def test_first_write_to_baseline_takeover_opens_as_taken_over(self) \
+            -> None:
+        # A pending baseline batch whose first upgraded write is an
+        # expired-lease ownership takeover opens its stream with
+        # taken_over, not created.
+        self._prepare_migrate()
+        self._run(key="old", owner="owner-a", now=30, lease=100)
+        self._strip_events_section()
+        self._run(key="old", owner="owner-b", now=131)
+        events = self._progress()
+        self.assertEqual(events[0]["category"], "taken_over")
+        self.assertEqual(events[0]["batch"]["owner"], "owner-b")
+        self.assertEqual(events[-1]["category"], "completed")
+
+    def test_events_response_renders_compact_bytes(self) -> None:
+        self._prepare_migrate()
+        self._run(now=30)
+        page = migration_batch.events(self.paths["coord"])
+        body = migration_batch.events_response(self.paths["coord"])
+        self.assertEqual(
+            body, json.dumps(page, ensure_ascii=False,
+                             separators=(",", ":")).encode("utf-8"))
+        self.assertFalse(body.endswith(b"\n"))
+        self.assertNotIn(b"\\u", body)
+
+    def test_malformed_progress_section_is_value_error(self) -> None:
+        self._prepare_migrate()
+        self._run(now=30)
+        coord = self.paths["coord"]
+
+        def tamper(mutate) -> None:
+            data = json.loads(Path(coord).read_text("utf-8"))
+            mutate(data)
+            Path(coord).write_bytes(
+                json.dumps(data, ensure_ascii=False,
+                           separators=(",", ":")).encode("utf-8") + b"\n")
+
+        good = Path(coord).read_bytes()
+        cases = [
+            lambda d: d["events"].__setitem__(0, "x"),
+            lambda d: d["events"][0].__setitem__("position", 5),
+            lambda d: d["events"][0].__setitem__("category", "bogus"),
+            lambda d: d["events"][0].__setitem__("job_id", "missing-job"),
+            lambda d: d["events"][0].__setitem__("job_id", "j-1"),
+            lambda d: d["events"].pop(0),
+        ]
+        for index, mutate in enumerate(cases):
+            with self.subTest(index=index):
+                tamper(mutate)
+                with self.assertRaises(ValueError):
+                    migration_batch.events(coord)
+            Path(coord).write_bytes(good)
 
 
 if __name__ == "__main__":

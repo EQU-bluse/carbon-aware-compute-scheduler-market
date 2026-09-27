@@ -52,13 +52,32 @@ snapshot has not advanced yet, re-entry catches the original action up
 exactly once.
 
 The coordination ledger (version 1, sections ``version``, key-sorted
-``batches`` and an append-only ``audit``) is one compact UTF-8 JSON
-document with non-ASCII written through, decimal integers and exactly
-one trailing newline. The audit is appended in the real order batches
-complete and is never re-sorted by batch key; each completed batch has
-exactly one event whose snapshot equals that batch's complete state at
-completion. Ledgers written without the per-item receipts field still
-load and replay byte-for-byte; a batch a run rewrites gains that field.
+``batches``, an append-only ``audit`` and, once upgraded, an
+append-only ``events``) is one compact UTF-8 JSON document with
+non-ASCII written through, decimal integers and exactly one trailing
+newline. The audit is appended in the real order batches complete and
+is never re-sorted by batch key; each completed batch has exactly one
+event whose snapshot equals that batch's complete state at completion.
+Ledgers written without the per-item receipts field still load and
+replay byte-for-byte; a batch a run rewrites gains that field.
+
+The ``events`` section is the incremental progress stream: the
+baseline published only batch snapshots, keyed pagination and the
+per-batch completion audit, which a fresh observer could only poll.
+Every durable commit that changes an observable batch state appends
+one progress event here -- creation, lease takeover, an item's phase
+or saved error, a receipt landing in the item snapshot and batch
+closure. Each event stores, in fixed order, its strictly increasing
+zero-based position (never reused), the commit moment, the batch key,
+the related member's job id (``null`` for batch-scoped changes), the
+change category and the complete batch snapshot as it stood after
+that commit. Equivalent replays, pure lease renewals, waiting runs
+and other commits that change no observable batch state append no
+event. Ledgers written by the baseline without an ``events`` section
+stay read-only compatible and keep replaying byte-for-byte; the first
+later write upgrades the document and seeds the stream with one
+synthesized baseline ``completed`` event per existing audit entry, in
+audit order, before this run's own events.
 """
 
 from __future__ import annotations
@@ -75,10 +94,16 @@ from typing import Any, Callable, Iterator
 from . import rebalance as _rebalance
 from ._jsonio import finite_loads
 
-__all__ = ["run", "get", "search", "get_response", "search_response"]
+__all__ = ["run", "get", "search", "get_response", "search_response",
+           "events", "events_response"]
 
 _VERSION = 1
 _ROOT_FIELDS = ("version", "batches", "audit")
+# The incremental events section is appended last and optional on
+# read: baseline ledgers carry no such section and keep validating and
+# replaying byte-for-byte until the first later write upgrades them.
+_ROOT_EVENTS_FIELD = "events"
+_ROOT_FIELDS_WITH_EVENTS = _ROOT_FIELDS + (_ROOT_EVENTS_FIELD,)
 _BATCH_FIELDS = ("key", "owner", "until", "status", "inputs", "items")
 _ITEM_FIELDS = ("job_id", "plan_key", "phase", "request_key", "lease",
                 "error", "snapshot")
@@ -91,6 +116,19 @@ _ITEM_FIELDS = ("job_id", "plan_key", "phase", "request_key", "lease",
 _ITEM_RECEIPTS_FIELD = "receipts"
 _ITEM_FIELDS_WITH_RECEIPTS = _ITEM_FIELDS + (_ITEM_RECEIPTS_FIELD,)
 _EVENT_FIELDS = ("key", "at", "batch")
+# Incremental progress events. Each durable commit whose observable
+# batch state changed appends exactly one event in one of these
+# categories: batch creation, an ownership takeover after lease
+# expiry, an item phase transition or saved error, a step receipt
+# landing in the item snapshot, and batch closure. The event's fixed
+# fields are the contiguous zero-based position, the commit moment,
+# the batch key, the related member job id (null for batch-scoped
+# changes), the category and the post-commit batch snapshot.
+_PROGRESS_FIELDS = ("position", "at", "key", "job_id", "category",
+                    "batch")
+_PROGRESS_CATEGORIES = ("created", "taken_over", "item", "receipt",
+                        "completed")
+_PROGRESS_BATCH_SCOPED = ("created", "taken_over", "completed")
 # Field order of the recorded input map; the values are resolved real
 # paths, so one batch permanently names one exact business ledger set.
 _INPUT_NAMES = ("advice", "dispatch", "execution", "jobs", "ledger",
@@ -791,16 +829,169 @@ def _validate_item(
     }, legacy
 
 
+def _validate_progress_event(
+    raw: object,
+    position: int,
+    batches: dict[str, dict[str, Any]],
+    ledger_inputs: dict[str, str],
+) -> dict[str, Any]:
+    # One incremental progress event, validated intrinsically: its
+    # batch is a historical snapshot taken right after that commit, so
+    # it must carry every field in canonical order and arity but it is
+    # never re-followed into the business ledgers, whose plans and
+    # bindings have legitimately advanced since.
+    if not isinstance(raw, dict) \
+            or set(raw.keys()) != set(_PROGRESS_FIELDS):
+        raise ValueError("migration progress event has invalid fields")
+    if not _is_plain_int(raw["position"]) or raw["position"] != position:
+        raise ValueError("migration progress event positions must be "
+                         "contiguous and zero-based")
+    at = raw["at"]
+    if not _is_plain_int(at) or at < 0:
+        raise ValueError("migration progress event moment must be a "
+                         "non-boolean non-negative integer")
+    event_key = raw["key"]
+    if not isinstance(event_key, str) or not event_key:
+        raise ValueError("migration progress event key must be a "
+                         "non-empty string")
+    if event_key not in batches:
+        raise ValueError("migration progress event must reference a "
+                         "recorded batch")
+    category = raw["category"]
+    if category not in _PROGRESS_CATEGORIES:
+        raise ValueError("migration progress event category is invalid")
+    job_id = raw["job_id"]
+    if job_id is not None and (not isinstance(job_id, str) or not job_id):
+        raise ValueError("migration progress event job id must be null "
+                         "or a non-empty string")
+    if category in _PROGRESS_BATCH_SCOPED:
+        if job_id is not None:
+            raise ValueError("a batch-scoped progress event must not "
+                             "name a job id")
+    elif job_id is None:
+        raise ValueError("an item progress event must name its job id")
+    event_batch_raw = raw["batch"]
+    if not isinstance(event_batch_raw, dict) \
+            or set(event_batch_raw.keys()) != set(_BATCH_FIELDS):
+        raise ValueError("progress event batch has invalid fields")
+    if event_batch_raw["key"] != event_key:
+        raise ValueError("progress event batch key does not match its "
+                         "event key")
+    inputs = _validate_inputs(event_batch_raw["inputs"])
+    if inputs != ledger_inputs:
+        raise ValueError("progress event batch must share the ledger's "
+                         "business ledger set")
+    owner = event_batch_raw["owner"]
+    if not isinstance(owner, str) or not owner:
+        raise ValueError("progress event batch owner must be a "
+                         "non-empty string")
+    until = event_batch_raw["until"]
+    if not _is_plain_int(until) or until < 1:
+        raise ValueError("progress event batch until must be a positive "
+                         "integer")
+    status = event_batch_raw["status"]
+    if status not in _BATCH_STATUSES:
+        raise ValueError("progress event batch status is invalid")
+    if category == "completed":
+        if status != "completed":
+            raise ValueError("a completed progress event must snapshot "
+                             "a completed batch")
+    elif status != "pending":
+        raise ValueError("a non-closing progress event must snapshot a "
+                         "pending batch")
+    items_raw = event_batch_raw["items"]
+    if not isinstance(items_raw, dict):
+        raise ValueError("progress event batch items must be an object")
+    _check_sorted_keys(items_raw, "progress event items")
+    event_items: dict[str, dict[str, Any]] = {}
+    for member_key, item_raw in items_raw.items():
+        # Historical snapshots always carry the current per-item
+        # receipts arity; the stream is never written in baseline shape.
+        item, item_legacy = _validate_item(
+            item_raw, member_key, None, references=False)
+        if item_legacy:
+            raise ValueError("progress event items must carry the "
+                             "receipts field")
+        event_items[member_key] = item
+    if job_id is not None and job_id not in event_items:
+        raise ValueError("progress event job id must name one of its "
+                         "batch's items")
+    event_batch = {
+        "key": event_key,
+        "owner": owner,
+        "until": until,
+        "status": status,
+        "inputs": inputs,
+        "items": event_items,
+    }
+    if event_batch_raw != _canonical_batch(event_batch):
+        raise ValueError("progress event batch is not in canonical form")
+    return {"position": position, "at": at, "key": event_key,
+            "job_id": job_id, "category": category,
+            "batch": event_batch}
+
+
+def _validate_progress(
+    raw: object,
+    batches: dict[str, dict[str, Any]],
+    ledger_inputs: dict[str, str],
+) -> list[dict[str, Any]]:
+    if not isinstance(raw, list):
+        raise ValueError("migration progress events must be a list")
+    progress: list[dict[str, Any]] = []
+    # Per-batch sequence invariants. A batch that completed before the
+    # stream was upgraded is legitimately known only by its seeded
+    # closing event, so a creation event is not mandatory; but a
+    # creation, when present, must be the batch's first event, and a
+    # completed batch's last event must be the immutable closing
+    # snapshot equal to the batch as it now stands.
+    seen_keys: set[str] = set()
+    last_by_key: dict[str, dict[str, Any]] = {}
+    for position, event_raw in enumerate(raw):
+        event = _validate_progress_event(
+            event_raw, position, batches, ledger_inputs)
+        event_key = event["key"]
+        if event_key in seen_keys:
+            if event["category"] == "created":
+                raise ValueError("a batch creation may be recorded only "
+                                 "once")
+        elif event["category"] not in ("created", "completed",
+                                        "taken_over"):
+            raise ValueError("a batch's first progress event must be its "
+                             "creation, a takeover or its seeded "
+                             "completion")
+        seen_keys.add(event_key)
+        if last_by_key.get(event_key, {}).get("category") == "completed":
+            raise ValueError("no progress event may follow a batch's "
+                             "completion")
+        last_by_key[event_key] = event
+        progress.append(event)
+    for event_key, event in last_by_key.items():
+        batch = batches[event_key]
+        if batch["status"] == "completed":
+            if event["category"] != "completed":
+                raise ValueError("a completed batch must end its progress "
+                                 "stream with a completed event")
+            if event["batch"] != _canonical_batch(batch):
+                raise ValueError("the completed progress snapshot must "
+                                 "equal the completed batch")
+    return progress
+
+
 def _validate_ledger(
     data: object,
     snapshots: dict[frozenset[tuple[str, str]], _Snapshot],
-    default_inputs: dict[str, str] | None,
+    default_inputs: dict[str, str] | None = None,
     require_references: bool = True,
 ) -> tuple[dict[str, dict[str, Any]], list[dict[str, Any]],
-           dict[str, str], set[str]]:
-    if not isinstance(data, dict) or set(data.keys()) != set(_ROOT_FIELDS):
+           list[dict[str, Any]], dict[str, str], set[str], bool]:
+    if not isinstance(data, dict) \
+            or set(data.keys()) not in (set(_ROOT_FIELDS),
+                                        set(_ROOT_FIELDS_WITH_EVENTS)):
         raise ValueError("migration coordination ledger root must be an "
-                         "object with keys version, batches and audit")
+                         "object with version, batches, audit and "
+                         "optionally events")
+    document_legacy = _ROOT_EVENTS_FIELD not in data
     if not _is_plain_int(data["version"]) or data["version"] != _VERSION:
         raise ValueError("unsupported migration coordination ledger "
                          "version")
@@ -926,7 +1117,20 @@ def _validate_ledger(
             raise ValueError("a migration coordination ledger must hold "
                              "at least one batch")
         ledger_inputs = default_inputs
-    return batches, audit, ledger_inputs, legacy_batches
+    # The incremental stream is optional: a baseline document ends
+    # after the audit and stays valid byte-for-byte. Once present it is
+    # fully validated -- contiguous positions, per-batch ordering and
+    # the immutable closing snapshot.
+    progress: list[dict[str, Any]] = []
+    if not document_legacy:
+        progress = _validate_progress(
+            data[_ROOT_EVENTS_FIELD], batches, ledger_inputs)
+        progress_keys = {event["key"] for event in progress}
+        if not completed.issubset(progress_keys):
+            raise ValueError("every completed batch must appear in the "
+                             "progress event stream")
+    return (batches, audit, progress, ledger_inputs, legacy_batches,
+            document_legacy)
 
 
 def _canonical_item(item: dict[str, Any], legacy: bool = False) -> dict[str, Any]:
@@ -946,10 +1150,23 @@ def _canonical_batch(batch: dict[str, Any], legacy: bool = False) -> dict[str, A
     }
 
 
+def _canonical_event(event: dict[str, Any]) -> dict[str, Any]:
+    # One progress event in fixed field order; its batch snapshot is
+    # always written in the current per-item arity, even when the
+    # closing audit entry it was seeded from predates the receipts
+    # field.
+    return {"position": event["position"], "at": event["at"],
+            "key": event["key"], "job_id": event["job_id"],
+            "category": event["category"],
+            "batch": _canonical_batch(event["batch"])}
+
+
 def _canonical_bytes(
     batches: dict[str, dict[str, Any]],
     audit: list[dict[str, Any]],
+    progress: list[dict[str, Any]] | None = None,
     legacy_batches: set[str] | None = None,
+    document_legacy: bool = False,
 ) -> bytes:
     # Compact UTF-8 JSON, non-ASCII written through, sections in their
     # fixed field order, batches and their items code-point sorted and
@@ -957,7 +1174,9 @@ def _canonical_bytes(
     # actually completed (never re-sorted by batch key), terminated by
     # exactly one newline. Baseline batches without the per-item
     # receipts field are reproduced field-for-field; every batch a run
-    # (re)writes carries that field.
+    # (re)writes carries that field. A baseline document carries no
+    # events section; the first new write appends it after the audit
+    # with one section per root field in fixed order.
     legacy_batches = legacy_batches or set()
     payload = {
         "version": _VERSION,
@@ -970,6 +1189,9 @@ def _canonical_bytes(
                        legacy=event["key"] in legacy_batches)}
                   for event in audit],
     }
+    if not document_legacy:
+        payload[_ROOT_EVENTS_FIELD] = [_canonical_event(event)
+                                       for event in (progress or [])]
     text = json.dumps(payload, ensure_ascii=False, separators=(",", ":"),
                       allow_nan=False) + "\n"
     return text.encode("utf-8")
@@ -982,7 +1204,7 @@ def _parse_coordination_bytes(
     default_inputs: dict[str, str] | None = None,
     require_references: bool = True,
 ) -> tuple[dict[str, dict[str, Any]], list[dict[str, Any]],
-           dict[str, str], set[str]]:
+           list[dict[str, Any]], dict[str, str], set[str], bool]:
     try:
         text = raw.decode("utf-8")
     except UnicodeDecodeError as exc:
@@ -996,14 +1218,17 @@ def _parse_coordination_bytes(
         raise ValueError(
             f"migration coordination ledger {realpath!r} is not valid "
             "JSON") from exc
-    batches, audit, inputs, legacy_batches = _validate_ledger(
-        data, snapshots, default_inputs,
-        require_references=require_references)
-    if raw != _canonical_bytes(batches, audit, legacy_batches):
+    batches, audit, progress, inputs, legacy_batches, document_legacy = \
+        _validate_ledger(
+            data, snapshots, default_inputs,
+            require_references=require_references)
+    if raw != _canonical_bytes(batches, audit, progress, legacy_batches,
+                               document_legacy):
         raise ValueError(
             f"migration coordination ledger {realpath!r} is not in "
             "canonical compact form")
-    return batches, audit, inputs, legacy_batches
+    return (batches, audit, progress, inputs, legacy_batches,
+            document_legacy)
 
 
 def _load_coordination(
@@ -1012,18 +1237,21 @@ def _load_coordination(
     default_inputs: dict[str, str] | None = None,
     require_references: bool = True,
 ) -> tuple[dict[str, dict[str, Any]], list[dict[str, Any]],
-           dict[str, str], bytes | None, set[str]]:
+           list[dict[str, Any]], dict[str, str], bytes | None, set[str],
+           bool]:
     try:
         with open(realpath, "rb") as handle:
             raw = handle.read()
     except FileNotFoundError:
         if default_inputs is None:
             raise
-        return {}, [], default_inputs, None, set()
-    batches, audit, inputs, legacy_batches = _parse_coordination_bytes(
-        realpath, raw, snapshots, default_inputs,
-        require_references=require_references)
-    return batches, audit, inputs, raw, legacy_batches
+        return {}, [], [], default_inputs, None, set(), True
+    batches, audit, progress, inputs, legacy_batches, document_legacy = \
+        _parse_coordination_bytes(
+            realpath, raw, snapshots, default_inputs,
+            require_references=require_references)
+    return (batches, audit, progress, inputs, raw, legacy_batches,
+            document_legacy)
 
 
 # ---------------------------------------------------------------------------
@@ -1351,12 +1579,17 @@ def run(
             try:
                 snapshot_map = {frozenset(snapshot.input_map.items()):
                                 snapshot}
-                batches, audit_events, _ledger_inputs, old_bytes, \
-                    legacy_batches = _load_coordination(
+                batches, audit_events, progress_events, _ledger_inputs, \
+                    old_bytes, legacy_batches, document_legacy = \
+                    _load_coordination(
                         coordination_real, snapshot_map, snapshot.input_map)
 
                 batch = batches.get(key)
                 created = batch is None
+                # A takeover of a batch a pre-stream ledger recorded as
+                # pending has no creation event yet; its first upgraded
+                # event must still be named for what actually happened.
+                first_event_is_takeover = False
                 if created:
                     excluded = {
                         member
@@ -1446,6 +1679,11 @@ def run(
                                 f"owner until {batch['until']}")
                         batch["owner"] = owner
                         takeover = True
+                        if document_legacy:
+                            # The upgrade seeds only completions, so this
+                            # pending batch has no stream entry yet; its
+                            # first event records the takeover itself.
+                            first_event_is_takeover = True
                     else:
                         takeover = False
 
@@ -1510,14 +1748,108 @@ def run(
 
                     batch["until"] = now + lease
 
+                # A baseline ledger carries no progress section. The
+                # first write of this run upgrades the document and
+                # seeds the stream with the already-recorded history:
+                # one completed event per audit entry, in the audit's
+                # real completion order. Pending baseline batches get
+                # their first event from the first commit that touches
+                # them below. Read-only calls never reach this point
+                # and keep reproducing the baseline bytes.
+                if document_legacy:
+                    for audit_event in audit_events:
+                        progress_events.append({
+                            "position": len(progress_events),
+                            "at": audit_event["at"],
+                            "key": audit_event["key"],
+                            "job_id": None,
+                            "category": "completed",
+                            "batch": _canonical_batch(audit_event["batch"]),
+                        })
+                    document_legacy = False
+
+                # The post-commit snapshot recorded in each batch's
+                # latest progress event; the diff against it decides
+                # whether a commit earns an event and which category.
+                last_progress_by_key: dict[str, dict[str, Any]] = {
+                    event["key"]: event for event in progress_events}
+
+                def append_progress() -> None:
+                    # Append exactly one event for this commit when it
+                    # changed an observable batch state. A commit whose
+                    # batch snapshot equals its latest event's snapshot
+                    # appends nothing -- that is the pure coordination
+                    # lease renewal, an equivalent replay and a wait on
+                    # an unchanged plan.
+                    current = _canonical_batch(batch)
+                    previous = last_progress_by_key.get(key)
+                    if previous is not None \
+                            and current == previous["batch"]:
+                        return
+                    if current["status"] == "completed":
+                        category = "completed"
+                        event_job: str | None = None
+                    elif previous is None and first_event_is_takeover:
+                        # A pending batch a baseline ledger recorded and
+                        # whose first upgraded write is an expired-lease
+                        # takeover opens its stream with the takeover.
+                        category = "taken_over"
+                        event_job = None
+                    elif previous is None:
+                        category = "created"
+                        event_job = None
+                    elif current["owner"] != previous["batch"]["owner"]:
+                        # The run-start commit of an expired-lease
+                        # takeover changes the owner and nothing else.
+                        category = "taken_over"
+                        event_job = None
+                    elif current["items"] == previous["batch"]["items"]:
+                        # Only the coordination lease window moved:
+                        # a renewal, not an observable batch change.
+                        return
+                    else:
+                        old_items = previous["batch"]["items"]
+                        changed_jobs = [
+                            member for member in sorted(
+                                set(old_items) | set(current["items"]))
+                            if old_items.get(member)
+                            != current["items"][member]]
+                        event_job = changed_jobs[0]
+                        old_receipts = old_items.get(event_job, {}) \
+                            .get("receipts", [])
+                        new_receipts = current["items"][event_job]["receipts"]
+                        # A commit that extends the item's saved
+                        # receipts by exactly the next equivalent step
+                        # is a receipt landing; every other item change
+                        # (a phase move, a saved error, a marker) is an
+                        # item event.
+                        if len(new_receipts) == len(old_receipts) + 1 \
+                                and new_receipts[:len(old_receipts)] \
+                                == old_receipts:
+                            category = "receipt"
+                        else:
+                            category = "item"
+                    event = {
+                        "position": len(progress_events),
+                        "at": now,
+                        "key": key,
+                        "job_id": event_job,
+                        "category": category,
+                        "batch": current,
+                    }
+                    progress_events.append(event)
+                    last_progress_by_key[key] = event
+
                 def persist() -> None:
                     nonlocal old_bytes
                     # A pending batch this run rewrites moves to the
                     # current shape (per-item receipts); untouched
                     # baseline batches keep their original bytes.
                     legacy_batches.discard(key)
-                    payload = _canonical_bytes(batches, audit_events,
-                                               legacy_batches)
+                    append_progress()
+                    payload = _canonical_bytes(
+                        batches, audit_events, progress_events,
+                        legacy_batches, document_legacy)
                     _commit_file(coordination_real, payload, old_bytes)
                     old_bytes = payload
 
@@ -1865,8 +2197,12 @@ def run(
                         "at": now,
                         "batch": _canonical_batch(batch),
                     })
-                    payload = _canonical_bytes(batches, audit_events,
-                                               legacy_batches)
+                    # The closing commit earns its own terminal event
+                    # before the bytes are formed and validated.
+                    append_progress()
+                    payload = _canonical_bytes(
+                        batches, audit_events, progress_events,
+                        legacy_batches, document_legacy)
                     # Validate the closing bytes against a fresh
                     # snapshot of the nine business ledgers.
                     release_inputs()
@@ -2020,8 +2356,9 @@ def get(ledger: str, key: str) -> dict[str, object]:
     # Format first, membership second: a malformed ledger is a
     # ValueError that an unknown key must never hide. This pass opens no
     # business ledger and takes no lock.
-    intrinsic, _audit, _inputs_unused, _legacy = _parse_coordination_bytes(
-        realpath, preliminary, {}, None, require_references=False)
+    intrinsic, _audit, _events_unused, _inputs_unused, _legacy, \
+        _doc_legacy = _parse_coordination_bytes(
+            realpath, preliminary, {}, None, require_references=False)
     if key not in intrinsic:
         raise KeyError(key)
 
@@ -2037,15 +2374,15 @@ def get(ledger: str, key: str) -> dict[str, object]:
             # Re-prove the format under the lock before touching a
             # business ledger; a concurrent replacement may have changed
             # the document.
-            locked_batches, _audit, locked_inputs, _legacy = \
-                _parse_coordination_bytes(
+            locked_batches, _audit, _events, locked_inputs, _legacy, \
+                _doc_legacy = _parse_coordination_bytes(
                     realpath, raw, {}, None, require_references=False)
             if key not in locked_batches:
                 raise KeyError(key)
             with _business_locks(locked_inputs):
                 snapshot = _Snapshot(locked_inputs)
-                batches, _audit_events, _ledger_inputs, _raw, _legacy = \
-                    _load_coordination(
+                batches, _audit_events, _events, _ledger_inputs, _raw, \
+                    _legacy, _doc_legacy = _load_coordination(
                         realpath,
                         {frozenset(snapshot.input_map.items()): snapshot},
                         None)
@@ -2094,13 +2431,13 @@ def search(ledger: str, cursor: str | None = None,
     with store.lock:
         with _lock(realpath, shared=True):
             raw = _read_raw(realpath)
-            _locked_batches, _audit, inputs, _legacy = \
-                _parse_coordination_bytes(
+            _locked_batches, _audit, _events, inputs, _legacy, \
+                _doc_legacy = _parse_coordination_bytes(
                     realpath, raw, {}, None, require_references=False)
             with _business_locks(inputs):
                 snapshot = _Snapshot(inputs)
-                batches, audit_events, _ledger_inputs, _raw, _legacy = \
-                    _load_coordination(
+                batches, audit_events, _events, _ledger_inputs, _raw, \
+                    _legacy, _doc_legacy = _load_coordination(
                         realpath,
                         {frozenset(snapshot.input_map.items()): snapshot},
                         None)
@@ -2143,8 +2480,9 @@ def get_response(ledger: str, key: str) -> bytes:
         preliminary = _read_raw(realpath)
     except FileNotFoundError:
         raise _CoordinationMissing(realpath)
-    intrinsic, _audit, _inputs, _legacy = _parse_coordination_bytes(
-        realpath, preliminary, {}, None, require_references=False)
+    intrinsic, _audit, _events, _inputs, _legacy, _doc_legacy = \
+        _parse_coordination_bytes(
+            realpath, preliminary, {}, None, require_references=False)
     if key not in intrinsic:
         raise KeyError(key)
     store = _get_store(realpath)
@@ -2155,15 +2493,15 @@ def get_response(ledger: str, key: str) -> bytes:
             except FileNotFoundError:
                 # Lost to a concurrent removal before the lock.
                 raise _CoordinationMissing(realpath)
-            batches_locked, _audit, inputs_locked, _legacy = \
-                _parse_coordination_bytes(
+            batches_locked, _audit, _events, inputs_locked, _legacy, \
+                _doc_legacy = _parse_coordination_bytes(
                     realpath, raw, {}, None, require_references=False)
             if key not in batches_locked:
                 raise KeyError(key)
             with _business_locks(inputs_locked):
                 snapshot = _snapshot_checked(inputs_locked)
-                batches, _audit_events, _ledger_inputs, _raw, _legacy = \
-                    _load_coordination(
+                batches, _audit_events, _events, _ledger_inputs, _raw, \
+                    _legacy, _doc_legacy = _load_coordination(
                         realpath,
                         {frozenset(snapshot.input_map.items()): snapshot},
                         None)
@@ -2193,15 +2531,175 @@ def search_response(ledger: str, cursor: str | None = None,
     with store.lock:
         with _lock(realpath, shared=True):
             raw = _read_raw(realpath)
-            _batches_locked, _audit, inputs, _legacy = \
-                _parse_coordination_bytes(
+            _batches_locked, _audit, _events, inputs, _legacy, \
+                _doc_legacy = _parse_coordination_bytes(
                     realpath, raw, {}, None, require_references=False)
             with _business_locks(inputs):
                 snapshot = _snapshot_checked(inputs)
-                batches, audit_events, _ledger_inputs, _raw, _legacy = \
-                    _load_coordination(
+                batches, audit_events, _events, _ledger_inputs, _raw, \
+                    _legacy, _doc_legacy = _load_coordination(
                         realpath,
                         {frozenset(snapshot.input_map.items()): snapshot},
                         None)
                 page = _page(batches, audit_events, cursor, limit)
+                return _render(page)
+
+
+# ---------------------------------------------------------------------------
+# Incremental progress event stream
+# ---------------------------------------------------------------------------
+
+
+def _progress_entry(event: dict[str, Any]) -> dict[str, Any]:
+    # A fixed-order deep copy of one progress event and its complete
+    # post-commit batch snapshot.
+    return {
+        "position": event["position"],
+        "at": event["at"],
+        "key": event["key"],
+        "job_id": event["job_id"],
+        "category": event["category"],
+        "batch": _batch_snapshot(event["batch"]),
+    }
+
+
+def _validate_events_arguments(
+    ledger: object, cursor: object, limit: object, key: object,
+    job_id: object,
+) -> None:
+    if not isinstance(ledger, str) or not ledger:
+        raise ValueError("ledger must be a non-empty string")
+    # bool is a subclass of int and must be rejected as a cursor.
+    if cursor is not None and (not _is_plain_int(cursor) or cursor < 0):
+        raise ValueError("cursor must be None or a non-boolean "
+                         "non-negative integer")
+    if not _is_plain_int(limit) or not 1 <= limit <= _MAX_LIMIT:
+        raise ValueError("limit must be a non-boolean integer between 1 "
+                         "and 1000")
+    for name, value in (("key", key), ("job_id", job_id)):
+        if value is not None and (not isinstance(value, str) or not value):
+            raise ValueError(f"{name} must be None or a non-empty string")
+
+
+def _events_page(
+    progress: list[dict[str, Any]], cursor: int | None, limit: int,
+    key: str | None, job_id: str | None,
+) -> dict[str, Any]:
+    # The stream is stored in strictly increasing zero-based position
+    # order. The cursor is exclusive, the batch-key and job filters
+    # combine by logical AND and items they skip never consume page
+    # capacity. One extra match is collected to learn whether more
+    # matches remain; the continuation cursor is the page's last
+    # position, null on the final page.
+    matched: list[dict[str, Any]] = []
+    for event in progress:
+        position = event["position"]
+        if cursor is not None and position <= cursor:
+            continue
+        if key is not None and event["key"] != key:
+            continue
+        if job_id is not None and event["job_id"] != job_id:
+            continue
+        matched.append(event)
+        if len(matched) > limit:
+            break
+    if len(matched) > limit:
+        page = matched[:limit]
+        next_cursor: int | None = page[-1]["position"]
+    else:
+        page = matched
+        next_cursor = None
+    return {"events": [_progress_entry(event) for event in page],
+            "next": next_cursor}
+
+
+def events(ledger: str, cursor: int | None = None,
+           limit: int = _DEFAULT_LIMIT, *, key: str | None = None,
+           job_id: str | None = None) -> dict[str, Any]:
+    """Return one page of incremental progress events by position.
+
+    ``ledger`` must be a non-empty string. ``cursor`` is ``None`` or a
+    non-boolean non-negative integer: only events at strictly greater
+    positions are considered, so omitting it reads from the start.
+    ``limit`` is a non-boolean integer from 1 to 1000, defaulting to
+    100. ``key`` and ``job_id`` are optional non-empty string filters
+    combined by logical AND (the batch key and the related member job
+    id, where batch-scoped events carry a null job id); positions they
+    skip never consume page capacity. Bad arguments raise
+    ``ValueError`` before a file is read.
+
+    The page object is ``{"events": [event, ...], "next": cursor}`` in
+    that order. Each event carries, in order, its contiguous zero-based
+    ``position`` (strictly increasing and never reused), the commit
+    moment ``at``, the batch ``key``, the related ``job_id`` (null for
+    batch-scoped changes), the ``category`` (``created``,
+    ``taken_over``, ``item``, ``receipt`` or ``completed``) and the
+    complete batch ``snapshot`` after that commit. ``next`` is the
+    position of the page's last event when further matches remain,
+    else ``None``.
+
+    A baseline ledger written before the stream existed stays
+    read-only compatible: it simply yields an empty page. A missing
+    coordination ledger raises :class:`FileNotFoundError`; malformed,
+    out-of-order or non-canonical bytes or a broken cross-reference
+    raise ``ValueError`` and a missing required business ledger
+    :class:`FileNotFoundError`; any other locking or I/O failure
+    raises ``OSError``.
+    """
+    _validate_events_arguments(ledger, cursor, limit, key, job_id)
+    realpath = os.path.realpath(ledger)
+    # Format before locks, as in search(): a malformed ledger never
+    # reaches a business ledger or creates a companion lock file.
+    preliminary = _read_raw(realpath)
+    _parse_coordination_bytes(realpath, preliminary, {}, None,
+                              require_references=False)
+    store = _get_store(realpath)
+    with store.lock:
+        with _lock(realpath, shared=True):
+            raw = _read_raw(realpath)
+            _batches, _audit, _events, inputs, _legacy, _doc_legacy = \
+                _parse_coordination_bytes(
+                    realpath, raw, {}, None, require_references=False)
+            with _business_locks(inputs):
+                snapshot = _Snapshot(inputs)
+                _batches, _audit, progress, _ledger_inputs, _raw, \
+                    _legacy, _doc_legacy = _load_coordination(
+                        realpath,
+                        {frozenset(snapshot.input_map.items()): snapshot},
+                        None)
+            return _events_page(progress, cursor, limit, key, job_id)
+
+
+def events_response(ledger: str, cursor: int | None = None,
+                    limit: int = _DEFAULT_LIMIT, *, key: str | None = None,
+                    job_id: str | None = None) -> bytes:
+    """Serialize :func:`events`' page while every read lock is held.
+
+    The page is formed and rendered under the coordination ledger's and
+    the business ledgers' shared locks, so a racing batch writer is
+    observed as one complete version. A missing coordination ledger
+    raises :class:`FileNotFoundError`; bad arguments, malformed bytes, a
+    broken cross-reference or a missing required business ledger raise
+    ``ValueError``; other locking or I/O failures raise ``OSError``.
+    """
+    _validate_events_arguments(ledger, cursor, limit, key, job_id)
+    realpath = os.path.realpath(ledger)
+    preliminary = _read_raw(realpath)
+    _parse_coordination_bytes(realpath, preliminary, {}, None,
+                              require_references=False)
+    store = _get_store(realpath)
+    with store.lock:
+        with _lock(realpath, shared=True):
+            raw = _read_raw(realpath)
+            _batches, _audit, _events, inputs, _legacy, _doc_legacy = \
+                _parse_coordination_bytes(
+                    realpath, raw, {}, None, require_references=False)
+            with _business_locks(inputs):
+                snapshot = _snapshot_checked(inputs)
+                _batches, _audit, progress, _ledger_inputs, _raw, \
+                    _legacy, _doc_legacy = _load_coordination(
+                        realpath,
+                        {frozenset(snapshot.input_map.items()): snapshot},
+                        None)
+                page = _events_page(progress, cursor, limit, key, job_id)
                 return _render(page)
