@@ -479,6 +479,173 @@ class MigrationBatchTest(unittest.TestCase):
         with self.assertRaises(KeyError):
             migration_batch.get(self.paths["coord"], "missing")
 
+    def test_get_proves_own_format_before_key_membership(self) -> None:
+        # An existing coordination file must first validate its own
+        # format; an unknown key must never mask a malformed file.
+        self._prepare_migrate()
+        self._run(now=30)
+        self._run(key="bk-2", now=31)
+        coord = self.paths["coord"]
+        good = Path(coord).read_bytes()
+        data = json.loads(good.decode("utf-8"))
+
+        def write(payload: bytes) -> None:
+            Path(coord).write_bytes(payload)
+
+        compact = lambda obj: json.dumps(  # noqa: E731
+            obj, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
+
+        cases: dict[str, bytes] = {
+            "utf-8": b'{"version":1}\xff\n',
+            "json": b"{not json\n",
+            "non-finite": b'{"version":NaN}\n',
+            "version": compact({**data, "version": 2}),
+            "root-order": compact({"batches": data["batches"],
+                                   "version": 1, "audit": data["audit"]}),
+            "non-canonical-newline": good + b"\n",
+            "pretty": json.dumps(data, ensure_ascii=False, indent=2)
+                .encode("utf-8") + b"\n",
+        }
+        keys = list(data["batches"])
+        reordered = dict(data)
+        reordered["batches"] = {keys[1]: data["batches"][keys[1]],
+                                keys[0]: data["batches"][keys[0]]}
+        cases["batch-key-order"] = compact(reordered)
+        for label, payload in cases.items():
+            with self.subTest(label=label):
+                write(payload)
+                # The key is deliberately absent; the format error wins.
+                with self.assertRaises(ValueError):
+                    migration_batch.get(coord, "absent-key")
+                # Listing rejects it the same way.
+                with self.assertRaises(ValueError):
+                    migration_batch.search(coord)
+        write(good)
+        # A canonical ledger that simply lacks the key is a KeyError.
+        with self.assertRaises(KeyError):
+            migration_batch.get(coord, "absent-key")
+
+    def test_get_and_search_miss_create_no_trace(self) -> None:
+        self._prepare_migrate()
+        self._run(now=30)
+        coord = self.paths["coord"]
+        lock_path = coord + ".lock"
+        # The writer's companion lock is persistent; clear it so this
+        # assertion isolates what the read-only miss itself creates.
+        if Path(lock_path).exists():
+            Path(lock_path).unlink()
+        with self.assertRaises(KeyError):
+            migration_batch.get(coord, "ghost")
+        self.assertFalse(Path(lock_path).exists())
+        missing = os.path.join(self.tmp.name, "missing-coord.json")
+        with self.assertRaises(KeyError):
+            migration_batch.get(missing, "ghost")
+        with self.assertRaises(FileNotFoundError):
+            migration_batch.search(missing)
+        self.assertFalse(Path(missing).exists())
+        self.assertFalse(Path(missing + ".lock").exists())
+        # The malformed-file refusal also creates no companion lock.
+        Path(coord).write_bytes(b"{broken\n")
+        with self.assertRaises(ValueError):
+            migration_batch.get(coord, "ghost")
+        self.assertFalse(Path(lock_path).exists())
+
+    def test_search_pages_with_completion_information(self) -> None:
+        self._prepare_migrate()
+        self._run(now=30)                    # bk-1 pending (j-1 active)
+        self._run(key="bk-2", now=31)       # bk-2 completed empty
+        coord = self.paths["coord"]
+
+        page = migration_batch.search(coord, limit=1)
+        self.assertEqual(list(page), ["entries", "next"])
+        self.assertEqual([entry["key"] for entry in page["entries"]],
+                         ["bk-1"])
+        self.assertEqual(page["next"], "bk-1")
+        entry = page["entries"][0]
+        self.assertEqual(list(entry), ["key", "snapshot", "completion"])
+        self.assertIsNone(entry["completion"])
+        self.assertEqual(entry["snapshot"]["status"], "pending")
+
+        second = migration_batch.search(coord, cursor="bk-1", limit=1)
+        self.assertEqual([e["key"] for e in second["entries"]], ["bk-2"])
+        self.assertIsNone(second["next"])
+        completed = second["entries"][0]
+        self.assertEqual(completed["snapshot"]["status"], "completed")
+        # Zero-based audit position and the completion moment.
+        self.assertEqual(completed["completion"], {"index": 0, "at": 31})
+        raw = json.loads(Path(coord).read_text("utf-8"))
+        self.assertEqual(raw["audit"][0]["key"], "bk-2")
+
+        full = migration_batch.search(coord)
+        self.assertEqual([e["key"] for e in full["entries"]],
+                         ["bk-1", "bk-2"])
+        self.assertIsNone(full["next"])
+        self.assertEqual(full["entries"][1]["completion"],
+                         {"index": 0, "at": 31})
+
+    def test_search_validates_arguments(self) -> None:
+        self._prepare_migrate()
+        coord = self.paths["coord"]
+        for bad_limit in (0, -1, 1001, True, False, "10", 1.5, None):
+            with self.subTest(bad_limit=bad_limit):
+                with self.assertRaises(ValueError):
+                    migration_batch.search(coord, limit=bad_limit)  # type: ignore[arg-type]
+        for bad_cursor in ("", 123, False):
+            with self.subTest(bad_cursor=bad_cursor):
+                with self.assertRaises(ValueError):
+                    migration_batch.search(coord, cursor=bad_cursor)  # type: ignore[arg-type]
+        with self.assertRaises(ValueError):
+            migration_batch.search("", limit=10)
+
+    def test_response_builders_error_vocabulary(self) -> None:
+        self._prepare_migrate()
+        self._run(now=30)
+        coord = self.paths["coord"]
+        missing = os.path.join(self.tmp.name, "absent-coord.json")
+        # A missing coordination ledger is FileNotFoundError for both
+        # builders (HTTP maps it to migration_batches_not_found); an
+        # unknown key on a canonical ledger is the separate KeyError
+        # (migration_batch_not_found).
+        with self.assertRaises(FileNotFoundError):
+            migration_batch.search_response(missing)
+        with self.assertRaises(FileNotFoundError):
+            migration_batch.get_response(missing, "bk-1")
+        with self.assertRaises(KeyError):
+            migration_batch.get_response(coord, "absent-key")
+        # Non-canonical bytes are ValueError.
+        good = Path(coord).read_bytes()
+        Path(coord).write_bytes(b"{broken\n")
+        with self.assertRaises(ValueError):
+            migration_batch.search_response(coord)
+        with self.assertRaises(ValueError):
+            migration_batch.get_response(coord, "bk-1")
+        Path(coord).write_bytes(good)
+        # A canonical coordination file that names a missing required
+        # business ledger is a broken reference: ValueError, not a 404.
+        os.unlink(self.paths["jobs"])
+        with self.assertRaises(ValueError):
+            migration_batch.search_response(coord)
+        with self.assertRaises(ValueError):
+            migration_batch.get_response(coord, "bk-1")
+
+    def test_response_builders_render_compact_bytes(self) -> None:
+        self._prepare_migrate()
+        self._run(now=30)
+        coord = self.paths["coord"]
+        page = migration_batch.search(coord)
+        body = migration_batch.search_response(coord)
+        self.assertEqual(
+            body, json.dumps(page, ensure_ascii=False,
+                             separators=(",", ":")).encode("utf-8"))
+        self.assertFalse(body.endswith(b"\n"))
+        snapshot = migration_batch.get(coord, "bk-1")
+        exact = migration_batch.get_response(coord, "bk-1")
+        self.assertEqual(
+            exact, json.dumps(snapshot, ensure_ascii=False,
+                              separators=(",", ":")).encode("utf-8"))
+        self.assertFalse(exact.endswith(b"\n"))
+
+
     # -- canonical form ------------------------------------------------------
 
     def test_canonical_form_non_ascii_and_append_audit(self) -> None:

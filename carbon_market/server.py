@@ -7,7 +7,7 @@ import urllib.parse
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
-from . import acceptance, audit, audit_proof, auth
+from . import acceptance, audit, audit_proof, auth, migration_batch
 
 # Query parameters GET /audit accepts; anything else is an invalid request.
 _AUDIT_PARAMS = ("cursor", "limit", "op", "stage", "key")
@@ -18,6 +18,10 @@ _PROOF_PARAMS = ("generation", "final") + _AUDIT_PARAMS
 # GET /acceptance takes either the exact-lookup key alone or the
 # paginated exclusive cursor, page size and state filter.
 _ACCEPTANCE_PARAMS = ("key", "cursor", "limit", "state")
+# GET /migration-batches takes either the exact-lookup key alone or the
+# paginated exclusive cursor and page size; the coordination ledger is
+# fixed at startup and can never be selected through the query.
+_MIGRATION_BATCHES_PARAMS = ("key", "cursor", "limit")
 _ACCEPTANCE_STATES = ("pending", "active", "quarantined")
 _OPS = ("copy", "restore")
 _STAGES = ("成功", "校验", "执行", "同步", "回滚")
@@ -105,6 +109,23 @@ def _parse_acceptance_params(query: str) -> dict[str, str]:
     return params
 
 
+def _parse_migration_batches_params(query: str) -> dict[str, str]:
+    params = _parse_query(query, _MIGRATION_BATCHES_PARAMS)
+    if "key" in params:
+        # An exact lookup stands alone: no cursor or page size may
+        # accompany the key.
+        if len(params) != 1:
+            raise ValueError("key cannot be combined with cursor or limit")
+        return params
+    limit = params.get("limit")
+    if limit is not None:
+        if not all("0" <= char <= "9" for char in limit):
+            raise ValueError("limit must be a decimal integer")
+        if not 1 <= int(limit) <= _MAX_LIMIT:
+            raise ValueError("limit must be between 1 and 1000")
+    return params
+
+
 class Handler(BaseHTTPRequestHandler):
     server_version = "CarbonMarket/0.1"
 
@@ -130,6 +151,11 @@ class Handler(BaseHTTPRequestHandler):
         if path == "/acceptance" \
                 and getattr(self.server, "acceptance_dir", None) is not None:
             self._acceptance(query)
+            return
+        if path == "/migration-batches" \
+                and getattr(self.server, "migration_batches", None) \
+                is not None:
+            self._migration_batches(query)
             return
         self._json(HTTPStatus.NOT_FOUND, {"error": "not_found"})
 
@@ -389,6 +415,72 @@ class Handler(BaseHTTPRequestHandler):
             else:
                 self._raw(HTTPStatus.OK, body, etag)
 
+    def _migration_batches(self, query: str) -> None:
+        ledger = getattr(self.server, "migration_batches")
+        authorized, record = self._authorize()
+        if not authorized:
+            return
+
+        try:
+            params = _parse_migration_batches_params(query)
+        except ValueError:
+            self._json(HTTPStatus.BAD_REQUEST, {"error": "invalid_request"})
+            return
+
+        # Scope checks follow parameter validation and precede any
+        # ledger access: an exact lookup requires unrestricted operation
+        # and stage scopes and a key scope that is unrestricted or names
+        # the requested batch; a paginated query requires all three
+        # scopes unrestricted. A forbidden request never opens the
+        # coordination ledger or a business ledger.
+        if record is not None:
+            if record.ops is not None or record.stages is not None:
+                self._json(HTTPStatus.FORBIDDEN, {"error": "forbidden"})
+                return
+            if "key" in params:
+                if record.keys is not None \
+                        and params["key"] not in record.keys:
+                    self._json(
+                        HTTPStatus.FORBIDDEN, {"error": "forbidden"})
+                    return
+            elif record.keys is not None:
+                self._json(HTTPStatus.FORBIDDEN, {"error": "forbidden"})
+                return
+
+        try:
+            if "key" in params:
+                # The exact lookup returns only the batch snapshot; the
+                # shared locks cover the coordination file, the business
+                # snapshots and the serialization, so the body is one
+                # complete version.
+                body = migration_batch.get_response(ledger, params["key"])
+            else:
+                kwargs: dict[str, object] = {}
+                if "cursor" in params:
+                    kwargs["cursor"] = params["cursor"]
+                if "limit" in params:
+                    kwargs["limit"] = int(params["limit"])
+                body = migration_batch.search_response(ledger, **kwargs)
+        except FileNotFoundError:
+            # The fixed coordination ledger itself is missing. Never
+            # leak its path or a system message.
+            self._json(HTTPStatus.NOT_FOUND,
+                       {"error": "migration_batches_not_found"})
+        except KeyError:
+            # A canonical coordination ledger that lacks the key.
+            self._json(HTTPStatus.NOT_FOUND,
+                       {"error": "migration_batch_not_found"})
+        except ValueError:
+            # Non-canonical content, a broken reference or a referenced
+            # business ledger that is missing.
+            self._json(HTTPStatus.CONFLICT,
+                       {"error": "migration_batches_invalid"})
+        except OSError:
+            self._json(HTTPStatus.SERVICE_UNAVAILABLE,
+                       {"error": "migration_batches_unavailable"})
+        else:
+            self._bytes(HTTPStatus.OK, body)
+
     def _raw(self, status: HTTPStatus, body: bytes, etag: str) -> None:
         # The snapshot bytes are served verbatim -- the original UTF-8
         # written by the exporter, with its field order intact -- and the
@@ -396,6 +488,16 @@ class Handler(BaseHTTPRequestHandler):
         self.send_response(status)
         self.send_header("Content-Type", "application/json")
         self.send_header("ETag", f'"{etag}"')
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        if body:
+            self.wfile.write(body)
+
+    def _bytes(self, status: HTTPStatus, body: bytes) -> None:
+        # Serve already-serialized compact UTF-8 JSON bytes verbatim, as
+        # the read-only library builder formed them under its locks.
+        self.send_response(status)
+        self.send_header("Content-Type", "application/json")
         self.send_header("Content-Length", str(len(body)))
         self.end_headers()
         if body:
@@ -419,11 +521,13 @@ class Handler(BaseHTTPRequestHandler):
 def serve(host: str, port: int, audit_path: str | None = None,
           token: str | None = None, auth: str | None = None,
           checkpoint: str | None = None,
-          acceptance: str | None = None) -> None:
+          acceptance: str | None = None,
+          migration_batches: str | None = None) -> None:
     with ThreadingHTTPServer((host, port), Handler) as server:
         server.audit_path = audit_path  # type: ignore[attr-defined]
         server.audit_token = token  # type: ignore[attr-defined]
         server.audit_auth = auth  # type: ignore[attr-defined]
         server.audit_checkpoint = checkpoint  # type: ignore[attr-defined]
         server.acceptance_dir = acceptance  # type: ignore[attr-defined]
+        server.migration_batches = migration_batches  # type: ignore[attr-defined]
         server.serve_forever()

@@ -75,7 +75,7 @@ from typing import Any, Callable, Iterator
 from . import rebalance as _rebalance
 from ._jsonio import finite_loads
 
-__all__ = ["run", "get"]
+__all__ = ["run", "get", "search", "get_response", "search_response"]
 
 _VERSION = 1
 _ROOT_FIELDS = ("version", "batches", "audit")
@@ -116,6 +116,15 @@ class _ChangedRequest(ValueError):
     # downstream ledger already holds. It is a public ValueError to
     # callers but must abort the run with the coordination bytes
     # untouched instead of failing just the member.
+    pass
+
+
+class _CoordinationMissing(FileNotFoundError):
+    # Internal marker for the read-only response builders: the fixed
+    # coordination ledger itself is absent, as opposed to an unknown
+    # batch key (KeyError) or a business ledger a canonical coordination
+    # file references but cannot find (ValueError -- a broken
+    # reference). It stays a FileNotFoundError to every other handler.
     pass
 
 
@@ -521,7 +530,8 @@ def _validate_inputs(raw: object) -> dict[str, str]:
 def _validate_item(
     raw: object,
     job_id: object,
-    snapshot: _Snapshot,
+    snapshot: _Snapshot | None,
+    references: bool = True,
 ) -> tuple[dict[str, Any], bool]:
     if not isinstance(job_id, str) or not job_id:
         raise ValueError("batch item keys must be non-empty strings")
@@ -556,6 +566,74 @@ def _validate_item(
     item_receipts = _validate_step_receipts(
         raw["receipts"]) if not legacy else []
 
+    if not references:
+        # Intrinsic form only: a reader that has not opened the business
+        # ledgers can still reject every shape, type, field-order and
+        # enumeration error and every contradiction internal to the item
+        # without following a single cross-reference. Cross-references
+        # (accepted job, trade, plan, advice, settlement and the exact
+        # receipt match) are the reference pass's job.
+        if phase == "kept":
+            if plan_key is not None or lease is not None \
+                    or error is not None:
+                raise ValueError("a kept item must not carry plan, lease or "
+                                 "error data")
+        elif phase == "failed":
+            if error is None:
+                raise ValueError("a failed item must carry the public "
+                                 "error class name")
+            if item_snapshot is not None:
+                raise ValueError("a failed item must not carry a snapshot")
+        else:
+            if plan_key is None or error is not None:
+                raise ValueError("an active migration item must name its "
+                                 "plan key and carry no error")
+            marker_actions = {
+                "evaluating": ("evaluate",),
+                "reserved": ("apply",),
+                "claimed": ("start",),
+                "active": ("record", "recover"),
+                "settling": ("settle",),
+            }
+            if phase in ("evaluating", "reserved", "claimed", "settling") \
+                    and not _is_marker(item_snapshot):
+                # These four stages only ever persist a pending-action
+                # marker; an active item may hold the plan snapshot and a
+                # settled item its settlement record.
+                raise ValueError(f"a {phase} item must carry a "
+                                 "pending-action marker")
+            if phase == "settled" and _is_marker(item_snapshot):
+                # A settled item persists the settlement record, never a
+                # pending action.
+                raise ValueError("a settled item must snapshot its "
+                                 "settlement record")
+            if _is_marker(item_snapshot):
+                marker = _validate_marker(item_snapshot)
+                action = marker["action"]
+                expected_actions = marker_actions[phase]
+                if action not in expected_actions:
+                    raise ValueError("migration batch item marker action "
+                                     "does not match its phase")
+                if action == "start" \
+                        and lease != marker["request"]["lease_end"]:
+                    raise ValueError("start marker lease must match the "
+                                     "item lease")
+                if action == "settle" \
+                        and marker["request"]["plan_key"] != plan_key:
+                    raise ValueError("settle marker must name the item's "
+                                     "plan")
+        return {
+            "job_id": job_id,
+            "plan_key": plan_key,
+            "phase": phase,
+            "request_key": request_key,
+            "lease": lease,
+            "error": error,
+            "snapshot": copy.deepcopy(item_snapshot),
+            "receipts": copy.deepcopy(item_receipts),
+        }, legacy
+
+    assert snapshot is not None
     if job_id not in snapshot.accepted:
         raise ValueError("migration batch item must reference an accepted "
                          "job")
@@ -717,6 +795,7 @@ def _validate_ledger(
     data: object,
     snapshots: dict[frozenset[tuple[str, str]], _Snapshot],
     default_inputs: dict[str, str] | None,
+    require_references: bool = True,
 ) -> tuple[dict[str, dict[str, Any]], list[dict[str, Any]],
            dict[str, str], set[str]]:
     if not isinstance(data, dict) or set(data.keys()) != set(_ROOT_FIELDS):
@@ -769,14 +848,16 @@ def _validate_ledger(
         _check_sorted_keys(items_raw, "batch items")
 
         snapshot = snapshots.get(frozenset(inputs.items()))
-        if snapshot is None:
+        if require_references and snapshot is None:
             raise ValueError("batch inputs do not name the loaded "
                              "business snapshot")
         item_shapes: set[bool] = set()
         items: dict[str, dict[str, Any]] = {}
         for member_key, item_raw in items_raw.items():
-            item, item_legacy = _validate_item(item_raw, member_key,
-                                               snapshot)
+            item, item_legacy = _validate_item(
+                item_raw, member_key,
+                snapshot if require_references else None,
+                references=require_references)
             item_shapes.add(item_legacy)
             items[member_key] = item
         if len(item_shapes) > 1:
@@ -894,19 +975,14 @@ def _canonical_bytes(
     return text.encode("utf-8")
 
 
-def _load_coordination(
+def _parse_coordination_bytes(
     realpath: str,
+    raw: bytes,
     snapshots: dict[frozenset[tuple[str, str]], _Snapshot],
     default_inputs: dict[str, str] | None = None,
+    require_references: bool = True,
 ) -> tuple[dict[str, dict[str, Any]], list[dict[str, Any]],
-           dict[str, str], bytes | None, set[str]]:
-    try:
-        with open(realpath, "rb") as handle:
-            raw = handle.read()
-    except FileNotFoundError:
-        if default_inputs is None:
-            raise
-        return {}, [], default_inputs, None, set()
+           dict[str, str], set[str]]:
     try:
         text = raw.decode("utf-8")
     except UnicodeDecodeError as exc:
@@ -921,11 +997,32 @@ def _load_coordination(
             f"migration coordination ledger {realpath!r} is not valid "
             "JSON") from exc
     batches, audit, inputs, legacy_batches = _validate_ledger(
-        data, snapshots, default_inputs)
+        data, snapshots, default_inputs,
+        require_references=require_references)
     if raw != _canonical_bytes(batches, audit, legacy_batches):
         raise ValueError(
             f"migration coordination ledger {realpath!r} is not in "
             "canonical compact form")
+    return batches, audit, inputs, legacy_batches
+
+
+def _load_coordination(
+    realpath: str,
+    snapshots: dict[frozenset[tuple[str, str]], _Snapshot],
+    default_inputs: dict[str, str] | None = None,
+    require_references: bool = True,
+) -> tuple[dict[str, dict[str, Any]], list[dict[str, Any]],
+           dict[str, str], bytes | None, set[str]]:
+    try:
+        with open(realpath, "rb") as handle:
+            raw = handle.read()
+    except FileNotFoundError:
+        if default_inputs is None:
+            raise
+        return {}, [], default_inputs, None, set()
+    batches, audit, inputs, legacy_batches = _parse_coordination_bytes(
+        realpath, raw, snapshots, default_inputs,
+        require_references=require_references)
     return batches, audit, inputs, raw, legacy_batches
 
 
@@ -1791,96 +1888,320 @@ def run(
 # ---------------------------------------------------------------------------
 
 
+# ---------------------------------------------------------------------------
+# Read-only lookup and pagination
+# ---------------------------------------------------------------------------
+
+_DEFAULT_LIMIT = 100
+_MAX_LIMIT = 1000
+
+
+def _validate_cursor_limit(cursor: object, limit: object) -> None:
+    if cursor is not None and (not isinstance(cursor, str) or not cursor):
+        raise ValueError("cursor must be None or a non-empty string")
+    # bool is a subclass of int and must be rejected as a page size.
+    if not isinstance(limit, int) or isinstance(limit, bool) \
+            or not 1 <= limit <= _MAX_LIMIT:
+        raise ValueError("limit must be an integer between 1 and 1000")
+
+
+@contextlib.contextmanager
+def _business_locks(inputs: dict[str, str]) -> Iterator[None]:
+    # Shared flocks on the business ledgers in resolved real-path order,
+    # the same order the writer takes them in. A ledger that does not
+    # exist is not flocked (which would create its companion lock file);
+    # _Snapshot rejects the broken reference itself.
+    held: list[Any] = []
+    try:
+        for input_real in sorted(set(inputs.values())):
+            if not os.path.exists(input_real):
+                continue
+            manager = _lock(input_real, shared=True)
+            manager.__enter__()
+            held.append(manager)
+        yield
+    finally:
+        while held:
+            manager = held.pop()
+            with contextlib.suppress(BaseException):
+                manager.__exit__(None, None, None)
+
+
+def _read_raw(realpath: str) -> bytes:
+    with open(realpath, "rb") as handle:
+        return handle.read()
+
+
+def _completion(audit: list[dict[str, Any]],
+                batch: dict[str, Any]) -> dict[str, int] | None:
+    # An active batch carries no completion information; a terminal one
+    # publishes its zero-based position in the append-only audit (the
+    # real completion order) and its completion moment.
+    if batch["status"] != "completed":
+        return None
+    for index, event in enumerate(audit):
+        if event["key"] == batch["key"]:
+            return {"index": index, "at": event["at"]}
+    raise ValueError("completed batch is missing its audit event")
+
+
+def _entry(batch: dict[str, Any], audit: list[dict[str, Any]]) -> dict[str, Any]:
+    return {"key": batch["key"], "snapshot": _batch_snapshot(batch),
+            "completion": _completion(audit, batch)}
+
+
+def _page(batches: dict[str, dict[str, Any]],
+          audit: list[dict[str, Any]], cursor: str | None,
+          limit: int) -> dict[str, Any]:
+    # The persisted batches are validated in ascending key code-point
+    # order; sorted() reproduces that document order. One extra match is
+    # collected to learn whether the page is the last; the cursor is
+    # exclusive.
+    entries: list[dict[str, Any]] = []
+    for batch_key in sorted(batches):
+        if cursor is not None and batch_key <= cursor:
+            continue
+        entries.append(_entry(batches[batch_key], audit))
+        if len(entries) > limit:
+            break
+    if len(entries) > limit:
+        page = entries[:limit]
+        next_cursor: str | None = page[-1]["key"]
+    else:
+        page = entries
+        next_cursor = None
+    return {"entries": page, "next": next_cursor}
+
+
+def _render(payload: Any) -> bytes:
+    # The endpoint's compact UTF-8 JSON: compact separators, non-ASCII
+    # written through, no trailing newline.
+    return json.dumps(payload, ensure_ascii=False, separators=(",", ":"),
+                      allow_nan=False).encode("utf-8")
+
+
 def get(ledger: str, key: str) -> dict[str, object]:
     """Return a copy of one batch without writing anything.
 
     ``ledger`` is the coordination ledger path and ``key`` the batch
-    key; both must be non-empty strings. The batch's nine recorded
-    business ledgers are read under shared locks to revalidate every
-    reference, so malformed, out-of-order or non-canonical bytes raise
-    ``ValueError`` and a missing business input ``FileNotFoundError``.
-    An unknown batch key -- including a missing coordination ledger --
-    raises ``KeyError`` and never creates the ledger, a lock file, a
-    directory or any other trace: a missing coordination ledger is
-    rejected before its companion lock is opened, and a business ledger
-    that does not exist is read (and refused) without creating its lock
-    file either.
+    key; both must be non-empty strings.
+
+    An existing coordination file first has to prove its *own* format --
+    UTF-8, finite JSON, version 1, the fixed root/batch/item/audit field
+    sets and order, key sorting and the exact canonical compact bytes --
+    before the target key is ever looked up. Any encoding, JSON,
+    version, field-order or canonical-byte violation therefore raises
+    ``ValueError`` even when ``key`` is absent; an unknown key can never
+    mask a malformed file. Only a missing ledger or a canonical ledger
+    that genuinely lacks the key raises ``KeyError``.
+
+    Once the format and the key are established without a lock, the
+    coordination ledger and the batch's nine business ledgers are read
+    under shared locks and every cross-reference is revalidated, so a
+    broken reference raises ``ValueError`` and a missing required
+    business ledger :class:`FileNotFoundError`. A miss never creates the
+    ledger, a lock file, a directory or any other trace: both miss
+    decisions are made by unlocked reads before a companion lock file is
+    opened (``os.open`` would create it), and a missing business ledger
+    is refused without creating its lock file either.
     """
     for value in (ledger, key):
         if not isinstance(value, str) or not value:
             raise ValueError("ledger and key must be non-empty strings")
     realpath = os.path.realpath(ledger)
-    # A read-only miss must leave no trace behind. The coordination
-    # ledger's absence and the batch key's absence are both established
-    # by unlocked reads before any companion lock file is opened
-    # (os.open would create it). Writes land through an atomic replace,
-    # so an unlocked read only ever sees a complete document.
-    def read_raw() -> bytes:
-        with open(realpath, "rb") as handle:
-            return handle.read()
-
-    if not os.path.exists(realpath):
-        raise KeyError(key)
+    # A read-only miss must leave no trace behind, so the coordination
+    # ledger is read unlocked first and its whole self-format is proven
+    # before the key membership decision. Writes land through an atomic
+    # replace, so an unlocked read only ever sees a complete document.
     try:
-        preliminary = read_raw()
+        preliminary = _read_raw(realpath)
     except FileNotFoundError:
         raise KeyError(key)
-    try:
-        probe = finite_loads(preliminary.decode("utf-8"))
-    except (ValueError, UnicodeDecodeError):
-        # A malformed ledger is a ValueError; take no lock (which would
-        # create the companion file) and fall through to the locked path
-        # that reports it canonically. Establish that first below.
-        probe = None
-    if probe is not None:
-        if not isinstance(probe, dict) \
-                or not isinstance(probe.get("batches"), dict):
-            # Invalid structure: report under the locked path.
-            pass
-        elif key not in probe["batches"]:
-            raise KeyError(key)
+    # Format first, membership second: a malformed ledger is a
+    # ValueError that an unknown key must never hide. This pass opens no
+    # business ledger and takes no lock.
+    intrinsic, _audit, _inputs_unused, _legacy = _parse_coordination_bytes(
+        realpath, preliminary, {}, None, require_references=False)
+    if key not in intrinsic:
+        raise KeyError(key)
+
     store = _get_store(realpath)
     with store.lock:
         with _lock(realpath, shared=True):
             try:
-                raw = read_raw()
+                raw = _read_raw(realpath)
             except FileNotFoundError:
-                # Lost to a concurrent removal between the existence
-                # check and the open: still a trace-free miss.
+                # Lost to a concurrent removal before the lock: still a
+                # trace-free miss.
                 raise KeyError(key)
-            try:
-                data = finite_loads(raw.decode("utf-8"))
-            except (ValueError, UnicodeDecodeError) as exc:
-                raise ValueError(
-                    f"migration coordination ledger {realpath!r} is not "
-                    "valid JSON") from exc
-            if not isinstance(data, dict) \
-                    or not isinstance(data.get("batches"), dict):
-                raise ValueError("migration coordination ledger has "
-                                 "invalid fields")
-            if key not in data["batches"]:
+            # Re-prove the format under the lock before touching a
+            # business ledger; a concurrent replacement may have changed
+            # the document.
+            locked_batches, _audit, locked_inputs, _legacy = \
+                _parse_coordination_bytes(
+                    realpath, raw, {}, None, require_references=False)
+            if key not in locked_batches:
                 raise KeyError(key)
-            inputs = _validate_inputs(data["batches"][key]["inputs"])
-            held: list[Any] = []
-            try:
-                # Only existing business ledgers take a shared flock; a
-                # missing one is read below (and refused there) without
-                # creating a lock file as a side effect.
-                for input_real in sorted(set(inputs.values())):
-                    if not os.path.exists(input_real):
-                        continue
-                    manager = _lock(input_real, shared=True)
-                    manager.__enter__()
-                    held.append(manager)
-                snapshot = _Snapshot(inputs)
-                batches, _audit, _inputs, _raw, _legacy = \
+            with _business_locks(locked_inputs):
+                snapshot = _Snapshot(locked_inputs)
+                batches, _audit_events, _ledger_inputs, _raw, _legacy = \
                     _load_coordination(
                         realpath,
                         {frozenset(snapshot.input_map.items()): snapshot},
                         None)
-            finally:
-                while held:
-                    manager = held.pop()
-                    with contextlib.suppress(BaseException):
-                        manager.__exit__(None, None, None)
-            return _batch_snapshot(batches[key])
+                return _batch_snapshot(batches[key])
+
+
+def search(ledger: str, cursor: str | None = None,
+           limit: int = _DEFAULT_LIMIT) -> dict[str, Any]:
+    """Return one page of batch snapshots in key code-point order.
+
+    ``ledger`` must be a non-empty string. ``cursor`` is ``None`` or a
+    non-empty string -- it need not name an existing batch -- and only
+    batches whose key is strictly greater than it in code-point order
+    are considered. ``limit`` is the page size: a non-boolean integer
+    from 1 to 1000, defaulting to 100. Anything else raises
+    ``ValueError`` before a file is read.
+
+    The page object is ``{"entries": [entry, ...], "next": cursor}`` in
+    that order; each entry carries, in order, ``key``, the complete
+    batch ``snapshot`` and ``completion``, which is ``null`` for an
+    active batch and ``{"index": i, "at": t}`` for a terminal one -- the
+    batch's zero-based position in the append-only audit (the real
+    completion order) and its completion moment. ``next`` is the key of
+    the page's last entry when further batches remain, else ``None``.
+
+    The query is strictly read-only and, like :func:`get`, proves the
+    coordination ledger's own format before its business references are
+    followed. A missing coordination ledger raises
+    :class:`FileNotFoundError`; malformed, out-of-order or non-canonical
+    bytes or a broken cross-reference raise ``ValueError`` and a missing
+    required business ledger :class:`FileNotFoundError`; any other
+    locking or I/O failure raises ``OSError``.
+    """
+    if not isinstance(ledger, str) or not ledger:
+        raise ValueError("ledger must be a non-empty string")
+    _validate_cursor_limit(cursor, limit)
+    realpath = os.path.realpath(ledger)
+    # Format before locks: an unlocked atomic read only ever sees a
+    # complete document, and a malformed ledger never reaches a business
+    # ledger or creates a companion lock file.
+    preliminary = _read_raw(realpath)
+    _parse_coordination_bytes(realpath, preliminary, {}, None,
+                              require_references=False)
+
+    store = _get_store(realpath)
+    with store.lock:
+        with _lock(realpath, shared=True):
+            raw = _read_raw(realpath)
+            _locked_batches, _audit, inputs, _legacy = \
+                _parse_coordination_bytes(
+                    realpath, raw, {}, None, require_references=False)
+            with _business_locks(inputs):
+                snapshot = _Snapshot(inputs)
+                batches, audit_events, _ledger_inputs, _raw, _legacy = \
+                    _load_coordination(
+                        realpath,
+                        {frozenset(snapshot.input_map.items()): snapshot},
+                        None)
+            return _page(batches, audit_events, cursor, limit)
+
+
+def _snapshot_checked(inputs: dict[str, str]) -> _Snapshot:
+    # Build the business snapshot, classifying a missing required
+    # business ledger as a broken reference the canonical coordination
+    # document makes (ValueError -> 409 migration_batches_invalid) rather
+    # than an absent file of the endpoint's own (FileNotFoundError ->
+    # 404). The six mandatory ledgers are the acceptance, supply, signal,
+    # clearing, dispatch and execution files; the advice, intent and
+    # settlement ledgers may legitimately be absent and load as empty.
+    try:
+        return _Snapshot(inputs)
+    except FileNotFoundError as exc:
+        raise ValueError(
+            "migration coordination ledger references a missing business "
+            "ledger") from exc
+
+
+def get_response(ledger: str, key: str) -> bytes:
+    """Serialize :func:`get`'s snapshot while every read lock is held.
+
+    The shared locks cover the coordination ledger, the nine related
+    business snapshots and the response serialization, so a concurrent
+    writer is observed as either the complete old or the complete new
+    version, never a mix. A missing coordination ledger raises
+    :class:`FileNotFoundError`; an unknown key raises ``KeyError``;
+    malformed bytes, a broken reference or a missing required business
+    ledger raise ``ValueError``; any other locking or I/O failure raises
+    ``OSError``.
+    """
+    for value in (ledger, key):
+        if not isinstance(value, str) or not value:
+            raise ValueError("ledger and key must be non-empty strings")
+    realpath = os.path.realpath(ledger)
+    try:
+        preliminary = _read_raw(realpath)
+    except FileNotFoundError:
+        raise _CoordinationMissing(realpath)
+    intrinsic, _audit, _inputs, _legacy = _parse_coordination_bytes(
+        realpath, preliminary, {}, None, require_references=False)
+    if key not in intrinsic:
+        raise KeyError(key)
+    store = _get_store(realpath)
+    with store.lock:
+        with _lock(realpath, shared=True):
+            try:
+                raw = _read_raw(realpath)
+            except FileNotFoundError:
+                # Lost to a concurrent removal before the lock.
+                raise _CoordinationMissing(realpath)
+            batches_locked, _audit, inputs_locked, _legacy = \
+                _parse_coordination_bytes(
+                    realpath, raw, {}, None, require_references=False)
+            if key not in batches_locked:
+                raise KeyError(key)
+            with _business_locks(inputs_locked):
+                snapshot = _snapshot_checked(inputs_locked)
+                batches, _audit_events, _ledger_inputs, _raw, _legacy = \
+                    _load_coordination(
+                        realpath,
+                        {frozenset(snapshot.input_map.items()): snapshot},
+                        None)
+                # Serialized before a single shared lock is released.
+                return _render(_batch_snapshot(batches[key]))
+
+
+def search_response(ledger: str, cursor: str | None = None,
+                    limit: int = _DEFAULT_LIMIT) -> bytes:
+    """Serialize :func:`search`'s page while every read lock is held.
+
+    The page is formed and rendered under the coordination ledger's and
+    the business ledgers' shared locks, so a racing writer is observed
+    as one complete version. A missing coordination ledger raises
+    :class:`FileNotFoundError`; bad arguments, malformed bytes, a broken
+    cross-reference or a missing required business ledger raise
+    ``ValueError``; other locking or I/O failures raise ``OSError``.
+    """
+    if not isinstance(ledger, str) or not ledger:
+        raise ValueError("ledger must be a non-empty string")
+    _validate_cursor_limit(cursor, limit)
+    realpath = os.path.realpath(ledger)
+    preliminary = _read_raw(realpath)
+    _parse_coordination_bytes(realpath, preliminary, {}, None,
+                              require_references=False)
+    store = _get_store(realpath)
+    with store.lock:
+        with _lock(realpath, shared=True):
+            raw = _read_raw(realpath)
+            _batches_locked, _audit, inputs, _legacy = \
+                _parse_coordination_bytes(
+                    realpath, raw, {}, None, require_references=False)
+            with _business_locks(inputs):
+                snapshot = _snapshot_checked(inputs)
+                batches, audit_events, _ledger_inputs, _raw, _legacy = \
+                    _load_coordination(
+                        realpath,
+                        {frozenset(snapshot.input_map.items()): snapshot},
+                        None)
+                page = _page(batches, audit_events, cursor, limit)
+                return _render(page)
