@@ -26,6 +26,21 @@ _MIGRATION_BATCHES_PARAMS = ("key", "cursor", "limit")
 # stream by the exclusive zero-based position cursor with an optional
 # batch key and related job filter, combined by logical AND.
 _MIGRATION_EVENTS_PARAMS = ("cursor", "limit", "key", "job")
+# POST /migration-consumers/{claim,pull,ack} each accept one fixed
+# JSON field set; the client never names a ledger path, which is fixed
+# at startup alongside --migration-batches.
+_MIGRATION_CONSUMER_PATHS = (
+    "/migration-consumers/claim", "/migration-consumers/pull",
+    "/migration-consumers/ack")
+_MIGRATION_CLAIM_FIELDS = frozenset(
+    ("consumer", "owner", "now", "lease", "idem", "key", "job_id"))
+_MIGRATION_CLAIM_REQUIRED = frozenset(
+    ("consumer", "owner", "now", "lease", "idem"))
+_MIGRATION_PULL_FIELDS = frozenset(("consumer", "owner", "now", "limit"))
+_MIGRATION_PULL_REQUIRED = frozenset(("consumer", "owner", "now"))
+_MIGRATION_ACK_FIELDS = frozenset(
+    ("consumer", "owner", "now", "position", "idem"))
+_MIGRATION_MAX_BODY = 1 << 20
 _ACCEPTANCE_STATES = ("pending", "active", "quarantined")
 _OPS = ("copy", "restore")
 _STAGES = ("成功", "校验", "执行", "同步", "回滚")
@@ -183,6 +198,220 @@ class Handler(BaseHTTPRequestHandler):
             self._migration_batch_events(query)
             return
         self._json(HTTPStatus.NOT_FOUND, {"error": "not_found"})
+
+    def do_POST(self) -> None:  # noqa: N802 - BaseHTTPRequestHandler contract
+        path, _, query = self.path.partition("?")
+        configured = getattr(self.server, "migration_batches", None) \
+            is not None and getattr(self.server, "migration_consumers",
+                                   None) is not None
+        if path in _MIGRATION_CONSUMER_PATHS and configured:
+            operation = path.rsplit("/", 1)[-1]
+            self._migration_consumer(operation, query)
+            return
+        self._json(HTTPStatus.NOT_FOUND, {"error": "not_found"})
+
+    def _read_consumer_body(self, operation: str) -> dict[str, object] | None:
+        # One fixed JSON object per operation: exact field set, no
+        # duplicates, non-boolean integer moments, no nulls beyond the
+        # optional claim filters and no client-selected paths. Anything
+        # else is a 400 and never reaches a ledger.
+        allowed, required = {
+            "claim": (_MIGRATION_CLAIM_FIELDS, _MIGRATION_CLAIM_REQUIRED),
+            "pull": (_MIGRATION_PULL_FIELDS, _MIGRATION_PULL_REQUIRED),
+            "ack": (_MIGRATION_ACK_FIELDS, _MIGRATION_ACK_FIELDS),
+        }[operation]
+
+        def reject_duplicates(pairs):
+            keys = [name for name, _value in pairs]
+            if len(keys) != len(set(keys)):
+                raise ValueError("duplicate JSON object member")
+            return dict(pairs)
+
+        def reject_constant(_token: str) -> float:
+            # NaN/Infinity are never valid request literals.
+            raise ValueError("non-finite JSON literal")
+
+        try:
+            length = int(self.headers.get("Content-Length", "0"))
+            if length < 0 or length > _MIGRATION_MAX_BODY:
+                raise ValueError("bad content length")
+            raw = self.rfile.read(length) if length else b""
+            body = json.loads(raw.decode("utf-8"),
+                             parse_constant=reject_constant,
+                             object_pairs_hook=reject_duplicates)
+        except (ValueError, UnicodeDecodeError):
+            self._json(HTTPStatus.BAD_REQUEST, {"error": "invalid_request"})
+            return None
+        if not isinstance(body, dict) \
+                or not required.issubset(body) \
+                or not set(body).issubset(allowed):
+            self._json(HTTPStatus.BAD_REQUEST, {"error": "invalid_request"})
+            return None
+        for name in ("consumer", "owner"):
+            value = body[name]
+            if not isinstance(value, str) or not value:
+                self._bad_request()
+                return None
+        now = body["now"]
+        if not isinstance(now, int) or isinstance(now, bool) or now < 0:
+            self._bad_request()
+            return None
+        if operation == "claim":
+            lease = body["lease"]
+            if not isinstance(lease, int) or isinstance(lease, bool) \
+                    or lease < 1:
+                self._bad_request()
+                return None
+            for name in ("key", "job_id"):
+                if name in body and body[name] is not None \
+                        and (not isinstance(body[name], str)
+                             or not body[name]):
+                    self._bad_request()
+                    return None
+            if not isinstance(body["idem"], str) or not body["idem"]:
+                self._bad_request()
+                return None
+        elif operation == "ack":
+            position = body["position"]
+            if not isinstance(position, int) or isinstance(position, bool) \
+                    or position < 0:
+                self._bad_request()
+                return None
+            if not isinstance(body["idem"], str) or not body["idem"]:
+                self._bad_request()
+                return None
+        elif "limit" in body:
+            limit = body["limit"]
+            if not isinstance(limit, int) or isinstance(limit, bool) \
+                    or not 1 <= limit <= _MAX_LIMIT:
+                self._bad_request()
+                return None
+        return body
+
+    def _bad_request(self) -> None:
+        self._json(HTTPStatus.BAD_REQUEST, {"error": "invalid_request"})
+
+    def _migration_consumer(self, operation: str, query: str) -> None:
+        coordination = getattr(self.server, "migration_batches")
+        consumers = getattr(self.server, "migration_consumers")
+        authorized, record = self._authorize()
+        if not authorized:
+            return
+        # No endpoint takes a query string; checked after identity like
+        # the other parameter validations, before the body and any file.
+        if query:
+            self._bad_request()
+            return
+        body = self._read_consumer_body(operation)
+        if body is None:
+            return
+        consumer = body["consumer"]
+        owner = body["owner"]
+        now = body["now"]
+
+        # Scope follows body validation and precedes the coordination
+        # stream read. The operation and stage axes need no file and are
+        # decided first. A claim carries the batch key in the request; a
+        # pull or ack never names it, so the key axis reads the
+        # consumer's persisted fixed subscription from this endpoint's
+        # own control ledger (at the same stage the auth configuration
+        # is re-read). The data-plane coordination and business ledgers
+        # open only after the scope is allowed.
+        if record is not None and (record.ops is not None
+                                   or record.stages is not None):
+            self._json(HTTPStatus.FORBIDDEN, {"error": "forbidden"})
+            return
+        batch_key: str | None
+        if operation == "claim":
+            batch_key = body.get("key")
+        elif record is not None and record.keys is None:
+            batch_key = None
+        else:
+            try:
+                subscription = migration_batch.consumer_subscription(
+                    coordination, consumers, consumer)
+            except KeyError:
+                self._json(HTTPStatus.NOT_FOUND,
+                           {"error": "migration_consumer_not_found"})
+                return
+            except migration_batch.ConsumerLedgerInvalid:
+                self._json(HTTPStatus.CONFLICT,
+                           {"error": "migration_consumers_invalid"})
+                return
+            except FileNotFoundError:
+                self._json(HTTPStatus.NOT_FOUND,
+                           {"error": "migration_consumers_not_found"})
+                return
+            except OSError:
+                self._json(HTTPStatus.SERVICE_UNAVAILABLE,
+                           {"error": "migration_consumers_unavailable"})
+                return
+            batch_key = subscription["key"]
+        if record is not None and record.keys is not None:
+            allowed = batch_key is not None and batch_key in record.keys
+            if not allowed:
+                self._json(HTTPStatus.FORBIDDEN,
+                           {"error": "forbidden"})
+                return
+
+        kwargs: dict[str, object] = {}
+        if operation == "claim":
+            if "key" in body:
+                kwargs["key"] = body["key"]
+            if "job_id" in body:
+                kwargs["job_id"] = body["job_id"]
+            kwargs["lease"] = body["lease"]
+            kwargs["idem"] = body["idem"]
+        elif operation == "ack":
+            kwargs["position"] = body["position"]
+            kwargs["idem"] = body["idem"]
+        elif "limit" in body:
+            kwargs["limit"] = body["limit"]
+
+        try:
+            payload = migration_batch.consume_response(
+                coordination, consumers, operation, consumer, owner, now,
+                **kwargs)
+        except KeyError:
+            self._json(HTTPStatus.NOT_FOUND,
+                       {"error": "migration_consumer_not_found"})
+        except (PermissionError, TimeoutError):
+            # A live lease owned by another caller, or an expired lease
+            # the caller no longer holds: an ownership conflict.
+            self._json(HTTPStatus.CONFLICT,
+                       {"error": "migration_consumer_ownership"})
+        except LookupError:
+            # The confirmed cursor points at an event the current stream
+            # truncated, rewrote or reused: a stream regression.
+            self._json(HTTPStatus.CONFLICT,
+                       {"error": "migration_consumer_checkpoint"})
+        except migration_batch.CoordinationLedgerInvalid:
+            self._json(HTTPStatus.CONFLICT,
+                       {"error": "migration_batches_invalid"})
+        except migration_batch.ConsumerLedgerInvalid:
+            self._json(HTTPStatus.CONFLICT,
+                       {"error": "migration_consumers_invalid"})
+        except migration_batch.CoordinationLedgerMissing:
+            # The fixed coordination ledger itself is missing; it keeps
+            # the read-only endpoint's 404 and never leaks its path.
+            self._json(HTTPStatus.NOT_FOUND,
+                       {"error": "migration_batches_not_found"})
+        except migration_batch.ConsumersLedgerMissing:
+            # The configured consumer ledger parent does not exist.
+            self._json(HTTPStatus.NOT_FOUND,
+                       {"error": "migration_consumers_not_found"})
+        except FileNotFoundError:
+            self._json(HTTPStatus.NOT_FOUND,
+                       {"error": "migration_consumers_not_found"})
+        except ValueError:
+            # A changed idempotent request, a backward or past-tail ack,
+            # a non-matching ack target or any other invalid argument.
+            self._json(HTTPStatus.BAD_REQUEST, {"error": "invalid_request"})
+        except OSError:
+            self._json(HTTPStatus.SERVICE_UNAVAILABLE,
+                       {"error": "migration_consumers_unavailable"})
+        else:
+            self._bytes(HTTPStatus.OK, payload)
 
     def _authorize(self) -> tuple[bool, auth.Record | None]:
         # Authorization comes first: an unauthorized request learns nothing
@@ -606,7 +835,8 @@ def serve(host: str, port: int, audit_path: str | None = None,
           token: str | None = None, auth: str | None = None,
           checkpoint: str | None = None,
           acceptance: str | None = None,
-          migration_batches: str | None = None) -> None:
+          migration_batches: str | None = None,
+          migration_consumers: str | None = None) -> None:
     with ThreadingHTTPServer((host, port), Handler) as server:
         server.audit_path = audit_path  # type: ignore[attr-defined]
         server.audit_token = token  # type: ignore[attr-defined]
@@ -614,4 +844,5 @@ def serve(host: str, port: int, audit_path: str | None = None,
         server.audit_checkpoint = checkpoint  # type: ignore[attr-defined]
         server.acceptance_dir = acceptance  # type: ignore[attr-defined]
         server.migration_batches = migration_batches  # type: ignore[attr-defined]
+        server.migration_consumers = migration_consumers  # type: ignore[attr-defined]
         server.serve_forever()
