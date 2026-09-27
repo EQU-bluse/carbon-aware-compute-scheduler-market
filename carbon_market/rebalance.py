@@ -104,10 +104,14 @@ only the source.
 The three calls share one idempotency key space with :func:`apply`:
 replaying a key with the same request returns the current plan snapshot
 with ``False`` and writes nothing, while the same key with a changed
-request raises ``ValueError``. The ledger upgrade to version 2 keeps
-every recorded intent and appends the ``plans`` section keyed by job id;
-only the first change of a call commits the plan, its state, the
-idempotency binding and the audit event atomically. Every read requires the on-disk bytes to be exactly the
+request raises ``ValueError``. The first successful :func:`start`
+atomically upgrades the ledger to version 3 -- the continuous-migration
+layout that keeps every recorded intent (keyed by its reservation key)
+and appends the ``plans`` section keyed by the plan's own start key,
+with every action request carrying its derived association -- so no
+generation's evidence is ever overwritten; only the first change of a
+call commits the plan, its state, the idempotency binding and the audit
+event atomically. Every read requires the on-disk bytes to be exactly the
 canonical compact form :func:`_canonical_bytes` produces -- compact
 UTF-8 JSON with non-ASCII written through, no negative-zero or
 non-finite number literals and exactly one trailing newline -- and
@@ -2818,8 +2822,10 @@ def start(
     ``switch``; the target capacity stays exclusively held by the
     intent for the whole execution. Returns ``(plan, created)``; the
     plan, its idempotency binding and the audit event are committed in
-    one synced atomic write that upgrades the ledger to version 2 while
-    keeping every recorded intent. Replaying the same key with the same
+    one synced atomic write that upgrades the ledger to version 3 --
+    intents keyed by their reservation key, plans keyed by their start
+    key -- while keeping every recorded intent, plan, binding and audit
+    event. Replaying the same key with the same
     job, owner, lease end and moment returns the current plan with
     ``False`` without writing; the same key with a changed request
     raises ``ValueError`` and leaves the ledger untouched.
@@ -2895,6 +2901,22 @@ def start(
                     return copy.deepcopy(plans[key]), False
                 return copy.deepcopy(plans[job_id]), False
 
+            if _version != _INTENT_VERSION_V3:
+                # The first successful start atomically upgrades the
+                # ledger to the continuous-migration layout (version 3):
+                # every recorded intent, plan, idempotency binding and
+                # audit event is preserved, re-keyed so each reservation
+                # key names exactly one intent and each start key exactly
+                # one plan, and every action request gains its derived
+                # association. The upgrade is in-memory until the final
+                # commit, so the refusal checks below still leave the
+                # file untouched, and a replay (handled above) never
+                # rewrites a byte.
+                intents, plans, idempotency, events = \
+                    _upgrade_intent_ledger_v3(
+                        intents, plans, idempotency, events)
+                _version = _INTENT_VERSION_V3
+
             job = accepted.get(job_id)
             if job is None:
                 raise KeyError(job_id)
@@ -2962,24 +2984,19 @@ def start(
                 "state": "active",
                 "steps": [],
             }
-            if _version == _INTENT_VERSION_V3:
-                # The plan is keyed by its own start idempotency key and
-                # the request names the reserved intent it claims, so
-                # every earlier generation's plan, receipts and keys
-                # stay untouched.
-                request["intent_key"] = intent_ref
-                plans[key] = new_plan
-                write_version = _INTENT_VERSION_V3
-            else:
-                plans[job_id] = new_plan
-                write_version = _INTENT_VERSION_V2
+            # The plan is keyed by its own start idempotency key and the
+            # request names the reserved intent it claims, so every
+            # earlier generation's plan, receipts and keys stay
+            # untouched.
+            request["intent_key"] = intent_ref
+            plans[key] = new_plan
             idempotency[key] = request
             events[key] = {"key": key, "request": dict(request),
                            "result": copy.deepcopy(new_plan)}
             _commit_file(ledger_real,
                          _intent_canonical_bytes(intents, plans,
                                                  idempotency, events,
-                                                 write_version),
+                                                 _INTENT_VERSION_V3),
                          old_bytes, prefix=".rebalance-start-")
             return copy.deepcopy(new_plan), True
 

@@ -202,19 +202,26 @@ class RebalanceMigrateTest(unittest.TestCase):
                          ["version", "intents", "idempotency", "audit"])
         self._start()
         data = json.loads(Path(self.ledger).read_text(encoding="utf-8"))
-        self.assertEqual(data["version"], 2)
+        self.assertEqual(data["version"], 3)
         self.assertEqual(list(data.keys()),
                          ["version", "intents", "plans", "idempotency",
                           "audit"])
-        self.assertEqual(data["intents"], before["intents"])
-        self.assertEqual(list(data["plans"]), ["j-1"])
+        # The reservation is preserved verbatim, re-keyed by its own
+        # apply key, and the plan is keyed by its start key.
+        self.assertEqual(list(data["intents"]), ["r1"])
+        self.assertEqual(data["intents"]["r1"], before["intents"]["j-1"])
+        self.assertEqual(list(data["plans"]), ["m1"])
         self.assertEqual(set(data["idempotency"]), {"r1", "m1"})
         self.assertEqual(set(data["audit"]), {"r1", "m1"})
+        self.assertEqual(data["idempotency"]["r1"],
+                         before["idempotency"]["r1"])
+        self.assertEqual(data["audit"]["r1"], before["audit"]["r1"])
         event = data["audit"]["m1"]
         self.assertEqual(event["request"],
                          {"action": "start", "job_id": "j-1",
-                          "owner": "owner-1", "lease_end": 90, "at": 45})
-        self.assertEqual(event["result"], data["plans"]["j-1"])
+                          "owner": "owner-1", "lease_end": 90, "at": 45,
+                          "intent_key": "r1"})
+        self.assertEqual(event["result"], data["plans"]["m1"])
 
     def test_start_replay_returns_current_snapshot(self) -> None:
         self._prepare_reserved()
@@ -616,7 +623,7 @@ class RebalanceMigrateTest(unittest.TestCase):
         self._migrate()
         good = Path(self.ledger).read_bytes()
         data = json.loads(good.decode("utf-8"))
-        data["plans"]["j-1"]["state"] = "active"
+        data["plans"]["m1"]["state"] = "active"
         Path(self.ledger).write_text(
             json.dumps(data, ensure_ascii=False, separators=(",", ":"))
             + "\n", encoding="utf-8")
@@ -624,7 +631,7 @@ class RebalanceMigrateTest(unittest.TestCase):
             self._recover(at=95)
         Path(self.ledger).write_bytes(good)
         data = json.loads(good.decode("utf-8"))
-        data["plans"]["j-1"]["steps"][0]["receipt"] = "forged"
+        data["plans"]["m1"]["steps"][0]["receipt"] = "forged"
         Path(self.ledger).write_text(
             json.dumps(data, ensure_ascii=False, separators=(",", ":"))
             + "\n", encoding="utf-8")
