@@ -41,10 +41,24 @@ just that member, while the other members continue.
 
 An active batch may only be continued by its current owner; another
 owner may take over only after the coordination lease has strictly
-expired. The coordination ledger (version 1, sections ``version``,
+expired. A member that drives a migration plan keeps the plan's actual
+step receipts -- the credential text verbatim, including non-ASCII -- in
+its most recent snapshot, never just a stage marker. A receipt that is
+fully equivalent to a step already saved returns the current progress
+instead of failing the member, while any change to that step's result,
+credential or moment raises ``ValueError`` with the coordination bytes
+untouched; if the step previously landed downstream but the coordination
+snapshot has not advanced yet, re-entry catches the original action up
+exactly once.
+
+The coordination ledger (version 1, sections ``version``, key-sorted
 ``batches`` and an append-only ``audit``) is one compact UTF-8 JSON
 document with non-ASCII written through, decimal integers and exactly
-one trailing newline.
+one trailing newline. The audit is appended in the real order batches
+complete and is never re-sorted by batch key; each completed batch has
+exactly one event whose snapshot equals that batch's complete state at
+completion. Ledgers written without the per-item receipts field still
+load and replay byte-for-byte; a batch a run rewrites gains that field.
 """
 
 from __future__ import annotations
@@ -68,6 +82,14 @@ _ROOT_FIELDS = ("version", "batches", "audit")
 _BATCH_FIELDS = ("key", "owner", "until", "status", "inputs", "items")
 _ITEM_FIELDS = ("job_id", "plan_key", "phase", "request_key", "lease",
                 "error", "snapshot")
+# Every item that drove (or drives) a migration plan also carries the
+# actual step receipts its plan recorded, so the credential evidence --
+# including non-ASCII credentials -- survives in the item's most recent
+# snapshot instead of being reduced to a stage marker. The field is
+# appended last and is optional on read: ledgers written by the baseline
+# without it keep validating and replaying byte-for-byte.
+_ITEM_RECEIPTS_FIELD = "receipts"
+_ITEM_FIELDS_WITH_RECEIPTS = _ITEM_FIELDS + (_ITEM_RECEIPTS_FIELD,)
 _EVENT_FIELDS = ("key", "at", "batch")
 # Field order of the recorded input map; the values are resolved real
 # paths, so one batch permanently names one exact business ledger set.
@@ -87,6 +109,14 @@ _PLAN_TERMINAL = ("migrated", "failed", "interrupted")
 _STEPS = ("copy", "switch")
 _LOCK_SUFFIX = ".lock"
 _PREFIX = ".migration-batch-"
+
+
+class _ChangedRequest(ValueError):
+    # Internal marker: a persisted request conflicts with evidence the
+    # downstream ledger already holds. It is a public ValueError to
+    # callers but must abort the run with the coordination bytes
+    # untouched instead of failing just the member.
+    pass
 
 
 class _Store:
@@ -408,6 +438,35 @@ def _is_marker(value: object) -> bool:
         and isinstance(value.get("request"), dict)
 
 
+def _validate_step_receipts(raw: object) -> list[dict[str, Any]]:
+    # The actual step receipts a migration item's plan recorded, in the
+    # plan's fixed copy/switch order. The credentials are kept verbatim
+    # (non-ASCII written through on serialization), never collapsed to a
+    # stage marker.
+    if not isinstance(raw, list) or len(raw) > len(_STEPS):
+        raise ValueError("migration batch item receipts must be a list "
+                         "within the copy/switch sequence")
+    receipts: list[dict[str, Any]] = []
+    for index, entry in enumerate(raw):
+        if not isinstance(entry, dict) \
+                or set(entry.keys()) != {"step", "result", "receipt", "at"}:
+            raise ValueError("item step receipt has invalid fields")
+        if entry["step"] != _STEPS[index]:
+            raise ValueError("item step receipts must follow copy then "
+                             "switch")
+        if entry["result"] not in ("succeeded", "failed"):
+            raise ValueError("item step result must be succeeded or failed")
+        if not isinstance(entry["receipt"], str) or not entry["receipt"]:
+            raise ValueError("item step receipt text must be a non-empty "
+                             "string")
+        if not _is_plain_int(entry["at"]) or entry["at"] < 0:
+            raise ValueError("item step receipt at must be a non-boolean "
+                             "non-negative integer")
+        receipts.append({"step": entry["step"], "result": entry["result"],
+                         "receipt": entry["receipt"], "at": entry["at"]})
+    return receipts
+
+
 def _validate_marker(raw: object) -> dict[str, Any]:
     if not _is_marker(raw):
         raise ValueError("migration batch item snapshot must be a result "
@@ -463,11 +522,14 @@ def _validate_item(
     raw: object,
     job_id: object,
     snapshot: _Snapshot,
-) -> dict[str, Any]:
+) -> tuple[dict[str, Any], bool]:
     if not isinstance(job_id, str) or not job_id:
         raise ValueError("batch item keys must be non-empty strings")
-    if not isinstance(raw, dict) or set(raw.keys()) != set(_ITEM_FIELDS):
+    if not isinstance(raw, dict) \
+            or set(raw.keys()) not in (set(_ITEM_FIELDS),
+                                       set(_ITEM_FIELDS_WITH_RECEIPTS)):
         raise ValueError("migration batch item has invalid fields")
+    legacy = _ITEM_RECEIPTS_FIELD not in raw
     if raw["job_id"] != job_id:
         raise ValueError("migration batch item key must match its job id")
     plan_key = raw["plan_key"]
@@ -491,6 +553,8 @@ def _validate_item(
         raise ValueError("migration batch item error must be null or a "
                          "non-empty string")
     item_snapshot = raw["snapshot"]
+    item_receipts = _validate_step_receipts(
+        raw["receipts"]) if not legacy else []
 
     if job_id not in snapshot.accepted:
         raise ValueError("migration batch item must reference an accepted "
@@ -503,6 +567,21 @@ def _validate_item(
     binding_choices.extend(record["after"] for record
                           in snapshot.completed.get(job_id, ()))
 
+    def require_receipts_match(plan: dict[str, Any] | None) -> None:
+        # The item's saved step receipts are exactly the plan's recorded
+        # steps; an item that has not recorded a step carries none. A
+        # baseline ledger item has no receipts field: its receipts are
+        # derived from the referenced plan instead of enforced, so a
+        # pending baseline batch still loads and normalizes on its next
+        # commit while a completed one keeps replaying byte-for-byte.
+        nonlocal item_receipts
+        expected = plan["steps"] if plan is not None else []
+        if legacy:
+            item_receipts = copy.deepcopy(expected)
+        elif item_receipts != expected:
+            raise ValueError("migration batch item receipts must match the "
+                             "plan's recorded step receipts")
+
     if phase == "kept":
         if plan_key is not None or lease is not None or error is not None:
             raise ValueError("a kept item must not carry plan, lease or "
@@ -510,12 +589,16 @@ def _validate_item(
         if item_snapshot not in binding_choices:
             raise ValueError("a kept item snapshot must be a current "
                              "binding")
+        require_receipts_match(None)
     elif phase == "failed":
         if error is None:
             raise ValueError("a failed item must carry the public error "
                              "class name")
         if item_snapshot is not None:
             raise ValueError("a failed item must not carry a snapshot")
+        failed_plan = (snapshot.plans.get(plan_key)
+                       if plan_key is not None else None)
+        require_receipts_match(failed_plan)
     else:
         if plan_key is None or error is not None:
             raise ValueError("an active migration item must name its "
@@ -536,6 +619,7 @@ def _validate_item(
             if action not in expected_actions:
                 raise ValueError("migration batch item marker action does "
                                  "not match its phase")
+            marker_plan = snapshot.plans.get(plan_key)
             if action == "apply":
                 advice = snapshot.advice_records.get(
                     marker["request"]["advice_key"])
@@ -543,15 +627,40 @@ def _validate_item(
                         or advice["recommendation"] != "migrate":
                     raise ValueError("apply marker must reference a "
                                      "recorded migrate advice for the job")
+                require_receipts_match(None)
             elif action == "start":
                 if lease != marker["request"]["lease_end"]:
                     raise ValueError("start marker lease must match the "
                                      "item lease")
+                require_receipts_match(None)
             elif action in ("record", "recover"):
-                plan = snapshot.plans.get(plan_key)
-                if plan is None or plan["job_id"] != job_id:
+                if marker_plan is None or marker_plan["job_id"] != job_id:
                     raise ValueError("record/recover marker must reference "
                                      "a recorded migration plan")
+                if phase == "active" and action == "record":
+                    # The record action is in flight. Normally the item's
+                    # receipts are exactly the plan's steps. A crash
+                    # between the downstream commit and the coordination
+                    # snapshot update leaves the plan carrying the very
+                    # step the marker persists while the item receipts
+                    # lag by that one step -- the catch-up state re-entry
+                    # completes -- in which case the plan steps must be
+                    # the item receipts followed by exactly the marker's
+                    # own step. Any other divergence is corruption.
+                    req = marker["request"]
+                    lagging = {"step": req["step"], "result": req["result"],
+                               "receipt": req["receipt"], "at": req["at"]}
+                    plan_steps = marker_plan["steps"]
+                    if not (item_receipts == plan_steps
+                            or (len(plan_steps) == len(item_receipts) + 1
+                                and plan_steps[:len(item_receipts)]
+                                == item_receipts
+                                and plan_steps[-1] == lagging)):
+                        raise ValueError(
+                            "migration batch item receipts must match the "
+                            "plan's recorded step receipts")
+                else:
+                    require_receipts_match(marker_plan)
             elif action == "settle":
                 if marker["request"]["plan_key"] != plan_key:
                     raise ValueError("settle marker must name the item's "
@@ -560,19 +669,22 @@ def _validate_item(
                     record["job_id"] == job_id
                     and record["plan_key"] == plan_key
                     for record in snapshot.settlements.values())
-                plan = snapshot.plans.get(plan_key)
                 if not settled_already and (
-                        plan is None or plan["job_id"] != job_id
-                        or plan["state"] not in _PLAN_TERMINAL):
+                        marker_plan is None
+                        or marker_plan["job_id"] != job_id
+                        or marker_plan["state"] not in _PLAN_TERMINAL):
                     raise ValueError("settle marker must reference a "
                                      "terminal migration plan")
+                require_receipts_match(marker_plan)
         elif phase == "settled":
             settled = next((record for record in snapshot.settlements.values()
                             if record["job_id"] == job_id
                             and record["plan_key"] == plan_key), None)
+            settled_plan = snapshot.plans.get(plan_key)
             if settled is None or item_snapshot != settled:
                 raise ValueError("a settled item must snapshot its "
                                  "settlement record")
+            require_receipts_match(settled_plan)
         else:
             if phase != "active":
                 raise ValueError(f"a {phase} item must carry a pending-"
@@ -587,6 +699,7 @@ def _validate_item(
             if lease != plan["lease_end"]:
                 raise ValueError("migration batch item lease must be the "
                                  "plan lease end")
+            require_receipts_match(plan)
 
     return {
         "job_id": job_id,
@@ -596,7 +709,8 @@ def _validate_item(
         "lease": lease,
         "error": error,
         "snapshot": copy.deepcopy(item_snapshot),
-    }
+        "receipts": copy.deepcopy(item_receipts),
+    }, legacy
 
 
 def _validate_ledger(
@@ -604,7 +718,7 @@ def _validate_ledger(
     snapshots: dict[frozenset[tuple[str, str]], _Snapshot],
     default_inputs: dict[str, str] | None,
 ) -> tuple[dict[str, dict[str, Any]], list[dict[str, Any]],
-           dict[str, str]]:
+           dict[str, str], set[str]]:
     if not isinstance(data, dict) or set(data.keys()) != set(_ROOT_FIELDS):
         raise ValueError("migration coordination ledger root must be an "
                          "object with keys version, batches and audit")
@@ -619,6 +733,12 @@ def _validate_ledger(
 
     batches: dict[str, dict[str, Any]] = {}
     completed: set[str] = set()
+    # Batches written by the baseline carry no per-item receipts field.
+    # Their arity is uniform within a batch (a batch is always written as
+    # one document); a mixed batch is non-canonical. The set lets reads
+    # reproduce the original bytes while every new commit writes the
+    # receipts field on every item.
+    legacy_batches: set[str] = set()
     ledger_inputs: dict[str, str] | None = None
     for batch_key, batch_raw in batches_raw.items():
         if not isinstance(batch_key, str) or not batch_key:
@@ -652,10 +772,18 @@ def _validate_ledger(
         if snapshot is None:
             raise ValueError("batch inputs do not name the loaded "
                              "business snapshot")
+        item_shapes: set[bool] = set()
         items: dict[str, dict[str, Any]] = {}
         for member_key, item_raw in items_raw.items():
-            item = _validate_item(item_raw, member_key, snapshot)
+            item, item_legacy = _validate_item(item_raw, member_key,
+                                               snapshot)
+            item_shapes.add(item_legacy)
             items[member_key] = item
+        if len(item_shapes) > 1:
+            raise ValueError("a batch must uniformly carry the per-item "
+                             "receipts field or omit it")
+        if item_shapes == {True}:
+            legacy_batches.add(batch_key)
         if status == "completed":
             if any(item["phase"] not in _ITEM_TERMINAL
                    for item in items.values()):
@@ -673,7 +801,6 @@ def _validate_ledger(
 
     audit: list[dict[str, Any]] = []
     seen_events: set[str] = set()
-    last_key = ""
     for event_raw in audit_raw:
         if not isinstance(event_raw, dict) \
                 or set(event_raw.keys()) != set(_EVENT_FIELDS):
@@ -682,12 +809,10 @@ def _validate_ledger(
         if not isinstance(event_key, str) or not event_key:
             raise ValueError("migration audit event key must be a "
                              "non-empty string")
-        if event_key <= last_key:
-            # The audit is append-only: out-of-order or duplicated events
-            # are both illegal.
-            raise ValueError("migration audit must be strictly ordered "
-                             "and unique")
-        last_key = event_key
+        # The audit is an append-only log in the real order batches
+        # completed: the physical position carries the order, so events
+        # need not be -- and must not be re-sorted by -- batch key. Only
+        # duplication is illegal here.
         if event_key in seen_events:
             raise ValueError("migration audit keys must be unique")
         seen_events.add(event_key)
@@ -699,7 +824,12 @@ def _validate_ledger(
         if batch is None or batch["status"] != "completed":
             raise ValueError("migration audit event must reference a "
                              "completed batch")
-        if event_raw["batch"] != batch:
+        # Compare against the batch in its on-disk arity: a baseline
+        # batch's audit snapshot predates the per-item receipts field,
+        # whose values are derived on load.
+        expected_event_batch = _canonical_batch(
+            batch, legacy=event_key in legacy_batches)
+        if event_raw["batch"] != expected_event_batch:
             raise ValueError("migration audit event batch does not match "
                              "its batch")
         audit.append({"key": event_key, "at": at,
@@ -715,21 +845,22 @@ def _validate_ledger(
             raise ValueError("a migration coordination ledger must hold "
                              "at least one batch")
         ledger_inputs = default_inputs
-    return batches, audit, ledger_inputs
+    return batches, audit, ledger_inputs, legacy_batches
 
 
-def _canonical_item(item: dict[str, Any]) -> dict[str, Any]:
-    return {field: copy.deepcopy(item[field]) for field in _ITEM_FIELDS}
+def _canonical_item(item: dict[str, Any], legacy: bool = False) -> dict[str, Any]:
+    fields = _ITEM_FIELDS if legacy else _ITEM_FIELDS_WITH_RECEIPTS
+    return {field: copy.deepcopy(item[field]) for field in fields}
 
 
-def _canonical_batch(batch: dict[str, Any]) -> dict[str, Any]:
+def _canonical_batch(batch: dict[str, Any], legacy: bool = False) -> dict[str, Any]:
     return {
         "key": batch["key"],
         "owner": batch["owner"],
         "until": batch["until"],
         "status": batch["status"],
         "inputs": {name: batch["inputs"][name] for name in _INPUT_NAMES},
-        "items": {job_id: _canonical_item(batch["items"][job_id])
+        "items": {job_id: _canonical_item(batch["items"][job_id], legacy)
                   for job_id in sorted(batch["items"])},
     }
 
@@ -737,18 +868,26 @@ def _canonical_batch(batch: dict[str, Any]) -> dict[str, Any]:
 def _canonical_bytes(
     batches: dict[str, dict[str, Any]],
     audit: list[dict[str, Any]],
+    legacy_batches: set[str] | None = None,
 ) -> bytes:
     # Compact UTF-8 JSON, non-ASCII written through, sections in their
     # fixed field order, batches and their items code-point sorted and
-    # the audit appended in strict key order, terminated by exactly one
-    # newline.
+    # the audit appended in the physical order in which the batches
+    # actually completed (never re-sorted by batch key), terminated by
+    # exactly one newline. Baseline batches without the per-item
+    # receipts field are reproduced field-for-field; every batch a run
+    # (re)writes carries that field.
+    legacy_batches = legacy_batches or set()
     payload = {
         "version": _VERSION,
-        "batches": {key: _canonical_batch(batches[key])
+        "batches": {key: _canonical_batch(
+                        batches[key], legacy=key in legacy_batches)
                     for key in sorted(batches)},
         "audit": [{"key": event["key"], "at": event["at"],
-                   "batch": _canonical_batch(event["batch"])}
-                  for event in sorted(audit, key=lambda event: event["key"])],
+                   "batch": _canonical_batch(
+                       event["batch"],
+                       legacy=event["key"] in legacy_batches)}
+                  for event in audit],
     }
     text = json.dumps(payload, ensure_ascii=False, separators=(",", ":"),
                       allow_nan=False) + "\n"
@@ -760,14 +899,14 @@ def _load_coordination(
     snapshots: dict[frozenset[tuple[str, str]], _Snapshot],
     default_inputs: dict[str, str] | None = None,
 ) -> tuple[dict[str, dict[str, Any]], list[dict[str, Any]],
-           dict[str, str], bytes | None]:
+           dict[str, str], bytes | None, set[str]]:
     try:
         with open(realpath, "rb") as handle:
             raw = handle.read()
     except FileNotFoundError:
         if default_inputs is None:
             raise
-        return {}, [], default_inputs, None
+        return {}, [], default_inputs, None, set()
     try:
         text = raw.decode("utf-8")
     except UnicodeDecodeError as exc:
@@ -781,13 +920,13 @@ def _load_coordination(
         raise ValueError(
             f"migration coordination ledger {realpath!r} is not valid "
             "JSON") from exc
-    batches, audit, inputs = _validate_ledger(data, snapshots,
-                                              default_inputs)
-    if raw != _canonical_bytes(batches, audit):
+    batches, audit, inputs, legacy_batches = _validate_ledger(
+        data, snapshots, default_inputs)
+    if raw != _canonical_bytes(batches, audit, legacy_batches):
         raise ValueError(
             f"migration coordination ledger {realpath!r} is not in "
             "canonical compact form")
-    return batches, audit, inputs, raw
+    return batches, audit, inputs, raw, legacy_batches
 
 
 # ---------------------------------------------------------------------------
@@ -845,13 +984,23 @@ def _build_members(
     lease: int,
     excluded: set[str],
 ) -> list[dict[str, Any]]:
-    # Fix the membership from one complete snapshot: accepted jobs with
-    # a trade, minus jobs another still-open batch already drives,
-    # ordered by job id. The stage each member starts in is fixed here;
-    # only its downstream requests advance later.
+    # Fix the membership from one complete snapshot: accepted jobs that
+    # already hold a trade and whose booking is not yet finished -- a
+    # succeeded dispatch or a completed execution plan never becomes a
+    # member again -- minus jobs another still-open batch already
+    # drives, ordered by job id. The stage each member starts in is
+    # fixed here; only its downstream requests advance later.
     members: list[dict[str, Any]] = []
     for job_id in sorted(snapshot.accepted):
         if snapshot.cleared.get(job_id) is None or job_id in excluded:
+            continue
+        decision = snapshot.decisions.get(job_id)
+        exec_states = {plan["state"]
+                       for plan in snapshot.exec_plans.get(job_id, {}).values()}
+        if (decision is not None and decision["state"] == "succeeded") \
+                or "completed" in exec_states:
+            # A completed dispatch or execution is a finished booking:
+            # it is fixed by no batch, now or on any later scan.
             continue
         binding = snapshot.current_binding(job_id)
         own_plan_key = _plan_key_for(batch_key, job_id)
@@ -870,6 +1019,10 @@ def _build_members(
                 "lease": active["lease_end"],
                 "error": None,
                 "snapshot": copy.deepcopy(active),
+                # The plan may already hold recorded step receipts; the
+                # first snapshot keeps them verbatim, including non-ASCII
+                # credentials, instead of reducing the member to a stage.
+                "receipts": copy.deepcopy(active["steps"]),
             })
             continue
         terminal = next((plan for _ref, plan in reversed(rooted)
@@ -902,6 +1055,7 @@ def _build_members(
                 "error": None,
                 "snapshot": _marker("settle", plan_key=terminal_ref,
                                     at=settle_at),
+                "receipts": copy.deepcopy(terminal["steps"]),
             })
             continue
         unclaimed = snapshot.unclaimed_rooted_intent(job_id, binding)
@@ -920,6 +1074,7 @@ def _build_members(
                 "error": None,
                 "snapshot": _marker("start", owner=owner, lease_end=lease_end,
                                     at=now),
+                "receipts": [],
             })
             continue
         decision = snapshot.decisions.get(job_id)
@@ -941,6 +1096,7 @@ def _build_members(
                 "lease": None,
                 "error": None,
                 "snapshot": binding,
+                "receipts": [],
             })
             continue
         # Otherwise the batch judges the round itself: the evaluate
@@ -954,6 +1110,7 @@ def _build_members(
             "lease": None,
             "error": None,
             "snapshot": _marker("evaluate", at=now),
+            "receipts": [],
         })
     return members
 
@@ -1097,9 +1254,9 @@ def run(
             try:
                 snapshot_map = {frozenset(snapshot.input_map.items()):
                                 snapshot}
-                batches, audit_events, _ledger_inputs, old_bytes = \
-                    _load_coordination(coordination_real, snapshot_map,
-                                       snapshot.input_map)
+                batches, audit_events, _ledger_inputs, old_bytes, \
+                    legacy_batches = _load_coordination(
+                        coordination_real, snapshot_map, snapshot.input_map)
 
                 batch = batches.get(key)
                 created = batch is None
@@ -1131,7 +1288,9 @@ def run(
                         "until": now + lease,
                         "status": "pending",
                         "inputs": snapshot.input_map,
-                        "items": {member["job_id"]: member
+                        "items": {member["job_id"]:
+                                      dict(member, receipts=list(
+                                          member.get("receipts", ())))
                                   for member in members},
                     }
                     batches[key] = batch
@@ -1145,9 +1304,10 @@ def run(
                         return _batch_snapshot(batch), False
                     # A receipt only makes sense for a member that is or
                     # is about to become active; a receipt that
-                    # contradicts a step already recorded for its plan is
-                    # a changed request, refused before the ownership
-                    # decision.
+                    # contradicts a step already recorded for its plan or
+                    # already saved on the member is a changed request,
+                    # refused before the ownership decision and before any
+                    # byte is written.
                     for job_id, receipt in checked_receipts.items():
                         item = batch["items"].get(job_id)
                         if item is None \
@@ -1155,6 +1315,17 @@ def run(
                                                      "failed", "settling"):
                             raise ValueError("receipt does not match an "
                                              "active migration member")
+
+                        def conflicts_with(saved: dict[str, Any]) -> bool:
+                            return saved["step"] == receipt["step"] and (
+                                saved["result"] != receipt["result"]
+                                or saved["receipt"] != receipt["receipt"]
+                                or saved["at"] != receipt["at"])
+
+                        if any(conflicts_with(saved)
+                               for saved in item.get("receipts", ())):
+                            raise ValueError("a receipt already saved for "
+                                             "this step cannot change")
                         plan = snapshot.plans.get(item["plan_key"])
                         if plan is None:
                             # The claim has not happened yet; the receipt
@@ -1177,11 +1348,79 @@ def run(
                                 "migration batch is owned by another "
                                 f"owner until {batch['until']}")
                         batch["owner"] = owner
+                        takeover = True
+                    else:
+                        takeover = False
+
+                    # A replay by the current owner carrying only
+                    # receipts already saved equivalently on their items
+                    # is a pure idempotent replay -- but only when the run
+                    # genuinely has nothing else to do: no pending marker,
+                    # no active item whose downstream plan is missing,
+                    # unrooted or terminal (it still has to settle), and
+                    # no active plan whose lease has strictly expired (it
+                    # still has to recover). Then it returns the current
+                    # progress with created False, neither renewing the
+                    # coordination lease nor rewriting a byte. A
+                    # crash-window item (the plan landed a step but the
+                    # item still holds its record marker, or the terminal
+                    # plan still has to be settled) is left for the main
+                    # loop to advance exactly once.
+                    def receipt_already_settled(receipt_job: str,
+                                                receipt: dict[str, Any]
+                                                ) -> bool:
+                        saved = next(
+                            (s for s in batch["items"][receipt_job]
+                             .get("receipts", ())
+                             if s["step"] == receipt["step"]), None)
+                        return saved == {
+                            "step": receipt["step"],
+                            "result": receipt["result"],
+                            "receipt": receipt["receipt"],
+                            "at": receipt["at"]}
+
+                    def batch_is_stable_wait() -> bool:
+                        for candidate in batch["items"].values():
+                            if candidate["phase"] in _ITEM_TERMINAL:
+                                continue
+                            if _is_marker(candidate["snapshot"]):
+                                return False
+                            if candidate["phase"] != "active":
+                                return False
+                            plan_now = snapshot.plans.get(
+                                candidate["plan_key"])
+                            if plan_now is None \
+                                    or plan_now["source"] != \
+                                    snapshot.current_binding(
+                                        candidate["job_id"]):
+                                return False
+                            if plan_now["state"] in _PLAN_TERMINAL:
+                                return False
+                            if plan_now["state"] != "active" \
+                                    or now > plan_now["lease_end"]:
+                                return False
+                        return True
+
+                    pure_receipt_replay = (
+                        not takeover and bool(checked_receipts)
+                        and batch_is_stable_wait()
+                        and all(receipt_already_settled(
+                                    receipt_job, receipt)
+                                for receipt_job, receipt
+                                in checked_receipts.items()))
+                    if pure_receipt_replay:
+                        return _batch_snapshot(batch), False
+
                     batch["until"] = now + lease
 
                 def persist() -> None:
                     nonlocal old_bytes
-                    payload = _canonical_bytes(batches, audit_events)
+                    # A pending batch this run rewrites moves to the
+                    # current shape (per-item receipts); untouched
+                    # baseline batches keep their original bytes.
+                    legacy_batches.discard(key)
+                    payload = _canonical_bytes(batches, audit_events,
+                                               legacy_batches)
                     _commit_file(coordination_real, payload, old_bytes)
                     old_bytes = payload
 
@@ -1202,6 +1441,15 @@ def run(
                     item["error"] = type(exc).__name__
                     item["snapshot"] = None
                     persist()
+
+                def sync_from_plan(item: dict[str, Any],
+                                   plan: dict[str, Any]) -> None:
+                    # The most recent item snapshot is the plan itself,
+                    # carrying every actual step receipt -- including a
+                    # non-ASCII credential -- never just a stage marker.
+                    item["lease"] = plan["lease_end"]
+                    item["snapshot"] = copy.deepcopy(plan)
+                    item["receipts"] = copy.deepcopy(plan["steps"])
 
                 def replay_pending(item: dict[str, Any],
                                    marker: dict[str, Any]) -> bool:
@@ -1266,17 +1514,44 @@ def run(
                                 request["at"]))
                             item["phase"] = "active"
                             item["plan_key"] = item["request_key"]
-                            item["lease"] = request["lease_end"]
-                            item["snapshot"] = copy.deepcopy(plan)
+                            sync_from_plan(item, plan)
                         elif action == "record":
-                            plan, _ = downstream(lambda: _rebalance.record(
-                                *paths8, job_id, item["request_key"],
-                                request["owner"], request["step"],
-                                request["result"], request["receipt"],
-                                request["at"]))
+                            landed = snapshot.plans.get(plan_key)
+                            saved = next(
+                                (step for step
+                                 in (landed["steps"] if landed is not None
+                                     else ())
+                                 if step["step"] == request["step"]), None)
+                            if saved is not None:
+                                if saved != {
+                                        "step": request["step"],
+                                        "result": request["result"],
+                                        "receipt": request["receipt"],
+                                        "at": request["at"]}:
+                                    # A different result, credential or
+                                    # moment for the same saved step is a
+                                    # changed request: refuse it outright
+                                    # and leave the coordination ledger's
+                                    # bytes exactly as they were.
+                                    raise _ChangedRequest(
+                                        "a receipt already recorded for "
+                                        "this step cannot change")
+                                # The receipt already landed downstream in
+                                # a crashed call while the coordination
+                                # snapshot still held the marker: re-entry
+                                # catches the snapshot up once, never
+                                # issuing the original action a second
+                                # time.
+                                plan = landed
+                            else:
+                                plan, _ = downstream(
+                                    lambda: _rebalance.record(
+                                        *paths8, job_id, item["request_key"],
+                                        request["owner"], request["step"],
+                                        request["result"],
+                                        request["receipt"], request["at"]))
                             item["phase"] = "active"
-                            item["lease"] = plan["lease_end"]
-                            item["snapshot"] = copy.deepcopy(plan)
+                            sync_from_plan(item, plan)
                         elif action == "recover":
                             plan, _ = downstream(lambda: _rebalance.recover(
                                 *paths8, job_id, item["request_key"],
@@ -1287,6 +1562,7 @@ def run(
                                     _settle_key_for(plan_key))
                             item["phase"] = "settling"
                             item["request_key"] = settle_key
+                            item["receipts"] = copy.deepcopy(plan["steps"])
                             item["snapshot"] = _marker(
                                 "settle", plan_key=plan_key,
                                 at=settle_at)
@@ -1297,7 +1573,17 @@ def run(
                                 request["at"]))
                             item["phase"] = "settled"
                             item["snapshot"] = copy.deepcopy(record)
+                            settled_plan = snapshot.plans.get(
+                                request["plan_key"])
+                            item["receipts"] = copy.deepcopy(
+                                settled_plan["steps"]
+                                if settled_plan is not None else [])
                     except Exception as exc:
+                        if isinstance(exc, _ChangedRequest):
+                            # A changed request aborts the run with the
+                            # coordination ledger untouched; it is a
+                            # plain ValueError to the caller.
+                            raise ValueError(str(exc)) from None
                         if _is_business_error(exc):
                             fail_member(item, exc)
                             return False
@@ -1395,30 +1681,39 @@ def run(
                                 "migration plan is not active"))
                             break
 
-                        next_step = _STEPS[len(plan["steps"])]
+                        next_step = (_STEPS[len(plan["steps"])]
+                                     if len(plan["steps"]) < len(_STEPS)
+                                     else None)
                         receipt = pending_receipts.get(item["job_id"])
-                        if receipt is not None and \
-                                receipt["step"] == next_step:
+                        if receipt is not None:
                             already = next(
                                 (step for step in plan["steps"]
-                                 if step["step"] == next_step), None)
+                                 if step["step"] == receipt["step"]), None)
                             if already is not None:
                                 if already != {
                                         "step": receipt["step"],
                                         "result": receipt["result"],
                                         "receipt": receipt["receipt"],
                                         "at": receipt["at"]}:
-                                    fail_member(item, ValueError(
-                                        "a receipt already recorded for "
-                                        "this step cannot change"))
-                                    break
-                                # An equivalent replay after a crash
-                                # between the record commit and the marker
-                                # update: consume the receipt and re-read
-                                # the plan without a new call.
+                                    # The same step's result, credential or
+                                    # moment changed: a changed request that
+                                    # aborts the run with the coordination
+                                    # bytes untouched, never a failed member.
+                                    raise ValueError(
+                                        "a receipt already recorded for this "
+                                        "step cannot change")
+                                # Fully equivalent to a step the plan
+                                # already holds (including a duplicate after
+                                # a crash between the downstream commit and
+                                # the snapshot update): return the current
+                                # progress without another record call and
+                                # without failing the member.
                                 pending_receipts.pop(item["job_id"], None)
-                                snapshot = _Snapshot(reals)
+                                sync_from_plan(item, plan)
+                                persist()
                                 continue
+                        if receipt is not None and next_step is not None \
+                                and receipt["step"] == next_step:
                             item["request_key"] = _stable_key(
                                 key, item["job_id"], "record:" + next_step)
                             item["snapshot"] = _marker(
@@ -1449,8 +1744,7 @@ def run(
                             # No matching receipt and a still-valid
                             # lease: wait for a later run; the other
                             # members are independent and continue.
-                            item["lease"] = plan["lease_end"]
-                            item["snapshot"] = copy.deepcopy(plan)
+                            sync_from_plan(item, plan)
                             persist()
                             break
                         # Strict expiry: persist the recovery action and
@@ -1466,12 +1760,16 @@ def run(
                 if all(member["phase"] in _ITEM_TERMINAL
                        for member in batch["items"].values()):
                     batch["status"] = "completed"
+                    # The closing event is appended at its physical end:
+                    # the audit order is the real completion order, not
+                    # the batch key order.
                     audit_events.append({
                         "key": key,
                         "at": now,
                         "batch": _canonical_batch(batch),
                     })
-                    payload = _canonical_bytes(batches, audit_events)
+                    payload = _canonical_bytes(batches, audit_events,
+                                               legacy_batches)
                     # Validate the closing bytes against a fresh
                     # snapshot of the nine business ledgers.
                     release_inputs()
@@ -1502,19 +1800,53 @@ def get(ledger: str, key: str) -> dict[str, object]:
     reference, so malformed, out-of-order or non-canonical bytes raise
     ``ValueError`` and a missing business input ``FileNotFoundError``.
     An unknown batch key -- including a missing coordination ledger --
-    raises ``KeyError`` and never creates a file.
+    raises ``KeyError`` and never creates the ledger, a lock file, a
+    directory or any other trace: a missing coordination ledger is
+    rejected before its companion lock is opened, and a business ledger
+    that does not exist is read (and refused) without creating its lock
+    file either.
     """
     for value in (ledger, key):
         if not isinstance(value, str) or not value:
             raise ValueError("ledger and key must be non-empty strings")
     realpath = os.path.realpath(ledger)
+    # A read-only miss must leave no trace behind. The coordination
+    # ledger's absence and the batch key's absence are both established
+    # by unlocked reads before any companion lock file is opened
+    # (os.open would create it). Writes land through an atomic replace,
+    # so an unlocked read only ever sees a complete document.
+    def read_raw() -> bytes:
+        with open(realpath, "rb") as handle:
+            return handle.read()
+
+    if not os.path.exists(realpath):
+        raise KeyError(key)
+    try:
+        preliminary = read_raw()
+    except FileNotFoundError:
+        raise KeyError(key)
+    try:
+        probe = finite_loads(preliminary.decode("utf-8"))
+    except (ValueError, UnicodeDecodeError):
+        # A malformed ledger is a ValueError; take no lock (which would
+        # create the companion file) and fall through to the locked path
+        # that reports it canonically. Establish that first below.
+        probe = None
+    if probe is not None:
+        if not isinstance(probe, dict) \
+                or not isinstance(probe.get("batches"), dict):
+            # Invalid structure: report under the locked path.
+            pass
+        elif key not in probe["batches"]:
+            raise KeyError(key)
     store = _get_store(realpath)
     with store.lock:
         with _lock(realpath, shared=True):
             try:
-                with open(realpath, "rb") as handle:
-                    raw = handle.read()
+                raw = read_raw()
             except FileNotFoundError:
+                # Lost to a concurrent removal between the existence
+                # check and the open: still a trace-free miss.
                 raise KeyError(key)
             try:
                 data = finite_loads(raw.decode("utf-8"))
@@ -1531,15 +1863,21 @@ def get(ledger: str, key: str) -> dict[str, object]:
             inputs = _validate_inputs(data["batches"][key]["inputs"])
             held: list[Any] = []
             try:
+                # Only existing business ledgers take a shared flock; a
+                # missing one is read below (and refused there) without
+                # creating a lock file as a side effect.
                 for input_real in sorted(set(inputs.values())):
+                    if not os.path.exists(input_real):
+                        continue
                     manager = _lock(input_real, shared=True)
                     manager.__enter__()
                     held.append(manager)
                 snapshot = _Snapshot(inputs)
-                batches, _audit, _inputs, _raw = _load_coordination(
-                    realpath,
-                    {frozenset(snapshot.input_map.items()): snapshot},
-                    None)
+                batches, _audit, _inputs, _raw, _legacy = \
+                    _load_coordination(
+                        realpath,
+                        {frozenset(snapshot.input_map.items()): snapshot},
+                        None)
             finally:
                 while held:
                     manager = held.pop()
