@@ -49,6 +49,10 @@ def parser() -> argparse.ArgumentParser:
         "--acceptance", action=_Once,
         help="acceptance ledger directory to expose at GET /acceptance, "
              "requires --audit and --auth")
+    server.add_argument(
+        "--migration-batches", action=_Once,
+        help="migration-batch coordination ledger to expose at "
+             "GET /migration-batches, requires --audit and --auth")
     bundle = subcommands.add_parser(
         "verify-bundle",
         help="verify a downloaded checkpoint/proof pair offline")
@@ -127,15 +131,17 @@ def main() -> None:
         # or a repeated option is a usage error and exits with
         # argparse's status 2. --checkpoint only ever accompanies
         # --audit: alone, empty or repeated it is a usage error too.
-        # --acceptance is stricter still: it requires --audit together
-        # with the multi-token --auth method, never the single --token.
+        # --acceptance and --migration-batches are stricter still: each
+        # requires --audit together with the multi-token --auth method,
+        # never the single --token.
         if args.audit is None:
             if args.token is not None or args.auth is not None \
                     or args.checkpoint is not None \
-                    or args.acceptance is not None:
+                    or args.acceptance is not None \
+                    or args.migration_batches is not None:
                 command.error(
-                    "--token, --auth, --checkpoint and --acceptance "
-                    "require --audit")
+                    "--token, --auth, --checkpoint, --acceptance and "
+                    "--migration-batches require --audit")
         else:
             if not args.audit:
                 command.error("--audit must be non-empty")
@@ -153,6 +159,11 @@ def main() -> None:
                     command.error("--acceptance must be non-empty")
                 if args.auth is None:
                     command.error("--acceptance requires --auth")
+            if args.migration_batches is not None:
+                if not args.migration_batches:
+                    command.error("--migration-batches must be non-empty")
+                if args.auth is None:
+                    command.error("--migration-batches requires --auth")
         if args.auth:
             # The whole configuration is validated before the port is
             # bound; any failure is a usage error with status 2.
@@ -162,7 +173,8 @@ def main() -> None:
                 command.error(f"invalid --auth file: {exc}")
         serve(args.host, args.port, audit_path=args.audit, token=args.token,
               auth=args.auth, checkpoint=args.checkpoint,
-              acceptance=args.acceptance)
+              acceptance=args.acceptance,
+              migration_batches=args.migration_batches)
     elif args.command == "verify-bundle":
         _verify_bundle(args)
 
