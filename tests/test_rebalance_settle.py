@@ -462,7 +462,7 @@ class RebalanceSettleTest(unittest.TestCase):
         self._settle()
         good = Path(self.ledger).read_bytes()
         data = json.loads(good.decode("utf-8"))
-        data["plans"]["j-1"]["state"] = "failed"
+        data["plans"]["m1"]["state"] = "failed"
         Path(self.ledger).write_text(
             json.dumps(data, ensure_ascii=False, separators=(",", ":"))
             + "\n", encoding="utf-8")

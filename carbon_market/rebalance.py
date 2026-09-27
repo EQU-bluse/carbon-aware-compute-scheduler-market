@@ -104,10 +104,13 @@ only the source.
 The three calls share one idempotency key space with :func:`apply`:
 replaying a key with the same request returns the current plan snapshot
 with ``False`` and writes nothing, while the same key with a changed
-request raises ``ValueError``. The ledger upgrade to version 2 keeps
-every recorded intent and appends the ``plans`` section keyed by job id;
-only the first change of a call commits the plan, its state, the
-idempotency binding and the audit event atomically. Every read requires the on-disk bytes to be exactly the
+request raises ``ValueError``. The first lifecycle action atomically
+upgrades the ledger to its history layout, keeping every recorded
+intent, binding, receipt and audit event: intents are keyed by their
+reservation (apply) key, plans by their own start key, the start request
+persistently names its reserved intent and each step/recovery request
+names its plan. Only the first change of a call commits the plan, its
+state, the idempotency binding and the audit event atomically. Every read requires the on-disk bytes to be exactly the
 canonical compact form :func:`_canonical_bytes` produces -- compact
 UTF-8 JSON with non-ASCII written through, no negative-zero or
 non-finite number literals and exactly one trailing newline -- and
@@ -1997,11 +2000,11 @@ def _intent_canonical_bytes(
     version: int,
 ) -> bytes:
     # Compact UTF-8 JSON, non-ASCII written through, sections in their
-    # fixed field order, intents and plans keyed by job id and
-    # bindings/events by idempotency key, each in code-point order,
-    # terminated by exactly one newline. Version 1 predates the plans
-    # section; version 2 keeps every intent and appends it. Version 3
-    # keeps every generation of each job's lineage: intents keyed by
+    # fixed field order, bindings/events by idempotency key, each in
+    # code-point order, terminated by exactly one newline. Version 1
+    # predates the plans section and keys intents by job id; version 2
+    # appends plans keyed by job id; version 3 is the history layout that
+    # keeps every generation of each job's lineage -- intents keyed by
     # their reservation key and plans by their start key.
     payload: dict[str, Any] = {"version": version}
     payload["intents"] = {job_id: intents[job_id]
@@ -2220,9 +2223,10 @@ def apply(
     missing intent ledger is created only by the first reservation, the
     intent, its idempotency binding and the audit event -- the complete
     request plus the committed intent -- committed together in one
-    synced atomic write; a ledger already upgraded to version 2 keeps
-    its version and its recorded plans, a version 1 ledger stays a
-    version 1 ledger. Replaying the same key with the same job,
+    synced atomic write; a version 1 ledger that has never held a plan
+    keeps its version 1 form, while a legacy version 2 artifact already
+    carrying a per-job plan is moved to the history layout the first
+    lifecycle action otherwise lands. Replaying the same key with the same job,
     advice key and moment returns the stored record with ``False``
     without writing; the same key with a changed request, or a job
     already reserved under another key, raises ``ValueError`` and
@@ -2624,11 +2628,17 @@ def apply(
                 "execution": execution_state,
                 "reserved": "reserved",
             }
-            if ledger_version != _INTENT_VERSION_V3 and job_intents:
-                # A subsequent reservation of the same job upgrades the
-                # ledger to version 3: every recorded intent, plan,
-                # binding and audit event is preserved, re-keyed so no
-                # generation's evidence is overwritten.
+            if ledger_version == _INTENT_VERSION_V2:
+                # A legacy version 2 artifact (written before the first
+                # start upgraded atomically) reaches a follow-up
+                # reservation already carrying a per-job plan. Move it
+                # to the history layout once so that plan, its start key
+                # and every binding survive the new generation; every
+                # recorded intent, plan, binding and audit event is
+                # preserved, re-keyed so no generation's evidence is
+                # overwritten. A version 1 ledger keeps its version 1
+                # form -- apply never starts the upgrade -- and a
+                # version 3 ledger is already in the history layout.
                 intents, migration_plans, idempotency, events = \
                     _upgrade_intent_ledger_v3(
                         intents, migration_plans, idempotency, events)
@@ -2640,9 +2650,10 @@ def apply(
             idempotency[key] = request
             events[key] = {"key": key, "request": dict(request),
                            "result": copy.deepcopy(record)}
-            # A ledger that already carries migration plans keeps its
-            # version 2 or 3 form; anything else stays a version 1
-            # ledger.
+            # apply keeps writing the ledger's existing layout: a
+            # version 1 ledger stays version 1, and only the lifecycle
+            # actions or a legacy version 2 artifact land the history
+            # layout.
             _commit_file(ledger_real,
                          _intent_canonical_bytes(intents, migration_plans,
                                                  idempotency, events,
@@ -2818,8 +2829,10 @@ def start(
     ``switch``; the target capacity stays exclusively held by the
     intent for the whole execution. Returns ``(plan, created)``; the
     plan, its idempotency binding and the audit event are committed in
-    one synced atomic write that upgrades the ledger to version 2 while
-    keeping every recorded intent. Replaying the same key with the same
+    one synced atomic write that lands the history layout -- intents
+    keyed by reservation key, plans by start key, with every recorded
+    intent, binding, receipt and event preserved -- on the first start.
+    Replaying the same key with the same
     job, owner, lease end and moment returns the current plan with
     ``False`` without writing; the same key with a changed request
     raises ``ValueError`` and leaves the ledger untouched.
@@ -2866,20 +2879,34 @@ def start(
              exec_plans, advice_records) = _load_snapshot_layers(
                 job_real, supply_real, signal_real, trades_real,
                 dispatch_real, execution_real, advice_real)
-            intents, plans, idempotency, events, _version, old_bytes = \
+            intents, plans, idempotency, events, version, old_bytes = \
                 _load_intent_ledger(
                     ledger_real, accepted, cleared, history,
                     signal_history, advice_records)
             plans_by_key_settle = _plans_by_start_key(
-                plans, idempotency, _version)
+                plans, idempotency, version)
             settlement_completed, settlement_pending = \
                 _lifecycle_settlement_view(
                     settlement_paths, accepted, cleared,
-                    plans_by_key_settle, idempotency, events, _version)
+                    plans_by_key_settle, idempotency, events, version)
             for advice_record in advice_records.values():
                 _ground_advice_current(
                     advice_record, cleared,
                     _settlement_currents(settlement_completed))
+            if version != _INTENT_VERSION_V3:
+                # The first lifecycle action atomically upgrades the
+                # ledger to the history layout in memory; the upgrade is
+                # only committed together with the new evidence below,
+                # so a refused action leaves the on-disk bytes
+                # untouched. Reservations become keyed by their apply
+                # key, plans by their start key, and every earlier
+                # action request gains its persistent association --
+                # the start/intent association is closed here, at the
+                # first start, never deferred to a later reservation.
+                intents, plans, idempotency, events = \
+                    _upgrade_intent_ledger_v3(
+                        intents, plans, idempotency, events)
+                version = _INTENT_VERSION_V3
 
             request = {"action": "start", "job_id": job_id,
                        "owner": owner, "lease_end": lease_end, "at": at}
@@ -2891,14 +2918,12 @@ def start(
                 # An equivalent replay returns the current state of the
                 # plan this very key started -- never a later
                 # generation's plan -- without rewriting a byte.
-                if _version == _INTENT_VERSION_V3:
-                    return copy.deepcopy(plans[key]), False
-                return copy.deepcopy(plans[job_id]), False
+                return copy.deepcopy(plans[key]), False
 
             job = accepted.get(job_id)
             if job is None:
                 raise KeyError(job_id)
-            job_intents = _job_intent_items(intents, _version, job_id)
+            job_intents = _job_intent_items(intents, version, job_id)
             if not job_intents:
                 raise KeyError(job_id)
             decision = decisions.get(job_id)
@@ -2906,11 +2931,11 @@ def start(
                 raise KeyError(job_id)
 
             plans_by_key = _plans_by_start_key(plans, idempotency,
-                                               _version)
+                                               version)
             migration_plans = [plan for plan in plans_by_key.values()
                                if plan["job_id"] == job_id]
             claimed = _claimed_intent_refs(plans_by_key, idempotency,
-                                           _version)
+                                           version)
             unclaimed = [(ref, intent) for ref, intent in job_intents
                          if ref not in claimed]
             if not unclaimed:
@@ -2962,24 +2987,19 @@ def start(
                 "state": "active",
                 "steps": [],
             }
-            if _version == _INTENT_VERSION_V3:
-                # The plan is keyed by its own start idempotency key and
-                # the request names the reserved intent it claims, so
-                # every earlier generation's plan, receipts and keys
-                # stay untouched.
-                request["intent_key"] = intent_ref
-                plans[key] = new_plan
-                write_version = _INTENT_VERSION_V3
-            else:
-                plans[job_id] = new_plan
-                write_version = _INTENT_VERSION_V2
+            # The ledger is in the history layout: the plan is keyed by
+            # its own start idempotency key and the request persistently
+            # names the reserved intent it claims, so every earlier
+            # generation's plan, receipts and keys stay untouched.
+            request["intent_key"] = intent_ref
+            plans[key] = new_plan
             idempotency[key] = request
             events[key] = {"key": key, "request": dict(request),
                            "result": copy.deepcopy(new_plan)}
             _commit_file(ledger_real,
                          _intent_canonical_bytes(intents, plans,
                                                  idempotency, events,
-                                                 write_version),
+                                                 version),
                          old_bytes, prefix=".rebalance-start-")
             return copy.deepcopy(new_plan), True
 
@@ -3073,20 +3093,30 @@ def record(
              _exec_plans, advice_records) = _load_snapshot_layers(
                 job_real, supply_real, signal_real, trades_real,
                 dispatch_real, execution_real, advice_real)
-            intents, plans, idempotency, events, _version, old_bytes = \
+            intents, plans, idempotency, events, version, old_bytes = \
                 _load_intent_ledger(
                     ledger_real, accepted, cleared, history,
                     signal_history, advice_records)
             plans_by_key_settle = _plans_by_start_key(
-                plans, idempotency, _version)
+                plans, idempotency, version)
             settlement_completed, settlement_pending = \
                 _lifecycle_settlement_view(
                     settlement_paths, accepted, cleared,
-                    plans_by_key_settle, idempotency, events, _version)
+                    plans_by_key_settle, idempotency, events, version)
             for advice_record in advice_records.values():
                 _ground_advice_current(
                     advice_record, cleared,
                     _settlement_currents(settlement_completed))
+            if version != _INTENT_VERSION_V3:
+                # Bring a legacy single-migration ledger to the history
+                # layout in memory. The upgrade is committed only with a
+                # first-served receipt below; an equivalent replay
+                # returns before the commit and leaves the legacy bytes
+                # untouched.
+                intents, plans, idempotency, events = \
+                    _upgrade_intent_ledger_v3(
+                        intents, plans, idempotency, events)
+                version = _INTENT_VERSION_V3
 
             request = {"action": "record", "job_id": job_id,
                        "owner": owner, "step": step, "result": result,
@@ -3097,18 +3127,17 @@ def record(
                     raise ValueError("idempotency key was already used "
                                      "with a different request")
                 # An equivalent replay returns the current state of the
-                # plan this very key recorded a step for -- never a
-                # later generation's plan -- without rewriting a byte.
-                if _version == _INTENT_VERSION_V3:
-                    return copy.deepcopy(plans[binding["plan_key"]]), False
-                return copy.deepcopy(plans[job_id]), False
+                # plan this very key recorded a step for -- located by
+                # its bound plan key, never a later generation's plan --
+                # without rewriting a byte.
+                return copy.deepcopy(plans[binding["plan_key"]]), False
 
             if job_id not in accepted:
                 raise KeyError(job_id)
-            if not _job_intent_items(intents, _version, job_id):
+            if not _job_intent_items(intents, version, job_id):
                 raise KeyError(job_id)
             plans_by_key = _plans_by_start_key(plans, idempotency,
-                                               _version)
+                                               version)
             job_plans = [(start_key, plan)
                          for start_key, plan in plans_by_key.items()
                          if plan["job_id"] == job_id]
@@ -3139,17 +3168,16 @@ def record(
                 plan["state"] = "failed"
             elif len(plan["steps"]) == len(_PLAN_STEPS):
                 plan["state"] = "migrated"
-            if _version == _INTENT_VERSION_V3:
-                # The request names the plan it acted on by the plan's
-                # own start key.
-                request["plan_key"] = plan_key
+            # The request persistently names the plan it acted on, by
+            # the plan's own start key.
+            request["plan_key"] = plan_key
             idempotency[key] = request
             events[key] = {"key": key, "request": dict(request),
                            "result": copy.deepcopy(plan)}
             _commit_file(ledger_real,
                          _intent_canonical_bytes(intents, plans,
                                                  idempotency, events,
-                                                 _version),
+                                                 version),
                          old_bytes, prefix=".rebalance-record-")
             return copy.deepcopy(plan), True
 
@@ -3229,20 +3257,28 @@ def recover(
              _exec_plans, advice_records) = _load_snapshot_layers(
                 job_real, supply_real, signal_real, trades_real,
                 dispatch_real, execution_real, advice_real)
-            intents, plans, idempotency, events, _version, old_bytes = \
+            intents, plans, idempotency, events, version, old_bytes = \
                 _load_intent_ledger(
                     ledger_real, accepted, cleared, history,
                     signal_history, advice_records)
             plans_by_key_settle = _plans_by_start_key(
-                plans, idempotency, _version)
+                plans, idempotency, version)
             settlement_completed, settlement_pending = \
                 _lifecycle_settlement_view(
                     settlement_paths, accepted, cleared,
-                    plans_by_key_settle, idempotency, events, _version)
+                    plans_by_key_settle, idempotency, events, version)
             for advice_record in advice_records.values():
                 _ground_advice_current(
                     advice_record, cleared,
                     _settlement_currents(settlement_completed))
+            if version != _INTENT_VERSION_V3:
+                # Bring a legacy single-migration ledger to the history
+                # layout in memory; the upgrade is committed only with a
+                # first-served recovery below, never on a replay.
+                intents, plans, idempotency, events = \
+                    _upgrade_intent_ledger_v3(
+                        intents, plans, idempotency, events)
+                version = _INTENT_VERSION_V3
 
             request = {"action": "recover", "job_id": job_id,
                        "owner": owner, "at": at}
@@ -3252,18 +3288,17 @@ def recover(
                     raise ValueError("idempotency key was already used "
                                      "with a different request")
                 # An equivalent replay returns the current state of the
-                # plan this very key recovered -- never a later
-                # generation's plan -- without rewriting a byte.
-                if _version == _INTENT_VERSION_V3:
-                    return copy.deepcopy(plans[binding["plan_key"]]), False
-                return copy.deepcopy(plans[job_id]), False
+                # plan this very key recovered -- located by its bound
+                # plan key, never a later generation's plan -- without
+                # rewriting a byte.
+                return copy.deepcopy(plans[binding["plan_key"]]), False
 
             if job_id not in accepted:
                 raise KeyError(job_id)
-            if not _job_intent_items(intents, _version, job_id):
+            if not _job_intent_items(intents, version, job_id):
                 raise KeyError(job_id)
             plans_by_key = _plans_by_start_key(plans, idempotency,
-                                               _version)
+                                               version)
             job_plans = [(start_key, plan)
                          for start_key, plan in plans_by_key.items()
                          if plan["job_id"] == job_id]
@@ -3280,17 +3315,16 @@ def recover(
                 raise PermissionError("the lease has not expired yet")
 
             plan["state"] = "interrupted"
-            if _version == _INTENT_VERSION_V3:
-                # The request names the plan it acted on by the plan's
-                # own start key.
-                request["plan_key"] = plan_key
+            # The request persistently names the plan it acted on, by
+            # the plan's own start key.
+            request["plan_key"] = plan_key
             idempotency[key] = request
             events[key] = {"key": key, "request": dict(request),
                            "result": copy.deepcopy(plan)}
             _commit_file(ledger_real,
                          _intent_canonical_bytes(intents, plans,
                                                  idempotency, events,
-                                                 _version),
+                                                 version),
                          old_bytes, prefix=".rebalance-recover-")
             return copy.deepcopy(plan), True
 
