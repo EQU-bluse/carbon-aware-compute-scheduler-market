@@ -22,6 +22,10 @@ _ACCEPTANCE_PARAMS = ("key", "cursor", "limit", "state")
 # paginated exclusive cursor and page size; the coordination ledger is
 # fixed at startup and can never be selected through the query.
 _MIGRATION_BATCHES_PARAMS = ("key", "cursor", "limit")
+# GET /migration-batches/events pages the incremental progress stream by
+# an exclusive numeric position cursor, optionally filtered by batch key
+# and member job; filters combine by logical AND.
+_MIGRATION_EVENTS_PARAMS = ("cursor", "limit", "key", "job")
 _ACCEPTANCE_STATES = ("pending", "active", "quarantined")
 _OPS = ("copy", "restore")
 _STAGES = ("成功", "校验", "执行", "同步", "回滚")
@@ -126,6 +130,23 @@ def _parse_migration_batches_params(query: str) -> dict[str, str]:
     return params
 
 
+def _parse_migration_events_params(query: str) -> dict[str, str]:
+    params = _parse_query(query, _MIGRATION_EVENTS_PARAMS)
+    limit = params.get("limit")
+    if limit is not None:
+        if not all("0" <= char <= "9" for char in limit):
+            raise ValueError("limit must be a decimal integer")
+        if not 1 <= int(limit) <= _MAX_LIMIT:
+            raise ValueError("limit must be between 1 and 1000")
+    # The position cursor is a non-negative decimal integer; signs,
+    # whitespace, hex and non-numeric text are invalid requests.
+    cursor = params.get("cursor")
+    if cursor is not None \
+            and not all("0" <= char <= "9" for char in cursor):
+        raise ValueError("cursor must be a non-negative decimal integer")
+    return params
+
+
 class Handler(BaseHTTPRequestHandler):
     server_version = "CarbonMarket/0.1"
 
@@ -156,6 +177,11 @@ class Handler(BaseHTTPRequestHandler):
                 and getattr(self.server, "migration_batches", None) \
                 is not None:
             self._migration_batches(query)
+            return
+        if path == "/migration-batches/events" \
+                and getattr(self.server, "migration_batches", None) \
+                is not None:
+            self._migration_batch_events(query)
             return
         self._json(HTTPStatus.NOT_FOUND, {"error": "not_found"})
 
@@ -470,6 +496,66 @@ class Handler(BaseHTTPRequestHandler):
             # A canonical coordination ledger that lacks the key.
             self._json(HTTPStatus.NOT_FOUND,
                        {"error": "migration_batch_not_found"})
+        except ValueError:
+            # Non-canonical content, a broken reference or a referenced
+            # business ledger that is missing.
+            self._json(HTTPStatus.CONFLICT,
+                       {"error": "migration_batches_invalid"})
+        except OSError:
+            self._json(HTTPStatus.SERVICE_UNAVAILABLE,
+                       {"error": "migration_batches_unavailable"})
+        else:
+            self._bytes(HTTPStatus.OK, body)
+
+    def _migration_batch_events(self, query: str) -> None:
+        ledger = getattr(self.server, "migration_batches")
+        authorized, record = self._authorize()
+        if not authorized:
+            return
+
+        try:
+            params = _parse_migration_events_params(query)
+        except ValueError:
+            self._json(HTTPStatus.BAD_REQUEST, {"error": "invalid_request"})
+            return
+
+        # Scope checks follow parameter validation and precede any
+        # ledger access: a batch-key filter requires unrestricted
+        # operation and stage scopes and a key scope that is
+        # unrestricted or names that key; a cross-batch read requires
+        # all three scopes unrestricted. The member-job filter never
+        # widens the read beyond the batch-key rule. A forbidden
+        # request never opens the coordination ledger or a business
+        # ledger.
+        if record is not None:
+            if record.ops is not None or record.stages is not None:
+                self._json(HTTPStatus.FORBIDDEN, {"error": "forbidden"})
+                return
+            if "key" in params:
+                if record.keys is not None \
+                        and params["key"] not in record.keys:
+                    self._json(HTTPStatus.FORBIDDEN,
+                               {"error": "forbidden"})
+                    return
+            elif record.keys is not None:
+                self._json(HTTPStatus.FORBIDDEN, {"error": "forbidden"})
+                return
+
+        kwargs: dict[str, object] = {}
+        if "cursor" in params:
+            kwargs["cursor"] = int(params["cursor"])
+        if "limit" in params:
+            kwargs["limit"] = int(params["limit"])
+        for name in ("key", "job"):
+            if name in params:
+                kwargs[name] = params[name]
+        try:
+            body = migration_batch.events_response(ledger, **kwargs)
+        except FileNotFoundError:
+            # The fixed coordination ledger itself is missing. Never
+            # leak its path or a system message.
+            self._json(HTTPStatus.NOT_FOUND,
+                       {"error": "migration_batches_not_found"})
         except ValueError:
             # Non-canonical content, a broken reference or a referenced
             # business ledger that is missing.

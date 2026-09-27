@@ -645,6 +645,315 @@ class MigrationBatchTest(unittest.TestCase):
                               separators=(",", ":")).encode("utf-8"))
         self.assertFalse(exact.endswith(b"\n"))
 
+    # -- incremental progress events ----------------------------------------
+
+    def _event_kinds(self, coord: str = None, **kwargs):
+        page = migration_batch.events(coord or self.paths["coord"], **kwargs)
+        return [(event["position"], event["kind"], event["job"])
+                for event in page["events"]]
+
+    def test_event_stream_records_full_lifecycle(self) -> None:
+        self._prepare_migrate()
+        self._run(key="aaa", owner="负责人-1", now=30)
+        self._run(key="aaa", owner="负责人-1", now=32,
+                  receipts={"j-1": self._receipt(
+                      "copy", "succeeded", "复制完成", 33)})
+        self._run(key="aaa", owner="负责人-1", now=34,
+                  receipts={"j-1": self._receipt(
+                      "switch", "succeeded", "切换完成", 35)})
+        page = migration_batch.events(self.paths["coord"])
+        events = page["events"]
+        self.assertIsNone(page["next"])
+        self.assertEqual([event["position"] for event in events],
+                         list(range(len(events))))
+        self.assertEqual(
+            [(event["kind"], event["job"]) for event in events],
+            [("created", None)]
+            + [("progress", "j-1")] * 4
+            + [("receipt", "j-1"), ("progress", "j-1"),
+               ("receipt", "j-1"), ("progress", "j-1")]
+            + [("completed", None)])
+        for event in events:
+            self.assertEqual(
+                list(event),
+                ["position", "at", "key", "job", "kind", "batch"])
+            self.assertEqual(event["key"], "aaa")
+        # Every embedded snapshot is a complete fixed-order batch.
+        for event in events:
+            self.assertEqual(list(event["batch"]),
+                             ["key", "owner", "until", "status", "inputs",
+                              "items"])
+        # The completion event snapshots the terminal batch and the
+        # receipt credential passes through verbatim.
+        closing = events[-1]
+        self.assertEqual(closing["kind"], "completed")
+        self.assertEqual(closing["batch"]["status"], "completed")
+        self.assertEqual(
+            closing["batch"]["items"]["j-1"]["receipts"],
+            [self._receipt("copy", "succeeded", "复制完成", 33),
+             self._receipt("switch", "succeeded", "切换完成", 35)])
+
+    def test_failed_member_emits_failed_event_before_completion(self) -> None:
+        self._prepare_migrate()
+        # A receipt for the wrong pending step fails the member; the
+        # batch still closes.
+        self._run(key="b", owner="o1", now=40, lease=100,
+                  receipts={"j-1": self._receipt(
+                      "switch", "succeeded", "r", 41)})
+        events = migration_batch.events(self.paths["coord"])["events"]
+        self.assertEqual(events[-1]["kind"], "completed")
+        failed = next(event for event in events
+                      if event["kind"] == "failed")
+        self.assertEqual(failed["job"], "j-1")
+        self.assertEqual(
+            failed["batch"]["items"]["j-1"]["error"], "ValueError")
+
+    def test_lease_renewal_and_equivalent_replay_append_no_event(self) -> None:
+        self._prepare_migrate()
+        self._run(key="aaa", owner="o1", now=30, lease=100)
+        after_create = len(
+            migration_batch.events(self.paths["coord"])["events"])
+        # j-1 is active with a valid lease; a run with no receipts waits,
+        # re-syncing the identical plan, and renewing only the lease.
+        self._run(key="aaa", owner="o1", now=31, lease=100)
+        self.assertEqual(
+            len(migration_batch.events(self.paths["coord"])["events"]),
+            after_create)
+        # The byte-level ledger still changed (the lease was renewed).
+        self.assertEqual(
+            migration_batch.get(self.paths["coord"], "aaa")["until"], 131)
+
+    def test_takeover_after_expiry_emits_taken_over_event(self) -> None:
+        self._prepare_migrate()
+        self._run(key="b", owner="o1", now=30, lease=5)
+        # Before strict expiry another owner is refused and writes
+        # nothing.
+        with self.assertRaises(PermissionError):
+            self._run(key="b", owner="o2", now=34, lease=100)
+        self.assertEqual(
+            [e for e in migration_batch.events(self.paths["coord"])["events"]
+             if e["kind"] == "taken_over"], [])
+        # Strict expiry lets the new owner take over.
+        another, created = self._run(key="b", owner="o2", now=40, lease=100)
+        self.assertFalse(created)
+        self.assertEqual(another["owner"], "o2")
+        events = migration_batch.events(self.paths["coord"])["events"]
+        takeovers = [event for event in events
+                     if event["kind"] == "taken_over"]
+        self.assertEqual(len(takeovers), 1)
+        takeover = takeovers[0]
+        self.assertIsNone(takeover["job"])
+        self.assertEqual(takeover["batch"]["owner"], "o2")
+
+    def test_events_pagination_cursor_and_next(self) -> None:
+        self._prepare_migrate()
+        self._run(key="aaa", owner="o1", now=30)
+        self._run(key="zzz", now=31)
+        self._run(key="aaa", owner="o1", now=32,
+                  receipts={"j-1": self._receipt(
+                      "copy", "succeeded", "复制完成", 33)})
+        full = migration_batch.events(self.paths["coord"])["events"]
+        seen = []
+        cursor = None
+        pages = 0
+        while True:
+            page = migration_batch.events(
+                self.paths["coord"], cursor=cursor, limit=2)
+            pages += 1
+            seen.extend(page["events"])
+            if page["next"] is None:
+                break
+            cursor = page["next"]
+        self.assertEqual([e["position"] for e in seen],
+                         [e["position"] for e in full])
+        self.assertGreater(pages, 1)
+        # The cursor is exclusive: positions at or below it are dropped.
+        page = migration_batch.events(self.paths["coord"], cursor=0,
+                                      limit=100)
+        self.assertEqual([e["position"] for e in page["events"]],
+                         list(range(1, len(full))))
+        # A cursor past the end returns an empty final page.
+        tail = migration_batch.events(self.paths["coord"],
+                                      cursor=len(full) + 5)
+        self.assertEqual(tail, {"events": [], "next": None})
+
+    def test_event_filters_combine_and_skip_capacity(self) -> None:
+        self._prepare_migrate()
+        self._run(key="aaa", owner="o1", now=30)
+        self._run(key="zzz", now=31)
+        self._run(key="aaa", owner="o1", now=32,
+                  receipts={"j-1": self._receipt(
+                      "copy", "succeeded", "复制完成", 33)})
+        only_aaa = migration_batch.events(self.paths["coord"], key="aaa")
+        self.assertTrue(
+            all(e["key"] == "aaa" for e in only_aaa["events"]))
+        only_job = migration_batch.events(self.paths["coord"], key="aaa",
+                                          job="j-1")
+        self.assertTrue(
+            all(e["key"] == "aaa" and e["job"] == "j-1"
+                for e in only_job["events"]))
+        # AND with an unknown job matches nothing but still succeeds and
+        # unmatched events do not consume the page.
+        empty = migration_batch.events(self.paths["coord"], key="aaa",
+                                       job="nope", limit=1)
+        self.assertEqual(empty, {"events": [], "next": None})
+        # The batch-wide events survive the key filter without a job.
+        self.assertIn(
+            "created",
+            [e["kind"] for e in migration_batch.events(
+                self.paths["coord"], key="zzz")["events"]])
+
+    def test_events_validates_arguments(self) -> None:
+        self._prepare_migrate()
+        coord = self.paths["coord"]
+        for bad_cursor in (-1, True, False, "1", 1.5, 0.0):
+            with self.subTest(bad_cursor=bad_cursor):
+                with self.assertRaises(ValueError):
+                    migration_batch.events(
+                        coord, cursor=bad_cursor)  # type: ignore[arg-type]
+        for bad_limit in (0, -1, 1001, True, False, "10", 1.5, None):
+            with self.subTest(bad_limit=bad_limit):
+                with self.assertRaises(ValueError):
+                    migration_batch.events(
+                        coord, limit=bad_limit)  # type: ignore[arg-type]
+        for kwargs in ({"key": ""}, {"job": ""}, {"key": 5},
+                       {"job": False}):
+            with self.subTest(kwargs=kwargs):
+                with self.assertRaises(ValueError):
+                    migration_batch.events(coord, **kwargs)
+        with self.assertRaises(ValueError):
+            migration_batch.events("")
+        with self.assertRaises(FileNotFoundError):
+            migration_batch.events(
+                os.path.join(self.tmp.name, "absent.json"))
+
+    def test_events_response_is_compact_utf8_and_locked(self) -> None:
+        self._prepare_migrate()
+        self._run(now=30)
+        coord = self.paths["coord"]
+        page = migration_batch.events(coord)
+        body = migration_batch.events_response(coord)
+        self.assertEqual(
+            body, json.dumps(page, ensure_ascii=False,
+                             separators=(",", ":")).encode("utf-8"))
+        self.assertFalse(body.endswith(b"\n"))
+        self._run(now=32, receipts={"j-1": self._receipt(
+            "copy", "succeeded", "复制完成", 33)})
+        body = migration_batch.events_response(coord, key="bk-1",
+                                               job="j-1")
+        self.assertIn("复制完成".encode("utf-8"), body)
+        self.assertNotIn(b"\\u", body)
+
+    def _legacy_bytes(self, *, strip_receipts: bool) -> bytes:
+        data = self._coord()
+        del data["events"]
+        if strip_receipts:
+            for batch in data["batches"].values():
+                for item in batch["items"].values():
+                    item.pop("receipts", None)
+            for event in data["audit"]:
+                for item in event["batch"]["items"].values():
+                    item.pop("receipts", None)
+        return json.dumps(data, ensure_ascii=False,
+                          separators=(",", ":")).encode("utf-8") + b"\n"
+
+    def test_legacy_ledger_reads_empty_stream_and_seeds_on_write(self) -> None:
+        self._prepare_migrate()
+        self._run(key="aaa", owner="o1", now=30)
+        self._run(key="zzz", now=31)
+        coord = self.paths["coord"]
+        # A current ledger stripped only of the events section.
+        Path(coord).write_bytes(self._legacy_bytes(strip_receipts=False))
+        self.assertEqual(
+            migration_batch.events(coord), {"events": [], "next": None})
+        # Read-only snapshot access stays compatible and rewrites nothing.
+        self.assertEqual(migration_batch.get(coord, "aaa")["status"],
+                         "pending")
+        self._run(key="aaa", owner="o1", now=32,
+                  receipts={"j-1": self._receipt(
+                      "copy", "succeeded", "复制完成", 33)})
+        events = migration_batch.events(coord)["events"]
+        self.assertEqual([event["position"] for event in events],
+                         list(range(len(events))))
+        keys = [(event["key"], event["kind"]) for event in events]
+        self.assertIn(("aaa", "created"), keys)
+        # The already completed empty batch seeds created and completed.
+        self.assertIn(("zzz", "created"), keys)
+        self.assertIn(("zzz", "completed"), keys)
+        self.assertEqual(list(self._coord()),
+                         ["version", "batches", "audit", "events"])
+        self.assertGreaterEqual(
+            next(e for e in events if e["key"] == "zzz"
+                 and e["kind"] == "completed")["position"], 0)
+
+    def test_baseline_ledger_without_receipts_seeds_legacy_snapshot(self) \
+            -> None:
+        self._prepare_migrate()
+        self._run(key="aaa", owner="o1", now=30)
+        self._run(key="zzz", now=31)
+        coord = self.paths["coord"]
+        Path(coord).write_bytes(self._legacy_bytes(strip_receipts=True))
+        self.assertEqual(
+            migration_batch.events(coord), {"events": [], "next": None})
+        # First write seeds the baseline in the receipts-less arity and
+        # normalizes the rewritten batch in the same commit.
+        self._run(key="aaa", owner="o1", now=32,
+                  receipts={"j-1": self._receipt(
+                      "copy", "succeeded", "复制完成", 33)})
+        events = migration_batch.events(coord)["events"]
+        seeded = next(e for e in events if e["key"] == "aaa"
+                      and e["kind"] == "created")
+        self.assertNotIn(
+            "receipts", next(iter(seeded["batch"]["items"].values())))
+        advanced = next(e for e in events if e["key"] == "aaa"
+                        and e["kind"] == "progress")
+        self.assertIn(
+            "receipts", next(iter(advanced["batch"]["items"].values())))
+        # The ledger validates through the reference-checked read path.
+        migration_batch.search_response(coord)
+
+    def test_non_canonical_stream_is_value_error(self) -> None:
+        self._prepare_migrate()
+        self._run(now=30)
+        coord = self.paths["coord"]
+        good = Path(coord).read_bytes()
+
+        def write(payload: bytes) -> None:
+            Path(coord).write_bytes(payload)
+
+        compact = lambda obj: json.dumps(  # noqa: E731
+            obj, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
+        cases: dict[str, bytes] = {}
+        # A position gap breaks the continuous zero-based sequence.
+        gapped = json.loads(good.decode("utf-8"))
+        gapped["events"][-1]["position"] += 1
+        cases["gap"] = compact(gapped) + b"\n"
+        # The same batch may not carry two created events.
+        double_created = json.loads(good.decode("utf-8"))
+        double_created["events"].insert(1, dict(double_created["events"][0]))
+        double_created["events"] = [
+            {**event, "position": index}
+            for index, event in enumerate(double_created["events"])]
+        cases["extra-created"] = compact(double_created) + b"\n"
+        # An embedded snapshot with an illegal item phase is invalid.
+        wrong = json.loads(good.decode("utf-8"))
+        wrong["events"][0]["batch"]["items"]["j-1"]["phase"] = "bogus"
+        cases["wrong-snapshot"] = compact(wrong) + b"\n"
+        # An event with an illegal kind.
+        bad_kind = json.loads(good.decode("utf-8"))
+        bad_kind["events"][1]["kind"] = "teleported"
+        cases["bad-kind"] = compact(bad_kind) + b"\n"
+        # An event naming a job the batch does not hold.
+        bad_job = json.loads(good.decode("utf-8"))
+        bad_job["events"][1]["job"] = "ghost"
+        cases["bad-job"] = compact(bad_job) + b"\n"
+        for label, payload in cases.items():
+            with self.subTest(label=label):
+                write(payload)
+                with self.assertRaises(ValueError):
+                    migration_batch.events(coord)
+        write(good)
+
 
     # -- canonical form ------------------------------------------------------
 
@@ -659,7 +968,8 @@ class MigrationBatchTest(unittest.TestCase):
         self.assertIn("复制完成".encode("utf-8"), raw)
         self.assertNotIn(b"\\u", raw)
         data = json.loads(raw.decode("utf-8"))
-        self.assertEqual(list(data), ["version", "batches", "audit"])
+        self.assertEqual(list(data), ["version", "batches", "audit",
+                                      "events"])
         self.assertEqual(data["version"], 1)
         self.assertEqual(list(data["batches"]), ["bk-1"])
         self.assertEqual(list(data["batches"]["bk-1"]["items"]),
