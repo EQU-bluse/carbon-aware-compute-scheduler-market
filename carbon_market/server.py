@@ -32,6 +32,9 @@ _MIGRATION_EVENTS_PARAMS = ("cursor", "limit", "key", "job")
 _MIGRATION_CONSUMER_PATHS = (
     "/migration-consumers/claim", "/migration-consumers/pull",
     "/migration-consumers/ack")
+# GET /migration-consumers/status takes exactly the named consumer and
+# the query moment, each once; the ledger paths stay fixed at startup.
+_MIGRATION_CONSUMER_STATUS_PARAMS = ("consumer", "now")
 _MIGRATION_CLAIM_FIELDS = frozenset(
     ("consumer", "owner", "now", "lease", "idem", "key", "job_id"))
 _MIGRATION_CLAIM_REQUIRED = frozenset(
@@ -161,6 +164,19 @@ def _parse_migration_events_params(query: str) -> dict[str, str]:
     return params
 
 
+def _parse_migration_consumer_status_params(query: str) -> dict[str, str]:
+    params = _parse_query(query, _MIGRATION_CONSUMER_STATUS_PARAMS)
+    # Both the consumer id and the query moment are mandatory, each at
+    # most once; now is decimal non-negative-integer text (no sign, no
+    # whitespace, booleans have no textual spelling to reject).
+    if "consumer" not in params or "now" not in params:
+        raise ValueError("consumer and now are required")
+    now = params["now"]
+    if not all("0" <= char <= "9" for char in now):
+        raise ValueError("now must be a decimal non-negative integer")
+    return params
+
+
 class Handler(BaseHTTPRequestHandler):
     server_version = "CarbonMarket/0.1"
 
@@ -196,6 +212,13 @@ class Handler(BaseHTTPRequestHandler):
                 and getattr(self.server, "migration_batches", None) \
                 is not None:
             self._migration_batch_events(query)
+            return
+        if path == "/migration-consumers/status" \
+                and getattr(self.server, "migration_batches", None) \
+                is not None \
+                and getattr(self.server, "migration_consumers", None) \
+                is not None:
+            self._migration_consumer_status(query)
             return
         self._json(HTTPStatus.NOT_FOUND, {"error": "not_found"})
 
@@ -406,6 +429,95 @@ class Handler(BaseHTTPRequestHandler):
         except ValueError:
             # A changed idempotent request, a backward or past-tail ack,
             # a non-matching ack target or any other invalid argument.
+            self._json(HTTPStatus.BAD_REQUEST, {"error": "invalid_request"})
+        except OSError:
+            self._json(HTTPStatus.SERVICE_UNAVAILABLE,
+                       {"error": "migration_consumers_unavailable"})
+        else:
+            self._bytes(HTTPStatus.OK, payload)
+
+    def _migration_consumer_status(self, query: str) -> None:
+        # Read-only consumer status: identity, parameters, the
+        # persisted subscription read for scope, and only then the
+        # coordination/business snapshot -- a failure at one stage
+        # never opens a later stage's files.
+        coordination = getattr(self.server, "migration_batches")
+        consumers = getattr(self.server, "migration_consumers")
+        authorized, record = self._authorize()
+        if not authorized:
+            return
+        try:
+            params = _parse_migration_consumer_status_params(query)
+        except ValueError:
+            self._bad_request()
+            return
+        consumer = params["consumer"]
+        now = int(params["now"])
+
+        # Operation- and stage-scoped tokens can never read a consumer;
+        # an unrestricted key scope reads any subscription. A key-scoped
+        # token reads the consumer's fixed subscription from the
+        # consumer ledger at the scope stage, exactly like a pull or
+        # ack: only a fixed-batch subscription naming an allowed batch
+        # passes, while a cross-batch or job-only range needs all three
+        # scopes unrestricted. The data-plane coordination and business
+        # ledgers open only after the scope is allowed.
+        if record is not None and (record.ops is not None
+                                   or record.stages is not None):
+            self._json(HTTPStatus.FORBIDDEN, {"error": "forbidden"})
+            return
+        if record is not None and record.keys is not None:
+            try:
+                subscription = migration_batch.consumer_subscription(
+                    coordination, consumers, consumer)
+            except KeyError:
+                self._json(HTTPStatus.NOT_FOUND,
+                           {"error": "migration_consumer_not_found"})
+                return
+            except migration_batch.ConsumerLedgerInvalid:
+                self._json(HTTPStatus.CONFLICT,
+                           {"error": "migration_consumers_invalid"})
+                return
+            except FileNotFoundError:
+                self._json(HTTPStatus.NOT_FOUND,
+                           {"error": "migration_consumers_not_found"})
+                return
+            except OSError:
+                self._json(HTTPStatus.SERVICE_UNAVAILABLE,
+                           {"error": "migration_consumers_unavailable"})
+                return
+            batch_key = subscription["key"]
+            if batch_key is None or batch_key not in record.keys:
+                self._json(HTTPStatus.FORBIDDEN, {"error": "forbidden"})
+                return
+
+        try:
+            payload = migration_batch.consumer_status_response(
+                coordination, consumers, consumer, now)
+        except KeyError:
+            self._json(HTTPStatus.NOT_FOUND,
+                       {"error": "migration_consumer_not_found"})
+        except LookupError:
+            # The confirmed cursor points at an event the current
+            # stream truncated, rewrote or reused: a stream regression.
+            self._json(HTTPStatus.CONFLICT,
+                       {"error": "migration_consumer_checkpoint"})
+        except migration_batch.CoordinationLedgerInvalid:
+            self._json(HTTPStatus.CONFLICT,
+                       {"error": "migration_batches_invalid"})
+        except migration_batch.ConsumerLedgerInvalid:
+            self._json(HTTPStatus.CONFLICT,
+                       {"error": "migration_consumers_invalid"})
+        except migration_batch.CoordinationLedgerMissing:
+            self._json(HTTPStatus.NOT_FOUND,
+                       {"error": "migration_batches_not_found"})
+        except migration_batch.ConsumersLedgerMissing:
+            self._json(HTTPStatus.NOT_FOUND,
+                       {"error": "migration_consumers_not_found"})
+        except FileNotFoundError:
+            self._json(HTTPStatus.NOT_FOUND,
+                       {"error": "migration_consumers_not_found"})
+        except ValueError:
             self._json(HTTPStatus.BAD_REQUEST, {"error": "invalid_request"})
         except OSError:
             self._json(HTTPStatus.SERVICE_UNAVAILABLE,

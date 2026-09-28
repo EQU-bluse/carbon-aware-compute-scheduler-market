@@ -8,9 +8,10 @@ the error mapping (404 migration_consumers_not_found /
 migration_consumer_not_found, 409 migration_consumers_invalid /
 migration_consumer_ownership / migration_consumer_checkpoint /
 migration_batches_invalid, 503 migration_consumers_unavailable), the
-plain 404 for unconfigured or unknown paths, and the
-``--migration-consumers`` serve option (only with --migration-batches
-and --auth).
+read-only GET /migration-consumers/status query and its parameter,
+scope and error mapping, the plain 404 for unconfigured or unknown
+paths, and the ``--migration-consumers`` serve option (only with
+--migration-batches and --auth).
 """
 
 from __future__ import annotations
@@ -121,6 +122,23 @@ class MigrationConsumersHttpTest(unittest.TestCase):
         body = {"consumer": consumer, "owner": owner, "now": now,
                 "lease": lease, "idem": idem, **filters}
         return self._post("claim", body, token=token)
+
+    def _get_status(self, query, token=FULL_TOKEN, raw_path=None):
+        connection = HTTPConnection("127.0.0.1", self.server.server_port,
+                                    timeout=2)
+        headers = {}
+        if token is not None:
+            headers["X-Audit-Token"] = token
+        path = (raw_path if raw_path is not None
+                else f"/migration-consumers/status?{query}")
+        connection.request("GET", path, headers=headers)
+        response = connection.getresponse()
+        raw_body = response.read()
+        connection.close()
+        try:
+            return response.status, json.loads(raw_body), raw_body
+        except ValueError:
+            return response.status, None, raw_body
 
     # -- authorization --------------------------------------------------------
 
@@ -450,6 +468,181 @@ class MigrationConsumersHttpTest(unittest.TestCase):
         ):
             self.assertEqual(set(body), {"error"})
 
+    # -- read-only status -----------------------------------------------------
+
+    def test_status_returns_lease_state_and_backlog(self) -> None:
+        self._claim(consumer="fixed", idem="f1", key="aaa")
+        aaa = [event for event
+               in migration_batch.events(self.coord, limit=1000)["events"]
+               if event["key"] == "aaa"]
+        status, body, raw = self._get_status("consumer=fixed&now=40")
+        self.assertEqual(status, 200)
+        self.assertEqual(list(body),
+                         ["consumer", "key", "job_id", "owner", "until",
+                          "lease", "position", "pending", "oldest"])
+        self.assertEqual(body["consumer"], "fixed")
+        self.assertEqual(body["key"], "aaa")
+        self.assertIsNone(body["job_id"])
+        self.assertEqual(body["owner"], "o1")
+        self.assertEqual(body["until"], 140)
+        self.assertEqual(body["lease"], "active")
+        self.assertIsNone(body["position"])
+        self.assertEqual(body["pending"], len(aaa))
+        self.assertEqual(body["oldest"]["position"], aaa[0]["position"])
+        self.assertEqual(body["oldest"], aaa[0])
+        self.assertFalse(raw.endswith(b"\n"))
+        # Compact UTF-8 with non-ASCII written straight through; the
+        # oldest event's batch snapshot carries the non-ASCII owner.
+        self.assertNotIn(b"\\u", raw)
+        self.assertIn("负责人-1".encode("utf-8"), raw)
+        # The wire bytes are exactly the lock-holding serializer's.
+        self.assertEqual(
+            raw, migration_batch.consumer_status_response(
+                self.coord, self.consumers, "fixed", 40))
+
+    def test_status_lease_boundary_and_caught_up_cursor(self) -> None:
+        total = len(migration_batch.events(self.coord, limit=1000)["events"])
+        self._claim()
+        self.assertEqual(
+            self._get_status("consumer=c1&now=140")[1]["lease"], "active")
+        self.assertEqual(
+            self._get_status("consumer=c1&now=141")[1]["lease"], "expired")
+        self._post("ack", {"consumer": "c1", "owner": "o1", "now": 40,
+                           "position": total - 1, "idem": "a-last"})
+        status, body, _ = self._get_status("consumer=c1&now=40")
+        self.assertEqual(status, 200)
+        self.assertEqual(body["position"], total - 1)
+        self.assertEqual(body["pending"], 0)
+        self.assertIsNone(body["oldest"])
+
+    def test_status_bad_queries_are_400(self) -> None:
+        self._claim()
+        for query in (
+            "",
+            "consumer=c1",
+            "now=40",
+            "consumer=c1&now=40&now=41",
+            "consumer=c1&consumer=c2&now=40",
+            "consumer=&now=40",
+            "consumer=c1&now=",
+            "consumer=c1&now=-1",
+            "consumer=c1&now=1.5",
+            "consumer=c1&now=0x10",
+            "consumer=c1&now=1e1",
+            "consumer=c1&now=true",
+            "consumer=c1&now=40&extra=1",
+            "CONSUMER=c1&now=40",
+        ):
+            with self.subTest(query=query):
+                status, body, _ = self._get_status(query)
+                self.assertEqual((status, body),
+                                 (400, {"error": "invalid_request"}))
+
+    def test_status_identity_is_checked_first(self) -> None:
+        status, body, _ = self._get_status("nonsense", token=None)
+        self.assertEqual((status, body), (401, {"error": "unauthorized"}))
+        status, body, _ = self._get_status("nonsense", token="wrong")
+        self.assertEqual((status, body), (403, {"error": "forbidden"}))
+
+    def test_status_unknown_consumer_is_404(self) -> None:
+        status, body, _ = self._get_status("consumer=ghost&now=40")
+        self.assertEqual((status, body),
+                         (404, {"error": "migration_consumer_not_found"}))
+
+    def test_status_scope_uses_persisted_subscription(self) -> None:
+        # Fixed-key subscription readable through the key-scoped token.
+        self._claim(consumer="fixed", idem="f1", key="aaa")
+        self.assertEqual(
+            self._get_status("consumer=fixed&now=40",
+                             token=KEY_TOKEN)[0], 200)
+        self.assertEqual(
+            self._get_status("consumer=fixed&now=40&now=41",
+                             token=KEY_TOKEN)[0], 400)
+        # A cross-batch and a job-only subscription stay forbidden.
+        self._claim(consumer="wide", idem="w1")
+        self._claim(consumer="jobonly", idem="j1", job_id="j-1")
+        for consumer in ("wide", "jobonly"):
+            status, body, _ = self._get_status(
+                f"consumer={consumer}&now=40", token=KEY_TOKEN)
+            self.assertEqual((status, body),
+                             (403, {"error": "forbidden"}))
+        # Ops- and stage-scoped tokens are rejected before the consumer
+        # is even looked up; an unknown consumer still answers 403.
+        for token in (OPS_TOKEN, STAGE_TOKEN):
+            self.assertEqual(
+                self._get_status("consumer=ghost&now=40",
+                                 token=token)[0], 403)
+        # The key-scoped token reads the subscription to decide scope,
+        # so an unknown consumer is 404, not 403.
+        self.assertEqual(
+            self._get_status("consumer=ghost&now=40",
+                             token=KEY_TOKEN)[0], 404)
+
+    def test_status_checkpoint_regression_is_409(self) -> None:
+        total = len(migration_batch.events(self.coord, limit=1000)["events"])
+        self._claim()
+        self._post("ack", {"consumer": "c1", "owner": "o1", "now": 40,
+                           "position": total - 1, "idem": "a-last"})
+        other = MigrationBatchTest(
+            "test_get_returns_copy_and_unknown_key_raises")
+        other.setUp()
+        self.addCleanup(other.doCleanups)
+        other._prepare_migrate()
+        other._run(key="aaa", owner="o1", now=30)
+        doc = json.loads(Path(self.consumers).read_text("utf-8"))
+        doc["coordination"] = os.path.realpath(other.paths["coord"])
+        other_cons = os.path.join(other.tmp.name, "consumers.json")
+        Path(other_cons).write_text(
+            json.dumps(doc, ensure_ascii=False,
+                       separators=(",", ":")) + "\n",
+            encoding="utf-8")
+        self.server.migration_batches = other.paths["coord"]
+        self.server.migration_consumers = other_cons
+        status, body, _ = self._get_status("consumer=c1&now=40")
+        self.assertEqual((status, body),
+                         (409, {"error": "migration_consumer_checkpoint"}))
+
+    def test_status_ledger_errors(self) -> None:
+        from tests.test_migration_batch import MigrationBatchTest as _Fx
+        # A malformed consumer ledger is 409.
+        self._claim()
+        with open(self.consumers, "wb") as handle:
+            handle.write(b"{broken\n")
+        status, body, _ = self._get_status("consumer=c1&now=40")
+        self.assertEqual((status, body),
+                         (409, {"error": "migration_consumers_invalid"}))
+        # A malformed bound coordination ledger is 409.
+        fx = _Fx("test_get_returns_copy_and_unknown_key_raises")
+        fx.setUp()
+        self.addCleanup(fx.doCleanups)
+        fx._prepare_migrate()
+        fx._run(key="aaa", owner="o1", now=30)
+        cons = os.path.join(fx.tmp.name, "consumers.json")
+        migration_batch.consume(fx.paths["coord"], cons, "claim",
+                                "c1", "o1", 40, lease=100, idem="k1")
+        self.server.migration_batches = fx.paths["coord"]
+        self.server.migration_consumers = cons
+        with open(fx.paths["coord"], "wb") as handle:
+            handle.write(b"{broken\n")
+        status, body, _ = self._get_status("consumer=c1&now=40")
+        self.assertEqual((status, body),
+                         (409, {"error": "migration_batches_invalid"}))
+        # A bound coordination ledger that has vanished is 404.
+        fx2 = _Fx("test_get_returns_copy_and_unknown_key_raises")
+        fx2.setUp()
+        self.addCleanup(fx2.doCleanups)
+        fx2._prepare_migrate()
+        fx2._run(key="aaa", owner="o1", now=30)
+        cons2 = os.path.join(fx2.tmp.name, "consumers.json")
+        migration_batch.consume(fx2.paths["coord"], cons2, "claim",
+                                "c1", "o1", 40, lease=100, idem="k1")
+        self.server.migration_batches = fx2.paths["coord"]
+        self.server.migration_consumers = cons2
+        os.unlink(fx2.paths["coord"])
+        status, body, _ = self._get_status("consumer=c1&now=40")
+        self.assertEqual((status, body),
+                         (404, {"error": "migration_batches_not_found"}))
+
     # -- unconfigured and unknown paths --------------------------------------
 
     def test_get_method_and_unknown_paths_are_plain_404(self) -> None:
@@ -491,6 +684,26 @@ class MigrationConsumersDisabledTest(unittest.TestCase):
         body = response.read()
         connection.close()
         return response.status, json.loads(body)
+
+    def _get_status_code(self, server):
+        connection = HTTPConnection("127.0.0.1", server.server_port,
+                                    timeout=2)
+        connection.request("GET", "/migration-consumers/status?consumer=c&now=1",
+                           headers={"X-Audit-Token": "anything"})
+        response = connection.getresponse()
+        body = response.read()
+        connection.close()
+        return response.status, json.loads(body)
+
+    def test_get_status_unconfigured_is_plain_404(self) -> None:
+        server, thread = self._server()
+        try:
+            self.assertEqual(self._get_status_code(server),
+                             (404, {"error": "not_found"}))
+        finally:
+            server.shutdown()
+            server.server_close()
+            thread.join(timeout=2)
 
     def test_unconfigured_is_plain_404(self) -> None:
         server, thread = self._server()

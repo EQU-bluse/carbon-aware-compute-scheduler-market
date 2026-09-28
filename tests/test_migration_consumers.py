@@ -4,11 +4,13 @@ Covers the fixed claim/pull/ack subscription ledger: first claim and
 idempotent replay, the immutable (key, job_id) subscription, pulls
 paged strictly after the acknowledged position without advancing it,
 forward/in-place/backward/past-tail/non-matching acks, ownership and
-strict lease expiry (PermissionError vs TimeoutError), expired-lease
-takeover with redelivery, the LookupError when a confirmed event is
-truncated, rewritten or position-reused, canonical ledger bytes, the
-coordination binding and the FileNotFoundError/ValueError/OSError
-surface.
+strict lease expiry (PermissionError vs TimeoutError), the same-owner
+renewal boundary (valid through until, TimeoutError after strict
+expiry with the ledger untouched), expired-lease takeover with
+redelivery, the read-only consumer_status status/backlog query, the
+LookupError when a confirmed event is truncated, rewritten or
+position-reused, canonical ledger bytes, the coordination binding and
+the FileNotFoundError/ValueError/OSError surface.
 """
 
 from __future__ import annotations
@@ -362,6 +364,149 @@ class ConsumeTest(unittest.TestCase):
                                    "o1", 40, limit=total)
         self.assertEqual(json.loads(body), result)
         self.assertFalse(body.endswith(b"\n"))
+
+    # -- renewal boundary -----------------------------------------------------
+
+    def test_same_owner_renewal_at_lease_end_is_still_active(self) -> None:
+        self._claim(now=40, lease=100)  # until 140
+        result, created = self._claim(now=140, lease=10, idem="k1b")
+        self.assertFalse(created)
+        self.assertFalse(result["taken_over"])
+        self.assertEqual(result["until"], 150)
+
+    def test_same_owner_renewal_after_strict_expiry_times_out(self) -> None:
+        self._claim(now=40, lease=100)  # until 140
+        before = Path(self.cons).read_bytes()
+        with self.assertRaises(TimeoutError):
+            self._claim(now=141, lease=10, idem="k1b")
+        # A timed-out renewal leaves the ledger byte-for-byte untouched.
+        self.assertEqual(Path(self.cons).read_bytes(), before)
+        # A different owner may still take over after strict expiry.
+        result, created = self._claim(owner="o2", now=141, lease=10,
+                                      idem="k2")
+        self.assertFalse(created)
+        self.assertTrue(result["taken_over"])
+        self.assertEqual(result["owner"], "o2")
+
+    # -- status ---------------------------------------------------------------
+
+    def _status(self, consumer="c1", now=40):
+        return mb.consumer_status(self.coord, self.cons, consumer, now)
+
+    def test_status_fields_and_full_backlog(self) -> None:
+        total = self.total
+        self._claim()
+        status = self._status()
+        self.assertEqual(list(status),
+                         ["consumer", "key", "job_id", "owner", "until",
+                          "lease", "position", "pending", "oldest"])
+        self.assertEqual(status["consumer"], "c1")
+        self.assertIsNone(status["key"])
+        self.assertIsNone(status["job_id"])
+        self.assertEqual(status["owner"], "o1")
+        self.assertEqual(status["until"], 140)
+        self.assertEqual(status["lease"], "active")
+        self.assertIsNone(status["position"])
+        self.assertEqual(status["pending"], total)
+        self.assertEqual(status["oldest"]["position"], 0)
+
+    def test_status_lease_boundary(self) -> None:
+        self._claim()
+        self.assertEqual(self._status(now=140)["lease"], "active")
+        self.assertEqual(self._status(now=141)["lease"], "expired")
+
+    def test_status_pending_follows_ack_and_filters(self) -> None:
+        total = self.total
+        self._claim()
+        self._ack(0, idem="a0")
+        status = self._status()
+        self.assertEqual(status["position"], 0)
+        self.assertEqual(status["pending"], total - 1)
+        self.assertEqual(status["oldest"]["position"], 1)
+        self._ack(total - 1, idem="a-last")
+        status = self._status()
+        self.assertEqual(status["pending"], 0)
+        self.assertIsNone(status["oldest"])
+
+    def test_status_respects_fixed_subscription(self) -> None:
+        self._claim(consumer="ck", idem="kb", key="zzz")
+        status = self._status(consumer="ck")
+        zzz = [e for e in mb.events(self.coord, limit=1000)["events"]
+               if e["key"] == "zzz"]
+        self.assertEqual(status["key"], "zzz")
+        self.assertEqual(status["pending"], len(zzz))
+        self.assertEqual(status["oldest"]["position"], zzz[0]["position"])
+        self.assertTrue(all(event["key"] == "zzz"
+                            for event in (status["oldest"],)))
+
+    def test_status_oldest_is_the_full_event(self) -> None:
+        self._claim()
+        status = self._status()
+        page = mb.events(self.coord, limit=1)["events"][0]
+        self.assertEqual(status["oldest"], page)
+        # The full post-commit batch snapshot rides along.
+        self.assertEqual(status["oldest"]["batch"]["key"],
+                         page["batch"]["key"])
+
+    def test_status_unknown_consumer_is_key_error(self) -> None:
+        self._claim()
+        with self.assertRaises(KeyError):
+            mb.consumer_status(self.coord, self.cons, "ghost", 40)
+
+    def test_status_without_ledger_is_key_error(self) -> None:
+        with self.assertRaises(KeyError):
+            mb.consumer_status(
+                self.coord, os.path.join(self.fx.tmp.name, "none.json"),
+                "c1", 40)
+
+    def test_status_bad_arguments_raise_value_error(self) -> None:
+        for bad in (
+            lambda: mb.consumer_status("", self.cons, "c1", 40),
+            lambda: mb.consumer_status(self.coord, "", "c1", 40),
+            lambda: mb.consumer_status(self.coord, self.cons, "", 40),
+            lambda: mb.consumer_status(self.coord, self.cons, "c1", -1),
+            lambda: mb.consumer_status(self.coord, self.cons, "c1", True),
+            lambda: mb.consumer_status(self.coord, self.cons, "c1", 1.0),
+        ):
+            with self.subTest(bad=bad):
+                self.assertRaises(ValueError, bad)
+
+    def test_status_paths_must_be_distinct(self) -> None:
+        with self.assertRaises(ValueError):
+            mb.consumer_status(self.coord, self.coord, "c1", 40)
+
+    def test_status_missing_parent_raises_file_not_found(self) -> None:
+        missing = os.path.join(self.fx.tmp.name, "no-dir", "c.json")
+        with self.assertRaises(FileNotFoundError):
+            mb.consumer_status(self.coord, missing, "c1", 40)
+
+    def test_status_checkpoint_regression_raises_lookup_error(self) -> None:
+        total = self.total
+        self._claim()
+        self._ack(total - 1, idem="a-last")
+        other = MigrationBatchTest(
+            "test_get_returns_copy_and_unknown_key_raises")
+        other.setUp()
+        self.addCleanup(other.doCleanups)
+        other._prepare_migrate()
+        other._run(key="aaa", owner="o1", now=30)
+        other_cons = os.path.join(other.tmp.name, "consumers.json")
+        doc = json.loads(Path(self.cons).read_text("utf-8"))
+        doc["coordination"] = os.path.realpath(other.paths["coord"])
+        Path(other_cons).write_text(
+            json.dumps(doc, ensure_ascii=False,
+                       separators=(",", ":")) + "\n",
+            encoding="utf-8")
+        with self.assertRaises(LookupError):
+            mb.consumer_status(other.paths["coord"], other_cons, "c1", 40)
+
+    def test_status_response_is_compact(self) -> None:
+        self._claim()
+        self._ack(0, idem="a0")
+        body = mb.consumer_status_response(self.coord, self.cons, "c1", 40)
+        self.assertFalse(body.endswith(b"\n"))
+        self.assertNotIn(b"\\u", body)
+        self.assertEqual(json.loads(body), self._status())
 
 
 if __name__ == "__main__":
