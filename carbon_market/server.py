@@ -8,6 +8,31 @@ from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 from . import acceptance, audit, audit_proof, auth, migration_batch
+from ._jsonio import _parse_float, _parse_int, _reject_constant
+
+
+def _loads_consumer_body(text: str) -> object:
+    # Finite JSON (no negative-zero or NaN/Infinity literals) with no
+    # duplicate object names: a body carrying the same field twice is
+    # ambiguous and rejected instead of silently taking the last value.
+    def pairs_hook(pairs: list[tuple[str, object]]) -> dict[str, object]:
+        names = {name for name, _value in pairs}
+        if len(names) != len(pairs):
+            raise ValueError("duplicate JSON object member")
+        return dict(pairs)
+
+    return json.loads(text, parse_int=_parse_int, parse_float=_parse_float,
+                      parse_constant=_reject_constant,
+                      object_pairs_hook=pairs_hook)
+
+
+class _InvalidConsumerRequest(Exception):
+    """A consumer POST body that is not the fixed JSON object shape."""
+
+
+class _ConsumerScopeForbidden(PermissionError):
+    """The token's scopes do not cover the effective batch range."""
+
 
 # Query parameters GET /audit accepts; anything else is an invalid request.
 _AUDIT_PARAMS = ("cursor", "limit", "op", "stage", "key")
@@ -26,6 +51,21 @@ _MIGRATION_BATCHES_PARAMS = ("key", "cursor", "limit")
 # stream by the exclusive zero-based position cursor with an optional
 # batch key and related job filter, combined by logical AND.
 _MIGRATION_EVENTS_PARAMS = ("cursor", "limit", "key", "job")
+# POST /migration-consumers/{claim,fetch,confirm}: the write requests
+# accept only a fixed JSON object each; the coordination and consumer
+# ledger paths are fixed at startup and can never be named in a body.
+_CONSUMER_CLAIM_FIELDS = frozenset(
+    ("consumer", "owner", "lease", "now", "key", "job",
+     "idempotency_key"))
+_CONSUMER_FETCH_FIELDS = frozenset(
+    ("consumer", "owner", "now", "cursor", "limit"))
+_CONSUMER_CONFIRM_FIELDS = frozenset(
+    ("consumer", "owner", "now", "position", "idempotency_key"))
+_CONSUMER_PATHS = {
+    "/migration-consumers/claim": "claim",
+    "/migration-consumers/fetch": "fetch",
+    "/migration-consumers/confirm": "confirm",
+}
 _ACCEPTANCE_STATES = ("pending", "active", "quarantined")
 _OPS = ("copy", "restore")
 _STAGES = ("成功", "校验", "执行", "同步", "回滚")
@@ -35,6 +75,84 @@ _MAX_LIMIT = 1000
 # of the full validated response bytes. Weak tags, lists, wildcards and
 # surrounding whitespace are invalid requests.
 _ETAG_RE = re.compile(r'"[0-9a-f]{64}"')
+
+
+def _parse_consumer_body(handler: "Handler", op: str) -> dict[str, object]:
+    # Each consumer op accepts exactly one JSON object with that op's
+    # fixed field set: no unknown fields, no duplicates possible in a
+    # JSON object, no file paths the client could choose, no NaN or
+    # negative-zero numeric literals. The body is length-bounded so a
+    # client can never make the service buffer without bound.
+    allowed = {
+        "claim": _CONSUMER_CLAIM_FIELDS,
+        "fetch": _CONSUMER_FETCH_FIELDS,
+        "confirm": _CONSUMER_CONFIRM_FIELDS,
+    }[op]
+    required = {
+        "claim": ("consumer", "owner", "now", "lease"),
+        "fetch": ("consumer", "owner", "now"),
+        "confirm": ("consumer", "owner", "now", "position"),
+    }[op]
+    try:
+        length = int(handler.headers.get("Content-Length", "0"))
+    except ValueError:
+        raise _InvalidConsumerRequest("bad content length")
+    if length <= 0 or length > 65536:
+        raise _InvalidConsumerRequest("bad content length")
+    raw = handler.rfile.read(length)
+    if len(raw) != length:
+        raise _InvalidConsumerRequest("short body")
+    try:
+        data = _loads_consumer_body(raw.decode("utf-8"))
+    except (ValueError, UnicodeDecodeError):
+        raise _InvalidConsumerRequest("body is not finite JSON") from None
+    if not isinstance(data, dict):
+        raise _InvalidConsumerRequest("body must be a JSON object")
+    fields = set(data.keys())
+    if not fields.issubset(allowed) or not fields.issuperset(required):
+        raise _InvalidConsumerRequest("invalid field set")
+    for name in ("consumer", "owner"):
+        if not isinstance(data[name], str) or not data[name]:
+            raise _InvalidConsumerRequest(f"{name} must be a non-empty string")
+    now = data["now"]
+    if not isinstance(now, int) or isinstance(now, bool) or now < 0:
+        raise _InvalidConsumerRequest("now must be a non-negative integer")
+    if op == "claim":
+        lease = data["lease"]
+        if not isinstance(lease, int) or isinstance(lease, bool) \
+                or lease < 1:
+            raise _InvalidConsumerRequest(
+                "lease must be a positive integer")
+        for name in ("key", "job", "idempotency_key"):
+            if name in data and (not isinstance(data[name], str)
+                                 or not data[name]):
+                raise _InvalidConsumerRequest(
+                    f"{name} must be a non-empty string")
+    elif op == "fetch":
+        if "cursor" in data:
+            cursor = data["cursor"]
+            if not isinstance(cursor, int) or isinstance(cursor, bool) \
+                    or cursor < 0:
+                raise _InvalidConsumerRequest(
+                    "cursor must be a non-negative integer")
+        if "limit" in data:
+            limit = data["limit"]
+            if not isinstance(limit, int) or isinstance(limit, bool) \
+                    or not 1 <= limit <= _MAX_LIMIT:
+                raise _InvalidConsumerRequest(
+                    "limit must be between 1 and 1000")
+    else:
+        position = data["position"]
+        if not isinstance(position, int) or isinstance(position, bool) \
+                or position < 0:
+            raise _InvalidConsumerRequest(
+                "position must be a non-negative integer")
+        if "idempotency_key" in data \
+                and (not isinstance(data["idempotency_key"], str)
+                     or not data["idempotency_key"]):
+            raise _InvalidConsumerRequest(
+                "idempotency_key must be a non-empty string")
+    return data
 
 
 def _decode_component(text: str) -> str:
@@ -181,6 +299,16 @@ class Handler(BaseHTTPRequestHandler):
                 and getattr(self.server, "migration_batches", None) \
                 is not None:
             self._migration_batch_events(query)
+            return
+        self._json(HTTPStatus.NOT_FOUND, {"error": "not_found"})
+
+    def do_POST(self) -> None:  # noqa: N802 - BaseHTTPRequestHandler contract
+        path, _, query = self.path.partition("?")
+        op = _CONSUMER_PATHS.get(path)
+        if op is not None \
+                and getattr(self.server, "migration_consumers", None) \
+                is not None:
+            self._migration_consume(op, query)
             return
         self._json(HTTPStatus.NOT_FOUND, {"error": "not_found"})
 
@@ -565,6 +693,124 @@ class Handler(BaseHTTPRequestHandler):
         else:
             self._bytes(HTTPStatus.OK, body)
 
+    def _migration_consume(self, op: str, query: str = "") -> None:
+        ledger = getattr(self.server, "migration_batches")
+        consumers = getattr(self.server, "migration_consumers")
+        authorized, record = self._authorize()
+        if not authorized:
+            return
+
+        # The consumer endpoints take no query parameters; any query
+        # string is an illegal request, validated after identity and
+        # before the body is parsed (the same order as the GET
+        # endpoints).
+        try:
+            _parse_query(query, ())
+        except ValueError:
+            self._json(HTTPStatus.BAD_REQUEST,
+                       {"error": "invalid_request"})
+            return
+
+        try:
+            request = _parse_consumer_body(self, op)
+        except _InvalidConsumerRequest:
+            self._json(HTTPStatus.BAD_REQUEST,
+                       {"error": "invalid_request"})
+            return
+
+        # The scope gate runs inside the library call at the exact
+        # point the effective batch key is known: the claim's own key
+        # for a claim, the stored subscription's key for a fetch or a
+        # confirm. A fixed-batch subscription needs unrestricted
+        # operation and stage scopes and a key scope that names that
+        # batch; a cross-batch or job-only subscription needs all three
+        # scopes unrestricted. A forbidden result is decided there,
+        # before any write.
+        def scope_gate(effective_key: str | None) -> None:
+            if record is None:
+                return
+            if record.ops is not None or record.stages is not None:
+                raise _ConsumerScopeForbidden()
+            if effective_key is None:
+                if record.keys is not None:
+                    raise _ConsumerScopeForbidden()
+            elif record.keys is not None \
+                    and effective_key not in record.keys:
+                raise _ConsumerScopeForbidden()
+
+        kwargs: dict[str, object] = {
+            "now": request["now"], "owner": request["owner"],
+            "scope": scope_gate,
+        }
+        if "lease" in request:
+            kwargs["lease"] = request["lease"]
+        if "key" in request:
+            kwargs["key"] = request["key"]
+        if "job" in request:
+            kwargs["job_id"] = request["job"]
+        if "position" in request:
+            kwargs["position"] = request["position"]
+        if "cursor" in request:
+            kwargs["cursor"] = request["cursor"]
+        if "limit" in request:
+            kwargs["limit"] = request["limit"]
+        if "idempotency_key" in request:
+            kwargs["idempotency_key"] = request["idempotency_key"]
+
+        try:
+            body = migration_batch.consume_response(
+                ledger, consumers, op, request["consumer"], **kwargs)
+        except _ConsumerScopeForbidden:
+            self._json(HTTPStatus.FORBIDDEN, {"error": "forbidden"})
+        except KeyError:
+            # A canonical consumer ledger that does not name the
+            # consumer.
+            self._json(HTTPStatus.NOT_FOUND,
+                       {"error": "migration_consumer_not_found"})
+        except migration_batch._ConsumersParentMissing:
+            # The consumer ledger's fixed parent directory is absent.
+            self._json(HTTPStatus.NOT_FOUND,
+                       {"error": "migration_consumers_not_found"})
+        except FileNotFoundError:
+            # The fixed coordination ledger is missing. Never leak a
+            # path.
+            self._json(HTTPStatus.NOT_FOUND,
+                       {"error": "migration_batches_not_found"})
+        except migration_batch._ConsumerLedgerInvalid as exc:
+            # Non-canonical stored bytes; each fixed ledger keeps its
+            # own error name.
+            if exc.source == "coordination":
+                self._json(
+                    HTTPStatus.CONFLICT,
+                    {"error": "migration_batches_invalid"})
+            else:
+                self._json(
+                    HTTPStatus.CONFLICT,
+                    {"error": "migration_consumers_invalid"})
+        except LookupError:
+            # The stream truncated or rewrote the confirmed event.
+            self._json(HTTPStatus.CONFLICT,
+                       {"error": "migration_consumer_conflict"})
+        except PermissionError:
+            # Another owner holds the subscription inside its lease.
+            self._json(HTTPStatus.CONFLICT,
+                       {"error": "migration_consumer_conflict"})
+        except TimeoutError:
+            # The acting owner's lease has strictly expired.
+            self._json(HTTPStatus.CONFLICT,
+                       {"error": "migration_consumer_conflict"})
+        except ValueError:
+            # A bad request the library refused (changed filter or
+            # idempotency key, a backwards or out-of-stream
+            # confirmation, ...).
+            self._json(HTTPStatus.BAD_REQUEST,
+                       {"error": "invalid_request"})
+        except OSError:
+            self._json(HTTPStatus.SERVICE_UNAVAILABLE,
+                       {"error": "migration_consumers_unavailable"})
+        else:
+            self._bytes(HTTPStatus.OK, body)
+
     def _raw(self, status: HTTPStatus, body: bytes, etag: str) -> None:
         # The snapshot bytes are served verbatim -- the original UTF-8
         # written by the exporter, with its field order intact -- and the
@@ -606,7 +852,8 @@ def serve(host: str, port: int, audit_path: str | None = None,
           token: str | None = None, auth: str | None = None,
           checkpoint: str | None = None,
           acceptance: str | None = None,
-          migration_batches: str | None = None) -> None:
+          migration_batches: str | None = None,
+          migration_consumers: str | None = None) -> None:
     with ThreadingHTTPServer((host, port), Handler) as server:
         server.audit_path = audit_path  # type: ignore[attr-defined]
         server.audit_token = token  # type: ignore[attr-defined]
@@ -614,4 +861,5 @@ def serve(host: str, port: int, audit_path: str | None = None,
         server.audit_checkpoint = checkpoint  # type: ignore[attr-defined]
         server.acceptance_dir = acceptance  # type: ignore[attr-defined]
         server.migration_batches = migration_batches  # type: ignore[attr-defined]
+        server.migration_consumers = migration_consumers  # type: ignore[attr-defined]
         server.serve_forever()

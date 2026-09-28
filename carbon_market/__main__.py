@@ -53,6 +53,11 @@ def parser() -> argparse.ArgumentParser:
         "--migration-batches", action=_Once, metavar="PATH",
         help="migration batch coordination ledger to expose at "
              "GET /migration-batches, requires --audit and --auth")
+    server.add_argument(
+        "--migration-consumers", action=_Once, metavar="PATH",
+        help="consumer ledger for the POST /migration-consumers claim, "
+             "fetch and confirm endpoints, requires --migration-batches "
+             "and --auth")
     bundle = subcommands.add_parser(
         "verify-bundle",
         help="verify a downloaded checkpoint/proof pair offline")
@@ -131,17 +136,21 @@ def main() -> None:
         # or a repeated option is a usage error and exits with
         # argparse's status 2. --checkpoint only ever accompanies
         # --audit: alone, empty or repeated it is a usage error too.
-        # --acceptance and --migration-batches are stricter still: they
-        # require --audit together with the multi-token --auth method,
-        # never the single --token.
+        # --acceptance, --migration-batches and --migration-consumers
+        # are stricter still: they require --audit together with the
+        # multi-token --auth method, never the single --token, and
+        # --migration-consumers additionally requires
+        # --migration-batches.
         if args.audit is None:
             if args.token is not None or args.auth is not None \
                     or args.checkpoint is not None \
                     or args.acceptance is not None \
-                    or args.migration_batches is not None:
+                    or args.migration_batches is not None \
+                    or args.migration_consumers is not None:
                 command.error(
-                    "--token, --auth, --checkpoint, --acceptance and "
-                    "--migration-batches require --audit")
+                    "--token, --auth, --checkpoint, --acceptance, "
+                    "--migration-batches and --migration-consumers "
+                    "require --audit")
         else:
             if not args.audit:
                 command.error("--audit must be non-empty")
@@ -164,6 +173,14 @@ def main() -> None:
                     command.error("--migration-batches must be non-empty")
                 if args.auth is None:
                     command.error("--migration-batches requires --auth")
+            if args.migration_consumers is not None:
+                if not args.migration_consumers:
+                    command.error("--migration-consumers must be non-empty")
+                if args.migration_batches is None:
+                    command.error(
+                        "--migration-consumers requires --migration-batches")
+                if args.auth is None:
+                    command.error("--migration-consumers requires --auth")
         if args.auth:
             # The whole configuration is validated before the port is
             # bound; any failure is a usage error with status 2.
@@ -174,7 +191,8 @@ def main() -> None:
         serve(args.host, args.port, audit_path=args.audit, token=args.token,
               auth=args.auth, checkpoint=args.checkpoint,
               acceptance=args.acceptance,
-              migration_batches=args.migration_batches)
+              migration_batches=args.migration_batches,
+              migration_consumers=args.migration_consumers)
     elif args.command == "verify-bundle":
         _verify_bundle(args)
 
