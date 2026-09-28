@@ -85,10 +85,21 @@ subscription -- one optional fixed batch key and one optional job
 filter -- the owner, the lease end and the acknowledged stream
 position; a pull returns the matching events after that position
 without advancing it, and an ack moves the position forward to a real
-matching event. A repeat claim by the live owner extends the lease.
-Only the current owner while the lease is valid may pull or ack; after
-strict expiry another owner may take over without changing the
-position, so unacknowledged events redeliver.
+matching event. A repeat claim by the live owner extends the lease only
+while it is still valid (the moment equal to the lease end counts);
+once it has strictly expired even the former owner may not renew in
+place and gets TimeoutError with the ledger untouched, while a
+different owner may take over. Only the current owner while the lease
+is valid may pull or ack; after strict expiry another owner may take
+over without changing the position, so unacknowledged events
+redeliver.
+
+A read-only status query (:func:`consumer_status`) reports one
+consumer's fixed subscription, current owner and lease end, the lease
+state at an observation moment (``active`` or ``expired``), the
+acknowledged position and the matching backlog: the count and the
+oldest still-unacknowledged matching event. It takes no owner and
+never writes.
 """
 
 from __future__ import annotations
@@ -107,7 +118,8 @@ from ._jsonio import finite_loads
 
 __all__ = ["run", "get", "search", "get_response", "search_response",
            "events", "events_response", "consume", "consume_response",
-           "consumer_subscription", "ConsumerLedgerInvalid",
+           "consumer_subscription", "consumer_status",
+           "consumer_status_response", "ConsumerLedgerInvalid",
            "CoordinationLedgerInvalid", "CoordinationLedgerMissing",
            "ConsumersLedgerMissing"]
 
@@ -2734,7 +2746,8 @@ def events_response(ledger: str, cursor: int | None = None,
 # The consumer ledger is an independent document bound to one resolved
 # coordination ledger path; a consume call never rewrites a coordination
 # byte. The three operations are claim, pull and ack; a repeat claim by
-# the live owner is the lease renewal.
+# the live owner renews the lease only while it is still valid (the
+# claim moment equal to the lease end counts).
 #
 #   {"version": 1,
 #    "coordination": <resolved coordination ledger real path>,
@@ -3062,6 +3075,12 @@ def _validate_consumer_ledger(
                     raise ValueError("a consumer subscription cannot be "
                                      "changed by a later claim")
                 if request["owner"] == current["owner"]:
+                    # A same-owner renewal is valid only while the lease
+                    # is still active (now == until counts); a strictly
+                    # expired lease may not be renewed in place.
+                    if request["now"] > current["until"]:
+                        raise ValueError("a same-owner renewal requires a "
+                                         "still-valid lease")
                     taken_over = False
                 else:
                     if request["now"] <= current["until"]:
@@ -3294,11 +3313,14 @@ def consume(
         rewritten: a later claim carrying another key/job filter raises
         ``ValueError``; a claim without a batch key stays a permanent
         cross-batch range. A repeat claim by the same owner (under a new
-        idempotency key) is the lease renewal and moves ``until``;
-        another owner is refused with ``PermissionError`` while the
-        lease is still valid and may take over only once it has
-        strictly expired, keeping the acknowledged position so
-        unacknowledged events redeliver.
+        idempotency key) is the lease renewal and moves ``until`` only
+        while the lease is still valid -- a claim moment equal to the
+        lease end still counts as valid; once the lease has strictly
+        expired the same owner may no longer renew in place and gets
+        ``TimeoutError`` with the ledger untouched. Another owner is
+        refused with ``PermissionError`` while the lease is still valid
+        and may take over only once it has strictly expired, keeping the
+        acknowledged position so unacknowledged events redeliver.
 
     ``pull``
         Returns one page, ``{"consumer", "owner", "until", "position",
@@ -3497,6 +3519,13 @@ def _consume_apply(
                 "a consumer subscription cannot be changed after the "
                 "first claim")
         if state["owner"] == request["owner"]:
+            # The same owner may renew only while the current lease is
+            # still valid; now == until is still active. Once the lease
+            # has strictly expired even its former owner may not renew
+            # in place -- a claim then raises TimeoutError and writes
+            # nothing, just like a pull or ack would.
+            if now > state["until"]:
+                raise TimeoutError("the consumer lease has expired")
             state["until"] = now + request["lease"]
             result = _claim_result(
                 consumer_id, subscriptions[consumer_id], state, False)
@@ -3506,7 +3535,8 @@ def _consume_apply(
             raise PermissionError(
                 "consumer is owned by another owner until "
                 f"{state['until']}")
-        # Strict expiry: takeover keeps the acknowledged position.
+        # Strict expiry: another owner may take over, keeping the
+        # acknowledged position.
         state["owner"] = request["owner"]
         state["until"] = now + request["lease"]
         result = _claim_result(
@@ -3599,3 +3629,130 @@ def consumer_subscription(
             if consumer not in consumers:
                 raise KeyError(consumer)
             return copy.deepcopy(subscriptions[consumer])
+
+
+def _status_snapshot(
+    coordination_real: str, consumer_real: str, consumer: str,
+) -> tuple[dict[str, Any], dict[str, Any], list[dict[str, Any]]]:
+    # One read-only snapshot: the consumer's fixed subscription and
+    # state under the consumer ledger's shared lock, followed by the
+    # coordination stream under the coordination ledger's and the nine
+    # business ledgers' shared locks (the same group a pull uses). The
+    # progress list is deep-copied while those locks are held, so the
+    # status is computed from one complete version of every ledger.
+    store = _get_store(consumer_real)
+    with store.lock:
+        with _lock(consumer_real, shared=True):
+            try:
+                with open(consumer_real, "rb") as handle:
+                    raw = handle.read()
+            except FileNotFoundError:
+                # No consumer ledger yet means the consumer was never
+                # claimed: an unknown consumer, exactly like a pull.
+                raise KeyError(consumer)
+            subscriptions, consumers, _idempotency, _audit = \
+                _load_consumer_bytes(consumer_real, coordination_real, raw)
+            state = consumers.get(consumer)
+            if state is None:
+                raise KeyError(consumer)
+            subscription = subscriptions[consumer]
+            progress = _read_locked_progress(coordination_real)
+            return (copy.deepcopy(subscription), copy.deepcopy(state),
+                    progress)
+
+
+def consumer_status(
+    coordination: str, ledger: str, consumer: str, now: int,
+) -> dict[str, Any]:
+    """Return one consumer's lease state and backlog without writing.
+
+    ``coordination`` is the fixed migration-batch coordination ledger
+    and ``ledger`` the independent consumer ledger; both are non-empty
+    strings resolving to distinct real paths, ``consumer`` a non-empty
+    string and ``now`` a non-boolean non-negative integer observation
+    moment. Bad arguments or coinciding real paths raise ``ValueError``
+    before any file is opened.
+
+    The result carries, in fixed order, ``consumer``, ``key``,
+    ``job_id``, ``owner``, ``until``, ``lease``, ``position``,
+    ``pending`` and ``oldest``:
+
+    * ``key``/``job_id`` are the consumer's fixed subscription (each
+      null or the fixed non-empty string);
+    * ``owner`` and ``until`` are the current lease holder and end;
+    * ``lease`` is ``"active"`` when ``now`` is no later than ``until``
+      -- the moment equal to ``until`` still counts as active -- and
+      ``"expired"`` after strict expiry;
+    * ``position`` is the acknowledged stream position (null before the
+      first ack);
+    * ``pending`` counts the current stream's events that match the
+      fixed subscription and sit strictly after that position;
+    * ``oldest`` is the earliest such unacknowledged event in the
+      stream's full event shape (complete post-commit batch snapshot
+      included), or null when there is no backlog -- in which case
+      ``pending`` is 0.
+
+    A confirmed position the current stream truncated, rewrote or
+    reused raises ``LookupError``; the cursor is never reset. The
+    snapshot is read-only under the shared locks of the consumer
+    ledger, the coordination ledger and the referenced business
+    ledgers and never writes a file. An unknown consumer (including a
+    consumer ledger that was never created) raises ``KeyError``; a
+    missing coordination ledger or consumer ledger parent raises
+    ``FileNotFoundError``; malformed consumer bytes raise
+    :class:`ConsumerLedgerInvalid` and malformed coordination or
+    referenced-business bytes :class:`CoordinationLedgerInvalid`; any
+    other locking or I/O failure raises ``OSError``.
+    """
+    for value in (coordination, ledger):
+        if not isinstance(value, str) or not value:
+            raise ValueError("coordination and ledger must be non-empty "
+                             "strings")
+    if not isinstance(consumer, str) or not consumer:
+        raise ValueError("consumer must be a non-empty string")
+    if not _is_plain_int(now) or now < 0:
+        raise ValueError("now must be a non-boolean non-negative integer")
+    coordination_real = os.path.realpath(coordination)
+    consumer_real = os.path.realpath(ledger)
+    if coordination_real == consumer_real:
+        raise ValueError("the consumer ledger must be distinct from the "
+                         "coordination ledger")
+    # The consumer ledger's directory is the only file-system fact the
+    # subscription-read stage needs; the coordination stream opens only
+    # after the consumer itself has been found.
+    _consumer_parent(consumer_real)
+    subscription, state, progress = _status_snapshot(
+        coordination_real, consumer_real, consumer)
+    position = state["position"]
+    _require_checkpoint_current(progress, subscription, position)
+    unacknowledged: list[dict[str, Any]] = []
+    for event in progress:
+        if position is not None and event["position"] <= position:
+            continue
+        if _consumer_matches(event, subscription):
+            unacknowledged.append(event)
+    return {
+        "consumer": consumer,
+        "key": subscription["key"],
+        "job_id": subscription["job_id"],
+        "owner": state["owner"],
+        "until": state["until"],
+        "lease": "active" if now <= state["until"] else "expired",
+        "position": position,
+        "pending": len(unacknowledged),
+        "oldest": _progress_entry(unacknowledged[0]) if unacknowledged
+        else None,
+    }
+
+
+def consumer_status_response(
+    coordination: str, ledger: str, consumer: str, now: int,
+) -> bytes:
+    """Serialize :func:`consumer_status`'s result from one snapshot.
+
+    The subscription, state and progress are read under the consumer
+    ledger's, the coordination ledger's and the referenced business
+    ledgers' shared locks, and the compact response bytes reflect that
+    one complete version.
+    """
+    return _render(consumer_status(coordination, ledger, consumer, now))
