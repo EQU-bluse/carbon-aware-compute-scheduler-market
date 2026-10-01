@@ -369,7 +369,9 @@ class _Snapshot:
                 f"signal file {reals['signals']!r} does not exist")
         cleared, _clear_keys, trades_raw = _rebalance._market.\
             _load_clear_ledger(
-                reals["trades"], accepted, history, signal_history)
+                reals["trades"], accepted, history, signal_history,
+                completion_paths=_rebalance._market.
+                _discover_completion_paths(tuple(sorted(reals.values()))))
         if trades_raw is None:
             raise FileNotFoundError(
                 f"clearing ledger {reals['trades']!r} does not exist")
@@ -1591,7 +1593,10 @@ def run(
         held: list[Any] = []
 
         def acquire_inputs() -> None:
-            for real in sorted(set(reals[name] for name in _INPUT_NAMES)):
+            input_reals = set(reals[name] for name in _INPUT_NAMES)
+            input_reals.update(_rebalance._market._discover_completion_paths(
+                tuple(sorted(input_reals))))
+            for real in sorted(input_reals):
                 manager = _lock(real, shared=True)
                 manager.__enter__()
                 held.append(manager)
@@ -2275,10 +2280,15 @@ def _business_locks(inputs: dict[str, str]) -> Iterator[None]:
     # Shared flocks on the business ledgers in resolved real-path order,
     # the same order the writer takes them in. A ledger that does not
     # exist is not flocked (which would create its companion lock file);
-    # _Snapshot rejects the broken reference itself.
+    # _Snapshot rejects the broken reference itself. Completion ledgers
+    # beside the business ledgers complete the trades ledger's capacity
+    # envelope and are shared in the same global order.
     held: list[Any] = []
     try:
-        for input_real in sorted(set(inputs.values())):
+        locked_reals = set(inputs.values())
+        locked_reals.update(_rebalance._market._discover_completion_paths(
+            tuple(sorted(locked_reals))))
+        for input_real in sorted(locked_reals):
             if not os.path.exists(input_real):
                 continue
             manager = _lock(input_real, shared=True)

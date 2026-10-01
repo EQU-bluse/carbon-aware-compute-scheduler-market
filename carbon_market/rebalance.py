@@ -767,6 +767,29 @@ def _commit_file(realpath: str, payload: bytes,
         raise
 
 
+def _load_completion_snapshot(
+    realpath: str,
+    accepted: dict[str, dict[str, Any]],
+    history: dict[str, list[dict[str, Any]]],
+) -> tuple[dict[str, dict[str, Any]], dict[str, dict[str, Any]],
+           dict[str, dict[str, Any]], bytes | None]:
+    # Read the optional completion ledger as one shared-lock snapshot,
+    # validated against the same acceptance and supply snapshots. Imported
+    # lazily to avoid a module-load cycle; completion sits on top of
+    # rebalance and only these two layers need this bridge.
+    from . import completion as _completion
+    return _completion._load_completion_ledger(realpath, accepted, history)
+
+
+def _completion_siblings(anchors: tuple[str, ...]) -> list[str]:
+    # Completion ledgers beside the business snapshots, discovered
+    # before any lock is taken so they can join the one global
+    # resolved-path lock order. The trades-ledger envelope check needs
+    # them even at call sites that never name a completion ledger
+    # explicitly (the migration lifecycle, settlement and current).
+    return _market._discover_completion_paths(anchors)
+
+
 def _latest_signal(
     signal_history: dict[str, list[dict[str, Any]]],
     region: str,
@@ -796,6 +819,7 @@ def evaluate(
     job_id: str,
     key: str,
     at: int,
+    completions: str | None = None,
 ) -> tuple[dict[str, object], bool]:
     """Re-evaluate one unfinished trade and advise keep or migrate.
 
@@ -850,6 +874,9 @@ def evaluate(
                              "non-empty strings")
     if not _is_plain_int(at) or at < 0:
         raise ValueError("at must be a non-boolean non-negative integer")
+    if completions is not None and (
+            not isinstance(completions, str) or not completions):
+        raise ValueError("completions must be a non-empty string or None")
 
     job_real = os.path.realpath(jobs)
     supply_real = os.path.realpath(supply)
@@ -860,7 +887,14 @@ def evaluate(
     ledger_real = os.path.realpath(ledger)
     all_paths = (job_real, supply_real, signal_real, trades_real,
                  dispatch_real, execution_real, ledger_real)
-    if len(set(all_paths)) != 7:
+    completion_real = (os.path.realpath(completions)
+                       if completions is not None else None)
+    path_set = set(all_paths)
+    if completion_real is not None:
+        if completion_real in path_set:
+            raise ValueError("completions must be a distinct real path")
+        path_set.add(completion_real)
+    if len(path_set) != (7 if completion_real is None else 8):
         raise ValueError("the seven paths must be distinct real paths")
 
     store = _get_store(ledger)
@@ -870,14 +904,22 @@ def evaluate(
         # advice ledger lock is exclusive, the six snapshot locks shared.
         # The independent intent and settlement ledgers beside the
         # snapshots are discovered before locking and added to the same
-        # ordered set, all shared (evaluate never writes them).
-        anchor_reals = (job_real, supply_real, signal_real, trades_real,
-                        dispatch_real, execution_real, ledger_real)
+        # ordered set, all shared (evaluate never writes them); the
+        # optional completion ledger is one more shared snapshot.
+        anchor_reals = all_paths
         discovered = _discover_lineage_paths(
             anchor_reals, ("intent", "settlement"))
         extra_reals = {real for kind in ("intent", "settlement")
                        for real in discovered.get(kind, ())
                        if real not in set(all_paths)}
+        # Completion ledgers beside the snapshots always join the lock
+        # set so the trades ledger's envelope sees the same capacity
+        # releases the other layers do. The explicit one is added when
+        # it lives elsewhere.
+        completion_siblings = _completion_siblings(anchor_reals)
+        extra_reals.update(completion_siblings)
+        if completion_real is not None:
+            extra_reals.add(completion_real)
         with contextlib.ExitStack() as stack:
             for locked in sorted(set(all_paths) | extra_reals):
                 stack.enter_context(
@@ -903,10 +945,35 @@ def evaluate(
             if signal_raw is None:
                 raise FileNotFoundError(
                     f"signal file {signal_real!r} does not exist")
+            released_jobs: set[str] = set()
+            completed_job_records: dict[str, dict[str, Any]] = {}
+            if completion_real is not None:
+                completion_paths_to_read = list(completion_siblings)
+                if completion_real not in completion_paths_to_read:
+                    completion_paths_to_read.append(completion_real)
+                for completion_path in completion_paths_to_read:
+                    completion_records, _completion_keys, \
+                        _completion_events, completion_raw = \
+                        _load_completion_snapshot(
+                            completion_path, accepted, history)
+                    if completion_raw is None:
+                        raise FileNotFoundError(
+                            f"completion ledger {completion_path!r} does "
+                            "not exist")
+                    for completion_record in completion_records.values():
+                        completed_job_records[completion_record["job_id"]] = \
+                            completion_record
+                        if completion_record["at"] <= at:
+                            released_jobs.add(completion_record["job_id"])
             # Live trades freeze signal versions, so the signal history
             # resolves their references; static trades validate as before.
             cleared, _clear_keys, trades_raw = _market._load_clear_ledger(
-                trades_real, accepted, history, signal_history)
+                trades_real, accepted, history, signal_history,
+                completion_paths=(completion_siblings
+                                  + ([completion_real]
+                                     if completion_real is not None
+                                     and completion_real
+                                     not in completion_siblings else [])))
             if trades_raw is None:
                 raise FileNotFoundError(
                     f"clearing ledger {trades_real!r} does not exist")
@@ -996,7 +1063,10 @@ def evaluate(
                 for plan in lineage_plans.values())
             # Refusal order is fixed: a finished booking is a ValueError,
             # work still in flight is a PermissionError, and a moment
-            # past the deadline is a TimeoutError.
+            # past the deadline is a TimeoutError. A completed job no
+            # longer takes migration advice.
+            if job_id in completed_job_records:
+                raise ValueError("the job is already completed")
             if decision["state"] == "succeeded" \
                     or any(plan["state"] == "completed"
                            for plan in job_plans.values()):
@@ -1028,10 +1098,13 @@ def evaluate(
 
             # Capacity already booked per exact resource version by
             # every OTHER job; this job's own frozen occupancy is never
-            # deducted against itself.
+            # deducted against itself. A job whose completion is already
+            # effective at the evaluation moment has released both its
+            # current occupancy and every historical migration
+            # reservation, so it contributes no deduction.
             booked: dict[tuple[str, int], int] = {}
             for other_id, other in cleared.items():
-                if other_id == job_id:
+                if other_id == job_id or other_id in released_jobs:
                     continue
                 slot = (other["resource_id"], other["version"])
                 booked[slot] = booked.get(slot, 0) + other["work"]
@@ -2176,6 +2249,7 @@ def apply(
     advice_key: str,
     key: str,
     at: int,
+    completions: str | None = None,
 ) -> tuple[dict[str, object], bool]:
     """Apply one migrate advice as a persisted re-reservation.
 
@@ -2246,6 +2320,9 @@ def apply(
                              "key must be non-empty strings")
     if not _is_plain_int(at) or at < 0:
         raise ValueError("at must be a non-boolean non-negative integer")
+    if completions is not None and (
+            not isinstance(completions, str) or not completions):
+        raise ValueError("completions must be a non-empty string or None")
 
     job_real = os.path.realpath(jobs)
     supply_real = os.path.realpath(supply)
@@ -2257,7 +2334,14 @@ def apply(
     ledger_real = os.path.realpath(ledger)
     all_paths = (job_real, supply_real, signal_real, trades_real,
                  dispatch_real, execution_real, advice_real, ledger_real)
-    if len(set(all_paths)) != 8:
+    completion_real = (os.path.realpath(completions)
+                       if completions is not None else None)
+    path_set = set(all_paths)
+    if completion_real is not None:
+        if completion_real in path_set:
+            raise ValueError("completions must be a distinct real path")
+        path_set.add(completion_real)
+    if len(path_set) != (8 if completion_real is None else 9):
         raise ValueError("the eight paths must be distinct real paths")
 
     store = _get_store(ledger)
@@ -2273,6 +2357,10 @@ def apply(
         extra_reals = {real for real in discovered_settlements.get(
                            "settlement", ())
                        if real not in set(all_paths)}
+        completion_siblings = _completion_siblings(anchor_reals)
+        extra_reals.update(completion_siblings)
+        if completion_real is not None:
+            extra_reals.add(completion_real)
         with contextlib.ExitStack() as stack:
             for locked in sorted(set(all_paths) | extra_reals):
                 stack.enter_context(
@@ -2298,8 +2386,13 @@ def apply(
             if signal_raw is None:
                 raise FileNotFoundError(
                     f"signal file {signal_real!r} does not exist")
+            envelope_paths = list(completion_siblings)
+            if completion_real is not None \
+                    and completion_real not in envelope_paths:
+                envelope_paths.append(completion_real)
             cleared, _clear_keys, trades_raw = _market._load_clear_ledger(
-                trades_real, accepted, history, signal_history)
+                trades_real, accepted, history, signal_history,
+                completion_paths=envelope_paths)
             if trades_raw is None:
                 raise FileNotFoundError(
                     f"clearing ledger {trades_real!r} does not exist")
@@ -2310,6 +2403,32 @@ def apply(
                     f"dispatch ledger {dispatch_real!r} does not exist")
             plans, _plan_keys, _plan_events = \
                 _execution._load_existing_ledger(execution_real)[:3]
+            # The optional completion ledger is one more shared
+            # snapshot: completions effective at the reservation moment
+            # release the job's current occupancy and historical
+            # migration reservations, and a completed job reserves
+            # nothing. Sibling completion ledgers beside the snapshots
+            # are part of the same physical state.
+            released_jobs: set[str] = set()
+            completed_job_records: dict[str, dict[str, Any]] = {}
+            if completion_real is not None:
+                completion_paths_to_read = list(completion_siblings)
+                if completion_real not in completion_paths_to_read:
+                    completion_paths_to_read.append(completion_real)
+                for completion_path in completion_paths_to_read:
+                    completion_records, _completion_keys, \
+                        _completion_events, completion_raw = \
+                        _load_completion_snapshot(
+                            completion_path, accepted, history)
+                    if completion_raw is None:
+                        raise FileNotFoundError(
+                            f"completion ledger {completion_path!r} does "
+                            "not exist")
+                    for completion_record in completion_records.values():
+                        completed_job_records[completion_record["job_id"]] = \
+                            completion_record
+                        if completion_record["at"] <= at:
+                            released_jobs.add(completion_record["job_id"])
             # The advice ledger is parsed first with only its structural
             # checks (current-binding grounding deferred): the intent
             # ledger references those advice records, while the
@@ -2368,6 +2487,8 @@ def apply(
             job = accepted.get(job_id)
             if job is None:
                 raise KeyError(job_id)
+            if job_id in completed_job_records:
+                raise ValueError("the job is already completed")
             plans_by_key = _plans_by_start_key(
                 migration_plans, idempotency, ledger_version)
             job_intents = _job_intent_items(intents, ledger_version,
@@ -2484,17 +2605,20 @@ def apply(
             # Each OTHER job occupies exactly one version: the after of
             # its latest completed settlement when one exists, otherwise
             # its traded version adjusted for the open/terminal migration
-            # plan the intent ledger still holds.
+            # plan the intent ledger still holds. A job whose completion
+            # is already effective at the reservation moment occupies
+            # nothing at all: its current occupancy and its historical
+            # migration reservations are both released.
             settled_binding: dict[str, dict[str, Any]] = {}
             for other_id in cleared:
-                if other_id == job_id:
+                if other_id == job_id or other_id in released_jobs:
                     continue
                 latest_other = _latest_completed_binding(
                     settlement_completed, other_id)
                 if latest_other is not None:
                     settled_binding[other_id] = latest_other["after"]
             for other_id, other in cleared.items():
-                if other_id == job_id:
+                if other_id == job_id or other_id in released_jobs:
                     continue
                 if other_id in settled_binding:
                     binding = settled_binding[other_id]
@@ -2530,7 +2654,7 @@ def apply(
             # nothing more, and a compensation holds no target.
             for ref, intent in intent_items:
                 other_id = intent["job_id"]
-                if other_id == job_id:
+                if other_id == job_id or other_id in released_jobs:
                     continue
                 other_plan = intent_plan.get(ref)
                 if other_plan is not None:
@@ -2675,6 +2799,7 @@ def _load_snapshot_layers(
     dispatch_real: str,
     execution_real: str,
     advice_real: str,
+    completion_paths: list[str] | None = None,
 ) -> tuple[dict[str, dict[str, Any]], dict[str, list[dict[str, Any]]],
            dict[str, list[dict[str, Any]]], dict[str, dict[str, Any]],
            dict[str, dict[str, Any]],
@@ -2704,7 +2829,8 @@ def _load_snapshot_layers(
         raise FileNotFoundError(
             f"signal file {signal_real!r} does not exist")
     cleared, _clear_keys, trades_raw = _market._load_clear_ledger(
-        trades_real, accepted, history, signal_history)
+        trades_real, accepted, history, signal_history,
+        completion_paths=completion_paths or [])
     if trades_raw is None:
         raise FileNotFoundError(
             f"clearing ledger {trades_real!r} does not exist")
@@ -2731,15 +2857,19 @@ def _load_snapshot_layers(
 
 def _lifecycle_extra_locks(
     all_reals: set[str],
-) -> tuple[set[str], list[str]]:
-    # Discover the independent settlement ledger beside the lifecycle
-    # snapshots and return the extra real paths to lock and the ordered
-    # settlement paths to read.
+) -> tuple[set[str], list[str], list[str]]:
+    # Discover the independent settlement ledger and any completion
+    # ledgers beside the lifecycle snapshots; return the extra real
+    # paths to lock (all shared, in the caller's global order), the
+    # ordered settlement paths to read and the ordered completion
+    # paths feeding the trades-ledger envelope check.
     discovered = _discover_lineage_paths(tuple(all_reals), ("settlement",))
-    paths = sorted(set(
+    settlement_paths = sorted(set(
         real for real in discovered.get("settlement", ())
         if real not in all_reals))
-    return set(paths), paths
+    completion_paths = _completion_siblings(tuple(sorted(all_reals)))
+    extras = set(settlement_paths) | set(completion_paths)
+    return extras, settlement_paths, completion_paths
 
 
 def _lifecycle_settlement_view(
@@ -2868,8 +2998,8 @@ def start(
         lifecycle_reals = {job_real, supply_real, signal_real,
                            trades_real, dispatch_real, execution_real,
                            advice_real, ledger_real}
-        settlement_extras, settlement_paths = _lifecycle_extra_locks(
-            lifecycle_reals)
+        settlement_extras, settlement_paths, completion_paths = \
+            _lifecycle_extra_locks(lifecycle_reals)
         with contextlib.ExitStack() as stack:
             for locked in sorted(lifecycle_reals | settlement_extras):
                 stack.enter_context(
@@ -2878,7 +3008,8 @@ def start(
             (accepted, history, signal_history, cleared, decisions,
              exec_plans, advice_records) = _load_snapshot_layers(
                 job_real, supply_real, signal_real, trades_real,
-                dispatch_real, execution_real, advice_real)
+                dispatch_real, execution_real, advice_real,
+                completion_paths=completion_paths)
             intents, plans, idempotency, events, version, old_bytes = \
                 _load_intent_ledger(
                     ledger_real, accepted, cleared, history,
@@ -3082,8 +3213,8 @@ def record(
         lifecycle_reals = {job_real, supply_real, signal_real,
                            trades_real, dispatch_real, execution_real,
                            advice_real, ledger_real}
-        settlement_extras, settlement_paths = _lifecycle_extra_locks(
-            lifecycle_reals)
+        settlement_extras, settlement_paths, completion_paths = \
+            _lifecycle_extra_locks(lifecycle_reals)
         with contextlib.ExitStack() as stack:
             for locked in sorted(lifecycle_reals | settlement_extras):
                 stack.enter_context(
@@ -3092,7 +3223,8 @@ def record(
             (accepted, history, signal_history, cleared, _decisions,
              _exec_plans, advice_records) = _load_snapshot_layers(
                 job_real, supply_real, signal_real, trades_real,
-                dispatch_real, execution_real, advice_real)
+                dispatch_real, execution_real, advice_real,
+                completion_paths=completion_paths)
             intents, plans, idempotency, events, version, old_bytes = \
                 _load_intent_ledger(
                     ledger_real, accepted, cleared, history,
@@ -3246,8 +3378,8 @@ def recover(
         lifecycle_reals = {job_real, supply_real, signal_real,
                            trades_real, dispatch_real, execution_real,
                            advice_real, ledger_real}
-        settlement_extras, settlement_paths = _lifecycle_extra_locks(
-            lifecycle_reals)
+        settlement_extras, settlement_paths, completion_paths = \
+            _lifecycle_extra_locks(lifecycle_reals)
         with contextlib.ExitStack() as stack:
             for locked in sorted(lifecycle_reals | settlement_extras):
                 stack.enter_context(
@@ -3256,7 +3388,8 @@ def recover(
             (accepted, history, signal_history, cleared, _decisions,
              _exec_plans, advice_records) = _load_snapshot_layers(
                 job_real, supply_real, signal_real, trades_real,
-                dispatch_real, execution_real, advice_real)
+                dispatch_real, execution_real, advice_real,
+                completion_paths=completion_paths)
             intents, plans, idempotency, events, version, old_bytes = \
                 _load_intent_ledger(
                     ledger_real, accepted, cleared, history,
@@ -3804,6 +3937,7 @@ def _load_settle_snapshot(
     execution_real: str,
     advice_real: str,
     ledger_real: str,
+    completion_paths: list[str] | None = None,
 ) -> tuple[dict[str, dict[str, Any]], dict[str, list[dict[str, Any]]],
            dict[str, list[dict[str, Any]]], dict[str, dict[str, Any]],
            dict[str, dict[str, Any]],
@@ -3818,7 +3952,7 @@ def _load_settle_snapshot(
     (accepted, history, signal_history, cleared, decisions, exec_plans,
      advice_records) = _load_snapshot_layers(
         job_real, supply_real, signal_real, trades_real, dispatch_real,
-        execution_real, advice_real)
+        execution_real, advice_real, completion_paths=completion_paths)
     intents, plans, intent_idempotency, intent_events, intent_version, \
         intent_raw = _load_intent_ledger(
             ledger_real, accepted, cleared, history, signal_history,
@@ -3929,6 +4063,12 @@ def settle(
 
     store = _get_store(settlement_real)
     with store.lock:
+        # Completion ledgers beside the snapshots join the lock set so
+        # the trades ledger's capacity envelope is read consistently.
+        completion_paths = _completion_siblings(
+            (job_real, supply_real, signal_real, trades_real,
+             dispatch_real, execution_real, advice_real, ledger_real,
+             settlement_real))
         with contextlib.ExitStack() as stack:
             # The settlement ledger is the only written file and takes
             # the one exclusive lock; every snapshot lock is shared, all
@@ -3936,7 +4076,8 @@ def settle(
             for locked in sorted({job_real, supply_real, signal_real,
                                   trades_real, dispatch_real,
                                   execution_real, advice_real, ledger_real,
-                                  settlement_real}):
+                                  settlement_real,
+                                  *completion_paths}):
                 stack.enter_context(
                     _lock(locked, shared=(locked != settlement_real)))
 
@@ -3946,7 +4087,7 @@ def settle(
                 _load_settle_snapshot(
                     job_real, supply_real, signal_real, trades_real,
                     dispatch_real, execution_real, advice_real,
-                    ledger_real)
+                    ledger_real, completion_paths=completion_paths)
             plans_by_key = _plans_by_start_key(
                 plans, intent_idempotency, intent_version)
             records, idempotency, events, old_bytes = \
@@ -4149,13 +4290,20 @@ def current(
 
     store = _get_store(settlement_real)
     with store.lock:
+        # Completion ledgers beside the snapshots are read shared as
+        # part of the same snapshot.
+        completion_paths = _completion_siblings(
+            (job_real, supply_real, signal_real, trades_real,
+             dispatch_real, execution_real, advice_real, ledger_real,
+             settlement_real))
         with contextlib.ExitStack() as stack:
             # A pure read: every lock, including the settlement
             # ledger's, is shared.
             for locked in sorted({job_real, supply_real, signal_real,
                                   trades_real, dispatch_real,
                                   execution_real, advice_real, ledger_real,
-                                  settlement_real}):
+                                  settlement_real,
+                                  *completion_paths}):
                 stack.enter_context(_lock(locked, shared=True))
 
             (accepted, _history, _signal_history, cleared, _decisions,
@@ -4164,7 +4312,7 @@ def current(
                 _load_settle_snapshot(
                     job_real, supply_real, signal_real, trades_real,
                     dispatch_real, execution_real, advice_real,
-                    ledger_real)
+                    ledger_real, completion_paths=completion_paths)
             if job_id not in accepted:
                 raise KeyError(job_id)
             trade = cleared.get(job_id)

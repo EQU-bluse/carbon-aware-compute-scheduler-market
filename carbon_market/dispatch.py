@@ -539,9 +539,16 @@ def commit(
     supply_real = os.path.realpath(supply)
     trades_real = os.path.realpath(trades)
     ledger_real = os.path.realpath(ledger)
-    if len({job_real, supply_real, trades_real, ledger_real}) != 4:
+    business_reals = {job_real, supply_real, trades_real, ledger_real}
+    if len(business_reals) != 4:
         raise ValueError("jobs, supply, trades and ledger paths must be "
                          "distinct real paths")
+    # Completion ledgers beside the snapshots are part of the trades
+    # ledger's capacity envelope; they are discovered before locking and
+    # shared in the same global order so a concurrent completion can
+    # never deadlock against this commit.
+    completion_reals = set(
+        _market._discover_completion_paths(tuple(business_reals)))
 
     store = _get_store(ledger)
     with store.lock:
@@ -549,8 +556,7 @@ def commit(
         # every caller, so concurrent commits can never deadlock; the
         # dispatch ledger lock is exclusive, the input snapshots shared.
         with contextlib.ExitStack() as stack:
-            for locked in sorted({job_real, supply_real, trades_real,
-                                  ledger_real}):
+            for locked in sorted(business_reals | completion_reals):
                 stack.enter_context(
                     _lock(locked, shared=(locked != ledger_real)))
 
@@ -573,7 +579,8 @@ def commit(
                 raise FileNotFoundError(
                     f"supply file {supply_real!r} does not exist")
             cleared, _clear_keys, trades_raw = _market._load_clear_ledger(
-                trades_real, accepted, history)
+                trades_real, accepted, history,
+                completion_paths=sorted(completion_reals))
             if trades_raw is None:
                 raise FileNotFoundError(
                     f"clearing ledger {trades_real!r} does not exist")

@@ -707,10 +707,16 @@ def plan(
     trades_real = os.path.realpath(trades)
     dispatch_real = os.path.realpath(dispatch)
     ledger_real = os.path.realpath(ledger)
-    if len({job_real, supply_real, trades_real, dispatch_real,
-            ledger_real}) != 5:
+    business_reals = {job_real, supply_real, trades_real, dispatch_real,
+                      ledger_real}
+    if len(business_reals) != 5:
         raise ValueError("jobs, supply, trades, dispatch and ledger "
                          "paths must be distinct real paths")
+    # Completion ledgers beside the snapshots complete the trades
+    # ledger's capacity envelope; discovered before locking and shared
+    # in the global order, so a concurrent completion cannot deadlock.
+    completion_reals = set(
+        _market._discover_completion_paths(tuple(sorted(business_reals))))
 
     store = _get_store(ledger)
     with store.lock:
@@ -718,8 +724,7 @@ def plan(
         # every caller, so concurrent plans can never deadlock; the
         # execution ledger lock is exclusive, the input snapshots shared.
         with contextlib.ExitStack() as stack:
-            for locked in sorted({job_real, supply_real, trades_real,
-                                  dispatch_real, ledger_real}):
+            for locked in sorted(business_reals | completion_reals):
                 stack.enter_context(
                     _lock(locked, shared=(locked != ledger_real)))
 
@@ -742,7 +747,8 @@ def plan(
                 raise FileNotFoundError(
                     f"supply file {supply_real!r} does not exist")
             cleared, _clear_keys, trades_raw = _market._load_clear_ledger(
-                trades_real, accepted, history)
+                trades_real, accepted, history,
+                completion_paths=sorted(completion_reals))
             if trades_raw is None:
                 raise FileNotFoundError(
                     f"clearing ledger {trades_real!r} does not exist")
