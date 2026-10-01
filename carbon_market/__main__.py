@@ -56,7 +56,8 @@ def parser() -> argparse.ArgumentParser:
     server.add_argument(
         "--migration-consumers", action=_Once, metavar="PATH",
         help="independent consumer ledger for "
-             "POST /migration-consumers/{claim,pull,ack}, requires "
+             "POST /migration-consumers/{claim,pull,ack,reject} and "
+             "GET /migration-consumers/{status,dead-letters}, requires "
              "--migration-batches")
     bundle = subcommands.add_parser(
         "verify-bundle",

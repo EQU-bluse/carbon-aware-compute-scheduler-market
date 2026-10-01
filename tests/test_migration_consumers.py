@@ -64,6 +64,15 @@ class ConsumeTest(unittest.TestCase):
         return mb.consume(self.coord, self.cons, "ack", consumer, owner,
                           now, position=position, idem=idem)
 
+    def _reject(self, position, reason="bad", consumer="c1", owner="o1",
+                now=40, idem=None):
+        return mb.consume(self.coord, self.cons, "reject", consumer, owner,
+                          now, position=position, reason=reason, idem=idem)
+
+    def _dead_letters(self, consumer="c1", cursor=None, limit=100):
+        return mb.consumer_dead_letters(
+            self.coord, self.cons, consumer, cursor, limit)
+
     # -- argument validation --------------------------------------------------
 
     def test_bad_arguments_raise_value_error(self) -> None:
@@ -387,6 +396,331 @@ class ConsumeTest(unittest.TestCase):
         self.assertFalse(created)
         self.assertTrue(result["taken_over"])
         self.assertEqual(result["owner"], "o2")
+
+    # -- reject ---------------------------------------------------------------
+
+    def test_reject_parks_event_and_advances_cursor(self) -> None:
+        total = self.total
+        self._claim()
+        page, _ = self._pull(limit=1)
+        event0 = page["events"][0]
+        result, created = self._reject(0, reason="  拒绝理由 \t\n", idem="r0")
+        self.assertTrue(created)
+        self.assertEqual(list(result),
+                         ["consumer", "owner", "until", "position",
+                          "dead_letter"])
+        self.assertEqual(result["consumer"], "c1")
+        self.assertEqual(result["owner"], "o1")
+        self.assertEqual(result["until"], 140)
+        self.assertEqual(result["position"], 0)
+        letter = result["dead_letter"]
+        self.assertEqual(list(letter),
+                         ["position", "event", "reason", "rejected_at",
+                          "owner"])
+        self.assertEqual(letter["position"], 0)
+        self.assertEqual(letter["event"], event0)
+        self.assertEqual(letter["reason"], "拒绝理由")
+        self.assertEqual(letter["rejected_at"], 40)
+        self.assertEqual(letter["owner"], "o1")
+        # The cursor moved, so the next pull starts at 1 and position 0
+        # never redelivers.
+        page, _ = self._pull(limit=10)
+        self.assertEqual([e["position"] for e in page["events"]],
+                         list(range(1, min(total, 11))))
+        status = self._status()
+        self.assertEqual(status["position"], 0)
+        self.assertEqual(status["pending"], total - 1)
+
+    def test_reject_reason_validation(self) -> None:
+        self._claim()
+        for reason in (1, True, None, ["x"], "", "   ", "\t\n ",
+                       "x" * 513, "あ" * 513):
+            with self.subTest(reason=repr(reason)[:20]):
+                with self.assertRaises(ValueError):
+                    mb.consume(self.coord, self.cons, "reject", "c1", "o1",
+                               40, position=0, reason=reason, idem="rx")
+        # 512 code points after trimming are accepted; the stripped text
+        # is stored.
+        result, _ = self._reject(0, reason=" " + "あ" * 512 + "\n", idem="r0")
+        self.assertEqual(result["dead_letter"]["reason"], "あ" * 512)
+
+    def test_reject_must_name_earliest_pending_match(self) -> None:
+        self._claim()
+        # Skipping the earliest pending event (position 0) to reject a
+        # later one is invalid.
+        with self.assertRaises(ValueError):
+            self._reject(1, idem="r1")
+        with self.assertRaises(ValueError):
+            self._reject(2, idem="r2")
+        self._reject(0, idem="r0")
+        # Past the tail is invalid too.
+        with self.assertRaises(ValueError):
+            self._reject(self.total + 5, idem="rend")
+        # Backward and in-place rejects (position at or before the
+        # cursor) are invalid; there is no in-place reject.
+        with self.assertRaises(ValueError):
+            self._reject(0, idem="r0b")
+
+    def test_reject_under_fixed_subscription_skips_non_matches(self) -> None:
+        # A zzz-only subscription: position 0 is an aaa event. The
+        # earliest *matching* position is what reject must name; a
+        # non-matching position is invalid, and rejecting a later match
+        # while an earlier match is pending is invalid too.
+        self._claim(consumer="ck", idem="kb", key="zzz")
+        stream = mb.events(self.coord, limit=1000)["events"]
+        zzz = [e["position"] for e in stream if e["key"] == "zzz"]
+        self.assertTrue(zzz)
+        first, second = zzz[0], zzz[1] if len(zzz) > 1 else None
+        with self.assertRaises(ValueError):
+            self._reject(0, consumer="ck", idem="r0")
+        if second is not None:
+            with self.assertRaises(ValueError):
+                self._reject(second, consumer="ck", idem="r2")
+        result, _ = self._reject(first, consumer="ck", idem="r1")
+        self.assertEqual(result["position"], first)
+        self.assertEqual(result["dead_letter"]["event"]["key"], "zzz")
+        # The rejected zzz event no longer pulls; aaa events never did.
+        page, _ = self._pull(consumer="ck", limit=1000)
+        self.assertNotIn(first, [e["position"] for e in page["events"]])
+        self.assertTrue(all(e["key"] == "zzz" for e in page["events"]))
+
+    def test_reject_and_ack_interleave(self) -> None:
+        total = self.total
+        self._claim()
+        self._reject(0, idem="r0")
+        ack1, _ = self._ack(1, idem="a1")
+        self.assertEqual(ack1["position"], 1)
+        self._reject(2, idem="r2")
+        page, _ = self._pull(limit=1000)
+        self.assertEqual([e["position"] for e in page["events"]],
+                         list(range(3, total)))
+        dead = self._dead_letters()
+        self.assertEqual([e["position"] for e in dead["entries"]], [0, 2])
+
+    def test_reject_idempotent_replay_returns_original_without_writing(
+            self) -> None:
+        self._claim()
+        first, created = self._reject(0, reason="r", idem="r0")
+        self.assertTrue(created)
+        before = Path(self.cons).read_bytes()
+        replay, replayed = self._reject(0, reason="r", idem="r0")
+        self.assertFalse(replayed)
+        self.assertEqual(replay, first)
+        self.assertEqual(Path(self.cons).read_bytes(), before)
+        # Whitespace changes the stored request: the key was bound to
+        # the trimmed request, so an equivalent-trim replay still
+        # matches, while a different trimmed reason conflicts.
+        again, _ = self._reject(0, reason="  r  ", idem="r0")
+        self.assertEqual(again, first)
+        with self.assertRaises(ValueError):
+            self._reject(0, reason="other", idem="r0")
+        with self.assertRaises(ValueError):
+            self._reject(1, reason="r", idem="r0")
+
+    def test_reject_ownership_and_lease(self) -> None:
+        self._claim()
+        with self.assertRaises(PermissionError):
+            self._reject(0, owner="o2", now=40, idem="r0")
+        with self.assertRaises(TimeoutError):
+            self._reject(0, owner="o1", now=141, idem="r0")
+        # A failed reject (position 2 skips the still-pending position
+        # 1) leaves the ledger byte-for-byte untouched.
+        self._reject(0, idem="r0")
+        before = Path(self.cons).read_bytes()
+        with self.assertRaises(ValueError):
+            self._reject(2, idem="skip")
+        self.assertEqual(Path(self.cons).read_bytes(), before)
+
+    def test_reject_unknown_consumer_is_key_error(self) -> None:
+        self._claim()
+        with self.assertRaises(KeyError):
+            self._reject(0, consumer="ghost", idem="r0")
+
+    def test_reject_checkpoint_regression_raises_lookup_error(self) -> None:
+        total = self.total
+        self._claim()
+        self._ack(total - 1, idem="a-last")
+        other = MigrationBatchTest(
+            "test_get_returns_copy_and_unknown_key_raises")
+        other.setUp()
+        self.addCleanup(other.doCleanups)
+        other._prepare_migrate()
+        other._run(key="aaa", owner="o1", now=30)
+        other_cons = os.path.join(other.tmp.name, "consumers.json")
+        doc = json.loads(Path(self.cons).read_text("utf-8"))
+        doc["coordination"] = os.path.realpath(other.paths["coord"])
+        # The baseline ledger has no dead_letters section to rewrite.
+        Path(other_cons).write_text(
+            json.dumps(doc, ensure_ascii=False,
+                       separators=(",", ":")) + "\n",
+            encoding="utf-8")
+        with self.assertRaises(LookupError):
+            mb.consume(other.paths["coord"], other_cons, "reject", "c1",
+                       "o1", 40, position=0, reason="r", idem="r-again")
+
+    def test_reject_requires_idem(self) -> None:
+        self._claim()
+        with self.assertRaises(ValueError):
+            mb.consume(self.coord, self.cons, "reject", "c1", "o1", 40,
+                       position=0, reason="r", idem="")
+        with self.assertRaises(ValueError):
+            mb.consume(self.coord, self.cons, "reject", "c1", "o1", 40,
+                       position=-1, reason="r", idem="i")
+        with self.assertRaises(ValueError):
+            mb.consume(self.coord, self.cons, "reject", "c1", "o1", 40,
+                       position=True, reason="r", idem="i")
+
+    # -- ledger upgrade -------------------------------------------------------
+
+    def test_claim_and_ack_leave_baseline_shape_untouched(self) -> None:
+        self._claim()
+        self._ack(0, idem="a0")
+        doc = json.loads(Path(self.cons).read_text("utf-8"))
+        self.assertEqual(list(doc),
+                         ["version", "coordination", "subscriptions",
+                          "consumers", "idempotency", "audit"])
+        before = Path(self.cons).read_bytes()
+        # A pull and an in-place ack neither write nor upgrade the file.
+        self._pull()
+        self._ack(0, idem="a0-again")
+        self.assertEqual(Path(self.cons).read_bytes(), before)
+        doc = json.loads(Path(self.cons).read_text("utf-8"))
+        self.assertNotIn("dead_letters", doc)
+
+    def test_first_reject_upgrades_and_seeds_one_list_per_consumer(
+            self) -> None:
+        self._claim(consumer="c1", idem="k1")
+        self._claim(consumer="c2", idem="k2", key="zzz")
+        raw = Path(self.cons).read_bytes()
+        self._reject(0, consumer="c1", idem="r0")
+        upgraded = json.loads(Path(self.cons).read_text("utf-8"))
+        self.assertEqual(list(upgraded),
+                         ["version", "coordination", "subscriptions",
+                          "consumers", "idempotency", "audit",
+                          "dead_letters"])
+        self.assertEqual(sorted(upgraded["dead_letters"]), ["c1", "c2"])
+        self.assertEqual(len(upgraded["dead_letters"]["c1"]), 1)
+        self.assertEqual(upgraded["dead_letters"]["c2"], [])
+        # The pre-upgrade bytes really were the baseline shape.
+        self.assertNotIn(b"dead_letters", raw)
+        # After the upgrade a claim renewal and ack keep the section.
+        self._claim(consumer="c1", now=50, idem="k1b")
+        self._ack(1, consumer="c1", idem="a1")
+        again = json.loads(Path(self.cons).read_text("utf-8"))
+        self.assertIn("dead_letters", again)
+        self.assertEqual([e["position"]
+                          for e in again["dead_letters"]["c1"]], [0])
+        # A consumer first claimed after the upgrade starts with an
+        # empty list and can reject on its own.
+        self._claim(consumer="c3", idem="k3", key="zzz")
+        doc3 = json.loads(Path(self.cons).read_text("utf-8"))
+        self.assertEqual(doc3["dead_letters"]["c3"], [])
+        stream = mb.events(self.coord, limit=1000)["events"]
+        first_zzz = next(e["position"] for e in stream if e["key"] == "zzz")
+        result, _ = self._reject(first_zzz, consumer="c3", idem="r3")
+        self.assertEqual(result["dead_letter"]["position"], first_zzz)
+
+    # -- dead-letter query ----------------------------------------------------
+
+    def test_dead_letters_pages_by_original_position(self) -> None:
+        total = self.total
+        self._claim()
+        self._reject(0, idem="r0")
+        self._ack(1, idem="a1")
+        self._reject(2, idem="r2")
+        page = self._dead_letters(limit=1)
+        self.assertEqual(list(page), ["consumer", "entries", "next"])
+        self.assertEqual(page["consumer"], "c1")
+        self.assertEqual([e["position"] for e in page["entries"]], [0])
+        self.assertEqual(page["next"], 0)
+        page = self._dead_letters(cursor=0, limit=1)
+        self.assertEqual([e["position"] for e in page["entries"]], [2])
+        self.assertIsNone(page["next"])
+        full = self._dead_letters()
+        self.assertEqual([e["position"] for e in full["entries"]], [0, 2])
+        self.assertIsNone(full["next"])
+        # Each entry is the complete parked letter.
+        self.assertEqual(list(full["entries"][0]),
+                         ["position", "event", "reason", "rejected_at",
+                          "owner"])
+        stream = mb.events(self.coord, limit=1000)["events"]
+        self.assertEqual([e["event"] for e in full["entries"]],
+                         [stream[0], stream[2]])
+
+    def test_dead_letters_default_limit_and_empty_consumer(self) -> None:
+        self._claim(consumer="empty", idem="ke")
+        page = mb.consumer_dead_letters(self.coord, self.cons, "empty")
+        self.assertEqual(page, {"consumer": "empty", "entries": [],
+                                "next": None})
+
+    def test_dead_letters_unknown_consumer_is_key_error(self) -> None:
+        self._claim()
+        with self.assertRaises(KeyError):
+            self._dead_letters(consumer="ghost")
+        with self.assertRaises(KeyError):
+            mb.consumer_dead_letters(
+                self.coord, os.path.join(self.fx.tmp.name, "none.json"),
+                "c1")
+
+    def test_dead_letters_bad_arguments_raise_value_error(self) -> None:
+        for bad in (
+            lambda: mb.consumer_dead_letters("", self.cons, "c1"),
+            lambda: mb.consumer_dead_letters(self.coord, "", "c1"),
+            lambda: mb.consumer_dead_letters(self.coord, self.cons, ""),
+            lambda: mb.consumer_dead_letters(
+                self.coord, self.cons, "c1", cursor=-1),
+            lambda: mb.consumer_dead_letters(
+                self.coord, self.cons, "c1", cursor=True),
+            lambda: mb.consumer_dead_letters(
+                self.coord, self.cons, "c1", limit=0),
+            lambda: mb.consumer_dead_letters(
+                self.coord, self.cons, "c1", limit=1001),
+        ):
+            with self.subTest(bad=bad):
+                self.assertRaises(ValueError, bad)
+
+    def test_dead_letters_paths_must_be_distinct(self) -> None:
+        with self.assertRaises(ValueError):
+            mb.consumer_dead_letters(self.coord, self.coord, "c1")
+
+    def test_dead_letters_missing_parent_raises_file_not_found(self) -> None:
+        missing = os.path.join(self.fx.tmp.name, "no-dir", "c.json")
+        with self.assertRaises(FileNotFoundError):
+            mb.consumer_dead_letters(self.coord, missing, "c1")
+
+    def test_dead_letters_reads_after_stream_truncation(self) -> None:
+        # The dead-letter query opens only the consumer ledger, so a
+        # rejected event stays observable after the bound stream is
+        # shortened (the status path would instead hit LookupError).
+        self._claim()
+        result, _ = self._reject(0, idem="r0")
+        other = MigrationBatchTest(
+            "test_get_returns_copy_and_unknown_key_raises")
+        other.setUp()
+        self.addCleanup(other.doCleanups)
+        other._prepare_migrate()
+        other._run(key="aaa", owner="o1", now=30)
+        other_cons = os.path.join(other.tmp.name, "consumers.json")
+        doc = json.loads(Path(self.cons).read_text("utf-8"))
+        doc["coordination"] = os.path.realpath(other.paths["coord"])
+        Path(other_cons).write_text(
+            json.dumps(doc, ensure_ascii=False,
+                       separators=(",", ":")) + "\n",
+            encoding="utf-8")
+        page = mb.consumer_dead_letters(
+            other.paths["coord"], other_cons, "c1")
+        self.assertEqual([e["position"] for e in page["entries"]], [0])
+        self.assertEqual(page["entries"][0], result["dead_letter"])
+
+    def test_dead_letters_response_is_compact(self) -> None:
+        self._claim()
+        self._reject(0, reason="理由", idem="r0")
+        body = mb.consumer_dead_letters_response(
+            self.coord, self.cons, "c1")
+        self.assertFalse(body.endswith(b"\n"))
+        self.assertNotIn(b"\\u", body)
+        self.assertIn("理由".encode("utf-8"), body)
+        self.assertEqual(json.loads(body), self._dead_letters())
 
     # -- status ---------------------------------------------------------------
 

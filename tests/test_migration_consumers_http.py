@@ -123,6 +123,19 @@ class MigrationConsumersHttpTest(unittest.TestCase):
                 "lease": lease, "idem": idem, **filters}
         return self._post("claim", body, token=token)
 
+    def _ack(self, position, consumer="c1", owner="o1", now=40, idem="a",
+             token=FULL_TOKEN):
+        return self._post(
+            "ack", {"consumer": consumer, "owner": owner, "now": now,
+                    "position": position, "idem": idem}, token=token)
+
+    def _reject(self, position, reason="bad", consumer="c1", owner="o1",
+                now=40, idem="r", token=FULL_TOKEN):
+        return self._post(
+            "reject", {"consumer": consumer, "owner": owner, "now": now,
+                       "position": position, "reason": reason, "idem": idem},
+            token=token)
+
     def _get_status(self, query, token=FULL_TOKEN, raw_path=None):
         connection = HTTPConnection("127.0.0.1", self.server.server_port,
                                     timeout=2)
@@ -131,6 +144,23 @@ class MigrationConsumersHttpTest(unittest.TestCase):
             headers["X-Audit-Token"] = token
         path = (raw_path if raw_path is not None
                 else f"/migration-consumers/status?{query}")
+        connection.request("GET", path, headers=headers)
+        response = connection.getresponse()
+        raw_body = response.read()
+        connection.close()
+        try:
+            return response.status, json.loads(raw_body), raw_body
+        except ValueError:
+            return response.status, None, raw_body
+
+    def _get_dead_letters(self, query, token=FULL_TOKEN, raw_path=None):
+        connection = HTTPConnection("127.0.0.1", self.server.server_port,
+                                    timeout=2)
+        headers = {}
+        if token is not None:
+            headers["X-Audit-Token"] = token
+        path = (raw_path if raw_path is not None
+                else f"/migration-consumers/dead-letters?{query}")
         connection.request("GET", path, headers=headers)
         response = connection.getresponse()
         raw_body = response.read()
@@ -642,6 +672,313 @@ class MigrationConsumersHttpTest(unittest.TestCase):
         status, body, _ = self._get_status("consumer=c1&now=40")
         self.assertEqual((status, body),
                          (404, {"error": "migration_batches_not_found"}))
+
+    # -- reject ---------------------------------------------------------------
+
+    def test_reject_parks_event_and_advances_cursor(self) -> None:
+        total = len(migration_batch.events(
+            self.coord, limit=1000)["events"])
+        self._claim()
+        status, body, raw = self._reject(0, reason="  拒绝理由 \t")
+        self.assertEqual(status, 200)
+        self.assertEqual(list(body),
+                         ["consumer", "owner", "until", "position",
+                          "dead_letter"])
+        self.assertEqual(body["consumer"], "c1")
+        self.assertEqual(body["owner"], "o1")
+        self.assertEqual(body["until"], 140)
+        self.assertEqual(body["position"], 0)
+        letter = body["dead_letter"]
+        self.assertEqual(list(letter),
+                         ["position", "event", "reason", "rejected_at",
+                          "owner"])
+        self.assertEqual(letter["position"], 0)
+        self.assertEqual(letter["reason"], "拒绝理由")
+        self.assertEqual(letter["rejected_at"], 40)
+        self.assertEqual(letter["owner"], "o1")
+        stream = migration_batch.events(self.coord, limit=1000)["events"]
+        self.assertEqual(letter["event"], stream[0])
+        self.assertFalse(raw.endswith(b"\n"))
+        self.assertNotIn(b"\\u", raw)
+        self.assertIn("拒绝理由".encode("utf-8"), raw)
+        self.assertEqual(
+            raw, migration_batch.consume_response(
+                self.coord, self.consumers, "reject", "c1", "o1", 40,
+                position=0, reason="  拒绝理由 \t", idem="r"))
+        # The rejected event no longer pulls; the cursor is at 0.
+        status, page, _ = self._post(
+            "pull", {"consumer": "c1", "owner": "o1", "now": 40,
+                     "limit": 1000})
+        self.assertEqual(status, 200)
+        self.assertEqual([e["position"] for e in page["events"]],
+                         list(range(1, total)))
+        # The first reject upgraded the on-disk ledger with the
+        # dead_letters section seeded for every existing consumer.
+        self._claim(consumer="c2", idem="k2", key="aaa")
+        # c2 was claimed after the upgrade, so a reject there appends to
+        # its already-present empty list.
+        doc = json.loads(Path(self.consumers).read_text("utf-8"))
+        self.assertEqual(list(doc),
+                         ["version", "coordination", "subscriptions",
+                          "consumers", "idempotency", "audit",
+                          "dead_letters"])
+        self.assertEqual(sorted(doc["dead_letters"]), ["c1", "c2"])
+        self.assertEqual(len(doc["dead_letters"]["c1"]), 1)
+        self.assertEqual(doc["dead_letters"]["c2"], [])
+
+    def test_reject_bad_bodies_are_400(self) -> None:
+        self._claim()
+        good = {"consumer": "c1", "owner": "o1", "now": 40, "position": 0,
+                "reason": "r", "idem": "i"}
+        for bad in (
+            {**good, "extra": 1},
+            {**good, "position": -1},
+            {**good, "position": True},
+            {**good, "position": 1.5},
+            {**good, "position": None},
+            {**good, "reason": ""},
+            {**good, "reason": "   "},
+            {**good, "reason": "\t\n "},
+            {**good, "reason": 5},
+            {**good, "reason": True},
+            {**good, "reason": None},
+            {**good, "reason": ["r"]},
+            {**good, "reason": "x" * 513},
+            {**good, "reason": "あ" * 513},
+            {**good, "idem": ""},
+            {"consumer": "c1", "owner": "o1", "now": 40, "position": 0,
+             "idem": "i"},
+        ):
+            with self.subTest(bad=bad):
+                status, body, _ = self._post("reject", bad)
+                self.assertEqual((status, body),
+                                 (400, {"error": "invalid_request"}))
+        # 512 code points after trimming are accepted.
+        status, _, _ = self._post(
+            "reject", {**good, "reason": " " + "あ" * 512, "idem": "i512"})
+        self.assertEqual(status, 200)
+        # Malformed JSON and duplicate members.
+        status, _, _ = self._post(
+            "reject", raw=b'{"consumer":"c1","consumer":"c2","owner":"o1",'
+                          b'"now":40,"position":0,"reason":"r","idem":"i"}')
+        self.assertEqual(status, 400)
+        # A query string is a 400 on the write path.
+        status, _, _ = self._post("reject", good, query="?x=1")
+        self.assertEqual(status, 400)
+
+    def test_reject_skipping_past_tail_or_in_place_is_400(self) -> None:
+        total = len(migration_batch.events(
+            self.coord, limit=1000)["events"])
+        self._claim()
+        for bad_position in (1, 2, total + 10):
+            status, body, _ = self._reject(
+                bad_position, idem=f"r{bad_position}")
+            self.assertEqual((status, body),
+                             (400, {"error": "invalid_request"}))
+        status, _, _ = self._reject(0, idem="r0")
+        self.assertEqual(status, 200)
+        # No in-place reject: position 0 is at the cursor now.
+        status, body, _ = self._reject(0, idem="r0b")
+        self.assertEqual((status, body),
+                         (400, {"error": "invalid_request"}))
+        # A non-matching position for a fixed-key subscription is 400.
+        self._claim(consumer="ck", idem="kb", key="zzz")
+        status, _, _ = self._reject(0, consumer="ck", idem="rk0")
+        self.assertEqual(status, 400)
+
+    def test_reject_ownership_is_409_and_unknown_consumer_404(self) -> None:
+        self._claim()
+        status, body, _ = self._reject(0, owner="o2", now=40, idem="r0")
+        self.assertEqual((status, body),
+                         (409, {"error": "migration_consumer_ownership"}))
+        status, body, _ = self._reject(0, owner="o1", now=141, idem="r0")
+        self.assertEqual((status, body),
+                         (409, {"error": "migration_consumer_ownership"}))
+        status, body, _ = self._reject(0, consumer="ghost", idem="r0")
+        self.assertEqual((status, body),
+                         (404, {"error": "migration_consumer_not_found"}))
+
+    def test_reject_checkpoint_regression_is_409(self) -> None:
+        total = len(migration_batch.events(
+            self.coord, limit=1000)["events"])
+        self._claim()
+        self._ack(total - 1)
+        other = MigrationBatchTest(
+            "test_get_returns_copy_and_unknown_key_raises")
+        other.setUp()
+        self.addCleanup(other.doCleanups)
+        other._prepare_migrate()
+        other._run(key="aaa", owner="o1", now=30)
+        doc = json.loads(Path(self.consumers).read_text("utf-8"))
+        doc["coordination"] = os.path.realpath(other.paths["coord"])
+        other_cons = os.path.join(other.tmp.name, "consumers.json")
+        Path(other_cons).write_text(
+            json.dumps(doc, ensure_ascii=False,
+                       separators=(",", ":")) + "\n",
+            encoding="utf-8")
+        self.server.migration_batches = other.paths["coord"]
+        self.server.migration_consumers = other_cons
+        status, body, _ = self._reject(0, idem="r0")
+        self.assertEqual((status, body),
+                         (409, {"error": "migration_consumer_checkpoint"}))
+
+    def test_reject_idempotent_replay_and_changed_request(self) -> None:
+        self._claim()
+        status, first, raw = self._reject(0, reason="r", idem="r0")
+        self.assertEqual(status, 200)
+        before = Path(self.consumers).read_bytes()
+        # Identical replay returns the same bytes and writes nothing.
+        status, replay, replay_raw = self._reject(0, reason="r", idem="r0")
+        self.assertEqual(status, 200)
+        self.assertEqual(replay, first)
+        self.assertEqual(replay_raw, raw)
+        self.assertEqual(Path(self.consumers).read_bytes(), before)
+        # The same key with a changed request is 400.
+        status, body, _ = self._reject(0, reason="other", idem="r0")
+        self.assertEqual((status, body),
+                         (400, {"error": "invalid_request"}))
+        status, _, _ = self._reject(1, reason="r", idem="r0")
+        self.assertEqual(status, 400)
+
+    def test_reject_scope_uses_persisted_subscription(self) -> None:
+        # The fixed-aaa subscription is rejectable through the aaa key
+        # token: position 0 is an aaa event.
+        self._claim(consumer="fixed", idem="f1", key="aaa")
+        status, _, _ = self._reject(
+            0, consumer="fixed", idem="r0", token=KEY_TOKEN)
+        self.assertEqual(status, 200)
+        # A cross-batch subscription stays forbidden.
+        self._claim(consumer="wide", idem="w1")
+        status, body, _ = self._reject(
+            0, consumer="wide", idem="rw", token=KEY_TOKEN)
+        self.assertEqual((status, body), (403, {"error": "forbidden"}))
+        # Ops/stage tokens are rejected before the consumer is looked up.
+        for token in (OPS_TOKEN, STAGE_TOKEN):
+            status, _, _ = self._reject(
+                0, consumer="ghost", idem="rg", token=token)
+            self.assertEqual(status, 403)
+
+    # -- dead-letter endpoint -------------------------------------------------
+
+    def test_dead_letters_returns_paged_entries(self) -> None:
+        total = len(migration_batch.events(
+            self.coord, limit=1000)["events"])
+        self._claim()
+        self._reject(0, reason="理由", idem="r0")
+        self._ack(1, idem="a1")
+        self._reject(2, reason="two", idem="r2")
+        status, page, raw = self._get_dead_letters(
+            "consumer=c1&limit=1")
+        self.assertEqual(status, 200)
+        self.assertEqual(list(page), ["consumer", "entries", "next"])
+        self.assertEqual([e["position"] for e in page["entries"]], [0])
+        self.assertEqual(page["next"], 0)
+        letter = page["entries"][0]
+        self.assertEqual(list(letter),
+                         ["position", "event", "reason", "rejected_at",
+                          "owner"])
+        self.assertEqual(letter["reason"], "理由")
+        stream = migration_batch.events(self.coord, limit=1000)["events"]
+        self.assertEqual(letter["event"], stream[0])
+        status, page, _ = self._get_dead_letters("consumer=c1&cursor=0&limit=1")
+        self.assertEqual(status, 200)
+        self.assertEqual([e["position"] for e in page["entries"]], [2])
+        self.assertIsNone(page["next"])
+        # Default limit 100 returns the complete page with next null.
+        status, full, _ = self._get_dead_letters("consumer=c1")
+        self.assertEqual(status, 200)
+        self.assertEqual([e["position"] for e in full["entries"]], [0, 2])
+        self.assertIsNone(full["next"])
+        self.assertFalse(raw.endswith(b"\n"))
+        self.assertNotIn(b"\\u", raw)
+        self.assertEqual(
+            raw, migration_batch.consumer_dead_letters_response(
+                self.coord, self.consumers, "c1", None, 1))
+        # An empty page past the cursor carries next null.
+        status, page, _ = self._get_dead_letters("consumer=c1&cursor=2")
+        self.assertEqual((page["entries"], page["next"]), ([], None))
+        # A consumer that never rejected has an empty page.
+        self._claim(consumer="empty", idem="ke")
+        status, page, _ = self._get_dead_letters("consumer=empty")
+        self.assertEqual(status, 200)
+        self.assertEqual(page, {"consumer": "empty", "entries": [],
+                                "next": None})
+
+    def test_dead_letters_bad_queries_are_400(self) -> None:
+        self._claim()
+        for query in (
+            "",
+            "consumer=c1&limit=0",
+            "consumer=c1&limit=1001",
+            "consumer=c1&limit=x",
+            "consumer=c1&cursor=-1",
+            "consumer=c1&cursor=1.5",
+            "consumer=c1&cursor=x",
+            "consumer=c1&cursor=0&extra=1",
+            "consumer=c1&consumer=c2",
+            "consumer=",
+            "CONSUMER=c1",
+        ):
+            with self.subTest(query=query):
+                status, body, _ = self._get_dead_letters(query)
+                self.assertEqual((status, body),
+                                 (400, {"error": "invalid_request"}))
+
+    def test_dead_letters_identity_unknown_and_scope(self) -> None:
+        status, body, _ = self._get_dead_letters("consumer=c1", token=None)
+        self.assertEqual((status, body), (401, {"error": "unauthorized"}))
+        status, body, _ = self._get_dead_letters("consumer=c1",
+                                                 token="wrong")
+        self.assertEqual((status, body), (403, {"error": "forbidden"}))
+        status, body, _ = self._get_dead_letters("consumer=ghost")
+        self.assertEqual((status, body),
+                         (404, {"error": "migration_consumer_not_found"}))
+        # Scopes mirror the status query.
+        self._claim(consumer="fixed", idem="f1", key="aaa")
+        self._reject(0, consumer="fixed", idem="r0")
+        self.assertEqual(
+            self._get_dead_letters("consumer=fixed",
+                                   token=KEY_TOKEN)[0], 200)
+        self._claim(consumer="wide", idem="w1")
+        status, body, _ = self._get_dead_letters(
+            "consumer=wide", token=KEY_TOKEN)
+        self.assertEqual((status, body), (403, {"error": "forbidden"}))
+        for token in (OPS_TOKEN, STAGE_TOKEN):
+            self.assertEqual(
+                self._get_dead_letters("consumer=ghost",
+                                       token=token)[0], 403)
+        self.assertEqual(
+            self._get_dead_letters("consumer=ghost",
+                                   token=KEY_TOKEN)[0], 404)
+
+    def test_dead_letters_ignore_a_broken_coordination_ledger(self) -> None:
+        # The query reads only the consumer ledger, so a coordination
+        # ledger that became malformed does not affect it -- while the
+        # reject write still maps that to 409.
+        self._claim()
+        self._reject(0, idem="r0")
+        with open(self.coord, "wb") as handle:
+            handle.write(b"{broken\n")
+        status, body, _ = self._get_dead_letters("consumer=c1")
+        self.assertEqual(status, 200)
+        self.assertEqual([e["position"] for e in body["entries"]], [0])
+        status, resp, _ = self._reject(1, idem="r1")
+        self.assertEqual((status, resp),
+                         (409, {"error": "migration_batches_invalid"}))
+
+    def test_dead_letters_ledger_errors(self) -> None:
+        self._claim()
+        self._reject(0, idem="r0")
+        with open(self.consumers, "wb") as handle:
+            handle.write(b"{broken\n")
+        status, body, _ = self._get_dead_letters("consumer=c1")
+        self.assertEqual((status, body),
+                         (409, {"error": "migration_consumers_invalid"}))
+        self.server.migration_consumers = os.path.join(
+            self.fx.tmp.name, "no-dir", "consumers.json")
+        status, body, _ = self._get_dead_letters("consumer=c1")
+        self.assertEqual((status, body),
+                         (404, {"error": "migration_consumers_not_found"}))
 
     # -- unconfigured and unknown paths --------------------------------------
 

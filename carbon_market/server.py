@@ -26,15 +26,17 @@ _MIGRATION_BATCHES_PARAMS = ("key", "cursor", "limit")
 # stream by the exclusive zero-based position cursor with an optional
 # batch key and related job filter, combined by logical AND.
 _MIGRATION_EVENTS_PARAMS = ("cursor", "limit", "key", "job")
-# POST /migration-consumers/{claim,pull,ack} each accept one fixed
-# JSON field set; the client never names a ledger path, which is fixed
-# at startup alongside --migration-batches.
+# POST /migration-consumers/{claim,pull,ack,reject} each accept one
+# fixed JSON field set; the client never names a ledger path, which is
+# fixed at startup alongside --migration-batches.
 _MIGRATION_CONSUMER_PATHS = (
     "/migration-consumers/claim", "/migration-consumers/pull",
-    "/migration-consumers/ack")
-# GET /migration-consumers/status takes exactly the named consumer and
-# the query moment, each once; the ledger paths stay fixed at startup.
+    "/migration-consumers/ack", "/migration-consumers/reject")
+# GET /migration-consumers/{status,dead-letters} take the named consumer
+# (and status the query moment / dead-letters an exclusive cursor and
+# page size), each once; the ledger paths stay fixed at startup.
 _MIGRATION_CONSUMER_STATUS_PARAMS = ("consumer", "now")
+_MIGRATION_DEAD_LETTERS_PARAMS = ("consumer", "cursor", "limit")
 _MIGRATION_CLAIM_FIELDS = frozenset(
     ("consumer", "owner", "now", "lease", "idem", "key", "job_id"))
 _MIGRATION_CLAIM_REQUIRED = frozenset(
@@ -43,6 +45,9 @@ _MIGRATION_PULL_FIELDS = frozenset(("consumer", "owner", "now", "limit"))
 _MIGRATION_PULL_REQUIRED = frozenset(("consumer", "owner", "now"))
 _MIGRATION_ACK_FIELDS = frozenset(
     ("consumer", "owner", "now", "position", "idem"))
+_MIGRATION_REJECT_FIELDS = frozenset(
+    ("consumer", "owner", "now", "position", "reason", "idem"))
+_MIGRATION_REASON_MAX = 512
 _MIGRATION_MAX_BODY = 1 << 20
 _ACCEPTANCE_STATES = ("pending", "active", "quarantined")
 _OPS = ("copy", "restore")
@@ -177,6 +182,25 @@ def _parse_migration_consumer_status_params(query: str) -> dict[str, str]:
     return params
 
 
+def _parse_migration_dead_letters_params(query: str) -> dict[str, str]:
+    params = _parse_query(query, _MIGRATION_DEAD_LETTERS_PARAMS)
+    # The consumer id is mandatory; the cursor is an optional decimal
+    # non-negative integer and limit an optional decimal 1..1000
+    # (default 100 applied by the caller).
+    if "consumer" not in params:
+        raise ValueError("consumer is required")
+    cursor = params.get("cursor")
+    if cursor is not None and not all("0" <= char <= "9" for char in cursor):
+        raise ValueError("cursor must be a decimal non-negative integer")
+    limit = params.get("limit")
+    if limit is not None:
+        if not all("0" <= char <= "9" for char in limit):
+            raise ValueError("limit must be a decimal integer")
+        if not 1 <= int(limit) <= _MAX_LIMIT:
+            raise ValueError("limit must be between 1 and 1000")
+    return params
+
+
 class Handler(BaseHTTPRequestHandler):
     server_version = "CarbonMarket/0.1"
 
@@ -220,6 +244,13 @@ class Handler(BaseHTTPRequestHandler):
                 is not None:
             self._migration_consumer_status(query)
             return
+        if path == "/migration-consumers/dead-letters" \
+                and getattr(self.server, "migration_batches", None) \
+                is not None \
+                and getattr(self.server, "migration_consumers", None) \
+                is not None:
+            self._migration_consumer_dead_letters(query)
+            return
         self._json(HTTPStatus.NOT_FOUND, {"error": "not_found"})
 
     def do_POST(self) -> None:  # noqa: N802 - BaseHTTPRequestHandler contract
@@ -242,6 +273,7 @@ class Handler(BaseHTTPRequestHandler):
             "claim": (_MIGRATION_CLAIM_FIELDS, _MIGRATION_CLAIM_REQUIRED),
             "pull": (_MIGRATION_PULL_FIELDS, _MIGRATION_PULL_REQUIRED),
             "ack": (_MIGRATION_ACK_FIELDS, _MIGRATION_ACK_FIELDS),
+            "reject": (_MIGRATION_REJECT_FIELDS, _MIGRATION_REJECT_FIELDS),
         }[operation]
 
         def reject_duplicates(pairs):
@@ -303,6 +335,23 @@ class Handler(BaseHTTPRequestHandler):
             if not isinstance(body["idem"], str) or not body["idem"]:
                 self._bad_request()
                 return None
+        elif operation == "reject":
+            position = body["position"]
+            if not isinstance(position, int) or isinstance(position, bool) \
+                    or position < 0:
+                self._bad_request()
+                return None
+            reason = body["reason"]
+            if not isinstance(reason, str) \
+                    or not 1 <= len(reason.strip()) <= _MIGRATION_REASON_MAX:
+                # The reason is a string of 1..512 Unicode code points
+                # after surrounding whitespace is stripped; blank or
+                # over-long reasons never reach a ledger.
+                self._bad_request()
+                return None
+            if not isinstance(body["idem"], str) or not body["idem"]:
+                self._bad_request()
+                return None
         elif "limit" in body:
             limit = body["limit"]
             if not isinstance(limit, int) or isinstance(limit, bool) \
@@ -335,7 +384,7 @@ class Handler(BaseHTTPRequestHandler):
         # Scope follows body validation and precedes the coordination
         # stream read. The operation and stage axes need no file and are
         # decided first. A claim carries the batch key in the request; a
-        # pull or ack never names it, so the key axis reads the
+        # pull, ack or reject never names it, so the key axis reads the
         # consumer's persisted fixed subscription from this endpoint's
         # own control ledger (at the same stage the auth configuration
         # is re-read). The data-plane coordination and business ledgers
@@ -387,6 +436,10 @@ class Handler(BaseHTTPRequestHandler):
             kwargs["idem"] = body["idem"]
         elif operation == "ack":
             kwargs["position"] = body["position"]
+            kwargs["idem"] = body["idem"]
+        elif operation == "reject":
+            kwargs["position"] = body["position"]
+            kwargs["reason"] = body["reason"]
             kwargs["idem"] = body["idem"]
         elif "limit" in body:
             kwargs["limit"] = body["limit"]
@@ -511,6 +564,78 @@ class Handler(BaseHTTPRequestHandler):
         except migration_batch.CoordinationLedgerMissing:
             self._json(HTTPStatus.NOT_FOUND,
                        {"error": "migration_batches_not_found"})
+        except migration_batch.ConsumersLedgerMissing:
+            self._json(HTTPStatus.NOT_FOUND,
+                       {"error": "migration_consumers_not_found"})
+        except FileNotFoundError:
+            self._json(HTTPStatus.NOT_FOUND,
+                       {"error": "migration_consumers_not_found"})
+        except ValueError:
+            self._json(HTTPStatus.BAD_REQUEST, {"error": "invalid_request"})
+        except OSError:
+            self._json(HTTPStatus.SERVICE_UNAVAILABLE,
+                       {"error": "migration_consumers_unavailable"})
+        else:
+            self._bytes(HTTPStatus.OK, payload)
+
+    def _migration_consumer_dead_letters(self, query: str) -> None:
+        # Read-only dead-letter query: identity, parameters, the
+        # persisted subscription read for scope, and only then the
+        # dead-letter page -- the same authorization scope and ordering
+        # as the status query. The parked letters live in the consumer
+        # ledger, so the coordination/business ledgers are never opened.
+        coordination = getattr(self.server, "migration_batches")
+        consumers = getattr(self.server, "migration_consumers")
+        authorized, record = self._authorize()
+        if not authorized:
+            return
+        try:
+            params = _parse_migration_dead_letters_params(query)
+        except ValueError:
+            self._bad_request()
+            return
+        consumer = params["consumer"]
+        cursor = int(params["cursor"]) if "cursor" in params else None
+        limit = int(params["limit"]) if "limit" in params else 100
+
+        if record is not None and (record.ops is not None
+                                   or record.stages is not None):
+            self._json(HTTPStatus.FORBIDDEN, {"error": "forbidden"})
+            return
+        if record is not None and record.keys is not None:
+            try:
+                subscription = migration_batch.consumer_subscription(
+                    coordination, consumers, consumer)
+            except KeyError:
+                self._json(HTTPStatus.NOT_FOUND,
+                           {"error": "migration_consumer_not_found"})
+                return
+            except migration_batch.ConsumerLedgerInvalid:
+                self._json(HTTPStatus.CONFLICT,
+                           {"error": "migration_consumers_invalid"})
+                return
+            except FileNotFoundError:
+                self._json(HTTPStatus.NOT_FOUND,
+                           {"error": "migration_consumers_not_found"})
+                return
+            except OSError:
+                self._json(HTTPStatus.SERVICE_UNAVAILABLE,
+                           {"error": "migration_consumers_unavailable"})
+                return
+            batch_key = subscription["key"]
+            if batch_key is None or batch_key not in record.keys:
+                self._json(HTTPStatus.FORBIDDEN, {"error": "forbidden"})
+                return
+
+        try:
+            payload = migration_batch.consumer_dead_letters_response(
+                coordination, consumers, consumer, cursor, limit)
+        except KeyError:
+            self._json(HTTPStatus.NOT_FOUND,
+                       {"error": "migration_consumer_not_found"})
+        except migration_batch.ConsumerLedgerInvalid:
+            self._json(HTTPStatus.CONFLICT,
+                       {"error": "migration_consumers_invalid"})
         except migration_batch.ConsumersLedgerMissing:
             self._json(HTTPStatus.NOT_FOUND,
                        {"error": "migration_consumers_not_found"})
