@@ -7,7 +7,8 @@ import urllib.parse
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
-from . import acceptance, audit, audit_proof, auth, migration_batch
+from . import acceptance, audit, audit_proof, auth, completion, \
+    migration_batch
 
 # Query parameters GET /audit accepts; anything else is an invalid request.
 _AUDIT_PARAMS = ("cursor", "limit", "op", "stage", "key")
@@ -39,6 +40,13 @@ _MIGRATION_CONSUMER_PATHS = (
 # once.
 _MIGRATION_CONSUMER_STATUS_PARAMS = ("consumer", "now")
 _MIGRATION_DEAD_LETTERS_PARAMS = ("consumer", "cursor", "limit")
+# GET /completions takes either the exact-lookup job id alone or the
+# paginated exclusive cursor, page size and the outcome/exceeded
+# filters; the completion ledger is fixed at startup and can never be
+# selected through the query.
+_COMPLETIONS_PARAMS = ("job", "cursor", "limit", "outcome", "exceeded")
+_COMPLETION_OUTCOMES = ("succeeded", "failed")
+_COMPLETION_EXCEEDED = ("cost", "carbon", "any", "none")
 _MIGRATION_CLAIM_FIELDS = frozenset(
     ("consumer", "owner", "now", "lease", "idem", "key", "job_id"))
 _MIGRATION_CLAIM_REQUIRED = frozenset(
@@ -134,6 +142,29 @@ def _parse_acceptance_params(query: str) -> dict[str, str]:
             raise ValueError("limit must be between 1 and 1000")
     if "state" in params and params["state"] not in _ACCEPTANCE_STATES:
         raise ValueError("state must be pending, active or quarantined")
+    return params
+
+
+def _parse_completions_params(query: str) -> dict[str, str]:
+    params = _parse_query(query, _COMPLETIONS_PARAMS)
+    if "job" in params:
+        # An exact lookup stands alone: no cursor, page size or filter
+        # may accompany the job id.
+        if len(params) != 1:
+            raise ValueError("job cannot be combined with cursor, "
+                             "limit, outcome or exceeded")
+        return params
+    limit = params.get("limit")
+    if limit is not None:
+        if not all("0" <= char <= "9" for char in limit):
+            raise ValueError("limit must be a decimal integer")
+        if not 1 <= int(limit) <= _MAX_LIMIT:
+            raise ValueError("limit must be between 1 and 1000")
+    if "outcome" in params and params["outcome"] not in _COMPLETION_OUTCOMES:
+        raise ValueError("outcome must be succeeded or failed")
+    if "exceeded" in params \
+            and params["exceeded"] not in _COMPLETION_EXCEEDED:
+        raise ValueError("exceeded must be cost, carbon, any or none")
     return params
 
 
@@ -252,6 +283,11 @@ class Handler(BaseHTTPRequestHandler):
                 and getattr(self.server, "migration_consumers", None) \
                 is not None:
             self._migration_consumer_dead_letters(query)
+            return
+        if path == "/completions" \
+                and getattr(self.server, "completions_path", None) \
+                is not None:
+            self._completions(query)
             return
         self._json(HTTPStatus.NOT_FOUND, {"error": "not_found"})
 
@@ -920,6 +956,88 @@ class Handler(BaseHTTPRequestHandler):
             else:
                 self._raw(HTTPStatus.OK, body, etag)
 
+    def _completions(self, query: str) -> None:
+        authorized, record = self._authorize()
+        if not authorized:
+            return
+
+        try:
+            params = _parse_completions_params(query)
+        except ValueError:
+            self._json(HTTPStatus.BAD_REQUEST, {"error": "invalid_request"})
+            return
+
+        # The conditional header is validated together with the query,
+        # before the scope decision and any ledger access: absent
+        # (allowed) or exactly one strong tag of the documented shape.
+        # A blank value, a repeated header, a weak tag, a list, a
+        # wildcard or any other shape is an invalid request that never
+        # opens the ledger.
+        conditions = self.headers.get_all("If-None-Match")
+        condition: str | None = None
+        if conditions is not None:
+            if len(conditions) != 1 or not _ETAG_RE.fullmatch(conditions[0]):
+                self._json(HTTPStatus.BAD_REQUEST,
+                           {"error": "invalid_request"})
+                return
+            condition = conditions[0][1:-1]
+
+        # Scope checks follow parameter validation and precede any
+        # ledger access: an exact lookup requires unrestricted operation
+        # and stage scopes and a key scope that is unrestricted or names
+        # the requested job id; a paginated query requires all three
+        # scopes unrestricted. A forbidden request never opens the
+        # ledger.
+        if record is not None:
+            if record.ops is not None or record.stages is not None:
+                self._json(HTTPStatus.FORBIDDEN, {"error": "forbidden"})
+                return
+            if "job" in params:
+                if record.keys is not None \
+                        and params["job"] not in record.keys:
+                    self._json(HTTPStatus.FORBIDDEN,
+                               {"error": "forbidden"})
+                    return
+            elif record.keys is not None:
+                self._json(HTTPStatus.FORBIDDEN, {"error": "forbidden"})
+                return
+
+        ledger = getattr(self.server, "completions_path")
+        try:
+            if "job" in params:
+                body, etag = completion.get_response(
+                    ledger, params["job"], condition)
+            else:
+                kwargs: dict[str, object] = {}
+                for name in ("cursor", "outcome", "exceeded"):
+                    if name in params:
+                        kwargs[name] = params[name]
+                if "limit" in params:
+                    kwargs["limit"] = int(params["limit"])
+                body, etag = completion.search_response(
+                    ledger, condition=condition, **kwargs)
+        except FileNotFoundError:
+            # Never leak the configured path or the system message.
+            self._json(HTTPStatus.NOT_FOUND,
+                       {"error": "completion_not_found"})
+        except KeyError:
+            self._json(HTTPStatus.NOT_FOUND,
+                       {"error": "completion_job_not_found"})
+        except ValueError:
+            self._json(HTTPStatus.CONFLICT, {"error": "completion_invalid"})
+        except OSError:
+            self._json(HTTPStatus.SERVICE_UNAVAILABLE,
+                       {"error": "completion_unavailable"})
+        else:
+            # The 304 decision was made under the ledger's shared lock
+            # against the same serialized bytes a 200 carries, so a
+            # concurrent completion can never mix an old tag with a new
+            # body.
+            if body is None:
+                self._raw(HTTPStatus.NOT_MODIFIED, b"", etag)
+            else:
+                self._raw(HTTPStatus.OK, body, etag)
+
     def _migration_batches(self, query: str) -> None:
         ledger = getattr(self.server, "migration_batches")
         authorized, record = self._authorize()
@@ -1087,7 +1205,8 @@ def serve(host: str, port: int, audit_path: str | None = None,
           checkpoint: str | None = None,
           acceptance: str | None = None,
           migration_batches: str | None = None,
-          migration_consumers: str | None = None) -> None:
+          migration_consumers: str | None = None,
+          completions: str | None = None) -> None:
     with ThreadingHTTPServer((host, port), Handler) as server:
         server.audit_path = audit_path  # type: ignore[attr-defined]
         server.audit_token = token  # type: ignore[attr-defined]
@@ -1096,4 +1215,5 @@ def serve(host: str, port: int, audit_path: str | None = None,
         server.acceptance_dir = acceptance  # type: ignore[attr-defined]
         server.migration_batches = migration_batches  # type: ignore[attr-defined]
         server.migration_consumers = migration_consumers  # type: ignore[attr-defined]
+        server.completions_path = completions  # type: ignore[attr-defined]
         server.serve_forever()
