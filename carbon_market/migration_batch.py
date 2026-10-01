@@ -94,6 +94,18 @@ is valid may pull or ack; after strict expiry another owner may take
 over without changing the position, so unacknowledged events
 redeliver.
 
+A reject (the fourth consume operation) is an ack that also dead-
+letters the event: only the current owner during a valid lease may
+reject, and the position must name the earliest unacknowledged event
+the fixed subscription still matches -- predecessors may not be
+skipped and the stream tail may not be passed. The cursor advances to
+that position in the same atomic commit that records the dead letter,
+so a rejected event is never pulled again but stays fully observable
+through the dead-letter query (:func:`consumer_dead_letters`). A
+consumer ledger written before dead letters existed keeps its exact
+bytes through claim and ack; its first successful reject upgrades it
+with the append-only ``dead_letters`` section.
+
 A read-only status query (:func:`consumer_status`) reports one
 consumer's fixed subscription, current owner and lease end, the lease
 state at an observation moment (``active`` or ``expired``), the
@@ -119,7 +131,9 @@ from ._jsonio import finite_loads
 __all__ = ["run", "get", "search", "get_response", "search_response",
            "events", "events_response", "consume", "consume_response",
            "consumer_subscription", "consumer_status",
-           "consumer_status_response", "ConsumerLedgerInvalid",
+           "consumer_status_response", "consumer_dead_letters",
+           "consumer_dead_letters_response", "ConsumerLedgerInvalid",
+           "ConsumerOwnershipError", "ConsumerLeaseExpired",
            "CoordinationLedgerInvalid", "CoordinationLedgerMissing",
            "ConsumersLedgerMissing"]
 
@@ -865,12 +879,19 @@ def _validate_progress_event(
     position: int,
     batches: dict[str, dict[str, Any]],
     ledger_inputs: dict[str, str],
+    *,
+    require_recorded: bool = True,
 ) -> dict[str, Any]:
     # One incremental progress event, validated intrinsically: its
     # batch is a historical snapshot taken right after that commit, so
     # it must carry every field in canonical order and arity but it is
     # never re-followed into the business ledgers, whose plans and
-    # bindings have legitimately advanced since.
+    # bindings have legitimately advanced since. A dead letter embeds
+    # one such event in the independent consumer ledger and passes
+    # require_recorded=False: it is form-checked the same way but does
+    # not have to reference a batch recorded beside it or share a
+    # business-ledger set, since the consumer ledger only binds the
+    # coordination ledger's path.
     if not isinstance(raw, dict) \
             or set(raw.keys()) != set(_PROGRESS_FIELDS):
         raise ValueError("migration progress event has invalid fields")
@@ -885,7 +906,7 @@ def _validate_progress_event(
     if not isinstance(event_key, str) or not event_key:
         raise ValueError("migration progress event key must be a "
                          "non-empty string")
-    if event_key not in batches:
+    if require_recorded and event_key not in batches:
         raise ValueError("migration progress event must reference a "
                          "recorded batch")
     category = raw["category"]
@@ -909,7 +930,7 @@ def _validate_progress_event(
         raise ValueError("progress event batch key does not match its "
                          "event key")
     inputs = _validate_inputs(event_batch_raw["inputs"])
-    if inputs != ledger_inputs:
+    if require_recorded and inputs != ledger_inputs:
         raise ValueError("progress event batch must share the ledger's "
                          "business ledger set")
     owner = event_batch_raw["owner"]
@@ -2750,43 +2771,81 @@ def events_response(ledger: str, cursor: int | None = None,
 
 
 # ---------------------------------------------------------------------------
-# Persistent consumer ledger: claims, pulls, acks and lease renewal
+# Persistent consumer ledger: claims, pulls, acks, rejects and lease
+# renewal
 # ---------------------------------------------------------------------------
 #
 # The consumer ledger is an independent document bound to one resolved
 # coordination ledger path; a consume call never rewrites a coordination
-# byte. The three operations are claim, pull and ack; a repeat claim by
-# the live owner renews the lease only while it is still valid (the
-# claim moment equal to the lease end counts).
+# byte. The four operations are claim, pull, ack and reject; a repeat
+# claim by the live owner renews the lease only while it is still valid
+# (the claim moment equal to the lease end counts).
 #
 #   {"version": 1,
 #    "coordination": <resolved coordination ledger real path>,
 #    "subscriptions": {<consumer id>: {"key": ..., "job_id": ...}},
 #    "consumers":     {<consumer id>: {"owner", "until", "position"}},
 #    "idempotency":   {<idem key>:  <the complete write request>},
-#    "audit":         [{"seq", "at", "request", "result"}, ...]}
+#    "audit":         [{"seq", "at", "request", "result"}, ...],
+#    "dead_letters":  [{"consumer", "position", "event", "reason",
+#                       "rejected_at", "owner"}, ...]}
 #
 # subscriptions/consumers/idempotency are key-sorted and share the
 # consumer-id set; the audit is appended in physical order with a
 # contiguous zero-based seq and is never re-sorted. Every first-served
 # write commits the state, its idempotency binding and one audit event
 # in the same synced atomic replace as every other ledger.
+#
+# dead_letters is optional on read, like the coordination ledger's
+# events section: a ledger written before rejects existed carries no
+# such field and keeps its exact bytes through claim, pull and ack; the
+# first successful reject upgrades the document and appends the
+# section, once, after the audit. It stays append-only: a dead letter
+# is an immutable record ordered by append (reject) time, and the
+# reject ordering within one consumer is the original position order.
 
 _CONSUMER_VERSION = 1
 _CONSUMER_ROOT_FIELDS = ("version", "coordination", "subscriptions",
                         "consumers", "idempotency", "audit")
+# Dead letters were added after the claim/pull/ack ledger shipped: the
+# section is optional on read and a pre-dead-letter document keeps
+# validating and reproducing byte-for-byte until its first successful
+# reject upgrades it, exactly like a baseline coordination ledger
+# without the events section.
+_CONSUMER_DEAD_LETTERS_FIELD = "dead_letters"
+_CONSUMER_ROOT_FIELDS_WITH_DEAD_LETTERS = _CONSUMER_ROOT_FIELDS + \
+    (_CONSUMER_DEAD_LETTERS_FIELD,)
 _CONSUMER_SUBSCRIPTION_FIELDS = ("key", "job_id")
 _CONSUMER_STATE_FIELDS = ("owner", "until", "position")
 _CONSUMER_AUDIT_FIELDS = ("seq", "at", "request", "result")
-_CONSUMER_OPERATIONS = ("claim", "pull", "ack")
+_CONSUMER_OPERATIONS = ("claim", "pull", "ack", "reject")
 _CONSUMER_REQUEST_FIELDS = {
     "claim": ("operation", "consumer", "key", "job_id", "owner", "lease",
               "now"),
     "ack": ("operation", "consumer", "owner", "position", "now"),
+    "reject": ("operation", "consumer", "owner", "position", "reason",
+               "now"),
 }
 _CONSUMER_CLAIM_RESULT_FIELDS = ("consumer", "key", "job_id", "owner",
                                 "until", "position", "taken_over")
 _CONSUMER_STATE_RESULT_FIELDS = ("consumer", "owner", "until", "position")
+# A reject result carries the state fields exactly like an ack and then
+# the dead letter it just recorded.
+_CONSUMER_REJECT_RESULT_FIELDS = _CONSUMER_STATE_RESULT_FIELDS + \
+    ("dead_letter",)
+# A dead letter as it rides a reject response and a dead-letter page:
+# the event's original position, its complete event snapshot, the
+# trimmed reason, the reject moment and the rejecting owner. The owning
+# consumer rides the enclosing response/page and the ledger record.
+_CONSUMER_DEAD_LETTER_FIELDS = ("position", "event", "reason",
+                               "rejected_at", "owner")
+# The ledger's append-only section additionally attributes each record
+# to its consumer, since one ledger serves every consumer.
+_CONSUMER_DEAD_LETTER_RECORD_FIELDS = ("consumer",) + \
+    _CONSUMER_DEAD_LETTER_FIELDS
+# A reject reason is stripped of surrounding whitespace and then must
+# hold between one and this many Unicode code points.
+_CONSUMER_REASON_MAX = 512
 _CONSUMER_PREFIX = ".migration-consumers-"
 
 
@@ -2795,6 +2854,23 @@ class ConsumerLedgerInvalid(ValueError):
     # the consume surface. It stays a public ValueError to library
     # callers but lets the endpoint answer 409 (an invalid ledger)
     # instead of 400 (an invalid request).
+    pass
+
+
+class ConsumerOwnershipError(PermissionError):
+    # A non-owner tried to act while the lease still holds. It stays a
+    # public PermissionError to library callers but lets the endpoint
+    # distinguish the 409 ownership conflict from a filesystem
+    # PermissionError, which must answer 503.
+    pass
+
+
+class ConsumerLeaseExpired(TimeoutError):
+    # The lease has strictly expired for the acting owner (or a
+    # same-owner renewal was attempted after strict expiry). It stays a
+    # public TimeoutError to library callers while the endpoint maps it
+    # to the same 409 ownership code and never mistakes it for an I/O
+    # timeout.
     pass
 
 
@@ -2816,12 +2892,38 @@ def _consumer_canonical_request(request: dict[str, Any]) -> dict[str, Any]:
     return {field: copy.deepcopy(request[field]) for field in fields}
 
 
+def _consumer_canonical_dead_letter(
+    record: dict[str, Any],
+) -> dict[str, Any]:
+    # One ledger dead-letter record in fixed field order: the owning
+    # consumer then the five public letter fields; the complete event
+    # snapshot rides along verbatim in the event stream's shape.
+    return {
+        "consumer": record["consumer"],
+        **_public_dead_letter(record),
+    }
+
+
+def _public_dead_letter(record: dict[str, Any]) -> dict[str, Any]:
+    # The five-field dead letter a reject answer and the dead-letter
+    # query expose, in fixed order: original position, complete event,
+    # trimmed reason, reject moment and rejecting owner.
+    return {
+        "position": record["position"],
+        "event": _progress_entry(record["event"]),
+        "reason": record["reason"],
+        "rejected_at": record["rejected_at"],
+        "owner": record["owner"],
+    }
+
+
 def _consumer_canonical_bytes(
     coordination_real: str,
     subscriptions: dict[str, dict[str, Any]],
     consumers: dict[str, dict[str, Any]],
     idempotency: dict[str, dict[str, Any]],
     audit: list[dict[str, Any]],
+    dead_letters: list[dict[str, Any]] | None = None,
 ) -> bytes:
     payload = {
         "version": _CONSUMER_VERSION,
@@ -2842,9 +2944,30 @@ def _consumer_canonical_bytes(
                    "result": copy.deepcopy(event["result"])}
                   for event in audit],
     }
+    # The dead-letter section is emitted only once a ledger has been
+    # upgraded by its first reject; a pre-dead-letter document keeps
+    # reproducing its original six-field shape byte-for-byte.
+    if dead_letters is not None:
+        payload["dead_letters"] = [
+            _consumer_canonical_dead_letter(record)
+            for record in dead_letters]
     text = json.dumps(payload, ensure_ascii=False, separators=(",", ":"),
                       allow_nan=False) + "\n"
     return text.encode("utf-8")
+
+
+def _validate_reason(value: object) -> str:
+    # A reject reason is a string; leading and trailing whitespace is
+    # stripped and what remains must span 1..512 Unicode code points
+    # (counting code points, not UTF-16 units or bytes). The stripped
+    # form is what gets persisted and replayed.
+    if not isinstance(value, str):
+        raise ValueError("reason must be a string")
+    reason = value.strip()
+    if not 1 <= len(reason) <= _CONSUMER_REASON_MAX:
+        raise ValueError("reason must contain between 1 and 512 Unicode "
+                         "code points after trimming")
+    return reason
 
 
 def _validate_consumer_request(raw: object) -> dict[str, Any]:
@@ -2875,12 +2998,74 @@ def _validate_consumer_request(raw: object) -> dict[str, Any]:
         lease = request["lease"]
         if not _is_plain_int(lease) or lease < 1:
             raise ValueError("lease must be a non-boolean positive integer")
-    if operation == "ack":
+    if operation in ("ack", "reject"):
         position = request["position"]
         if not _is_plain_int(position) or position < 0:
             raise ValueError("position must be a non-boolean non-negative "
                              "integer")
+    if operation == "reject":
+        request["reason"] = _validate_reason(request["reason"])
     return request
+
+
+def _validate_embedded_event(raw: object) -> dict[str, Any]:
+    # A dead letter embeds the complete rejected progress event. The
+    # event is form-checked exactly like the coordination stream's own
+    # events (fixed fields, order, arity and enumerations, canonical
+    # snapshot shape) without following it into any business ledger:
+    # the consumer ledger is bound only to the coordination path, and
+    # the embedded event is a historical snapshot that never has to
+    # reference a batch recorded beside it.
+    if not isinstance(raw, dict) \
+            or set(raw.keys()) != set(_PROGRESS_FIELDS):
+        raise ValueError("dead letter event has invalid fields")
+    position = raw["position"]
+    if not _is_plain_int(position) or position < 0:
+        raise ValueError("dead letter event position must be a "
+                         "non-boolean non-negative integer")
+    return _validate_progress_event(
+        raw, position, {}, {}, require_recorded=False)
+
+
+def _validate_public_dead_letter(raw: object) -> dict[str, Any]:
+    # The five-field public dead letter (the shape a reject answer and
+    # the dead-letter query expose), validated intrinsically.
+    if not isinstance(raw, dict) \
+            or list(raw.keys()) != list(_CONSUMER_DEAD_LETTER_FIELDS):
+        raise ValueError("dead letter has invalid fields")
+    position = raw["position"]
+    if not _is_plain_int(position) or position < 0:
+        raise ValueError("dead letter position must be a non-boolean "
+                         "non-negative integer")
+    event = _validate_embedded_event(raw["event"])
+    if event["position"] != position:
+        raise ValueError("a dead letter event must sit at its recorded "
+                         "position")
+    reason = _validate_reason(raw["reason"])
+    rejected_at = raw["rejected_at"]
+    if not _is_plain_int(rejected_at) or rejected_at < 0:
+        raise ValueError("dead letter rejected_at must be a non-boolean "
+                         "non-negative integer")
+    owner = raw["owner"]
+    if not isinstance(owner, str) or not owner:
+        raise ValueError("dead letter owner must be a non-empty string")
+    return {"position": position, "event": event, "reason": reason,
+            "rejected_at": rejected_at, "owner": owner}
+
+
+def _validate_dead_letter(raw: object) -> dict[str, Any]:
+    # One immutable ledger record: the six-field public letter plus the
+    # owning consumer, since the section serves every consumer.
+    if not isinstance(raw, dict) \
+            or list(raw.keys()) != list(
+                _CONSUMER_DEAD_LETTER_RECORD_FIELDS):
+        raise ValueError("consumer dead letter has invalid fields")
+    consumer = raw["consumer"]
+    if not isinstance(consumer, str) or not consumer:
+        raise ValueError("dead letter consumer must be a non-empty string")
+    letter = _validate_public_dead_letter(
+        {field: raw[field] for field in _CONSUMER_DEAD_LETTER_FIELDS})
+    return {"consumer": consumer, **letter}
 
 
 def _validate_consumer_result(
@@ -2890,6 +3075,8 @@ def _validate_consumer_result(
         raise ValueError("consumer audit result must be an object")
     if request["operation"] == "claim":
         fields = _CONSUMER_CLAIM_RESULT_FIELDS
+    elif request["operation"] == "reject":
+        fields = _CONSUMER_REJECT_RESULT_FIELDS
     else:
         fields = _CONSUMER_STATE_RESULT_FIELDS
     if list(raw.keys()) != list(fields):
@@ -2911,6 +3098,25 @@ def _validate_consumer_result(
                                  or position < 0):
         raise ValueError("consumer audit result position must be null or "
                          "a non-boolean non-negative integer")
+    if request["operation"] == "reject":
+        # The dead letter riding the result is the public five-field
+        # shape, pinned to this request: same rejecting owner and
+        # original position, with the request's trimmed reason and
+        # moment. Its full event snapshot is a historical fact only
+        # form-checked here; the ledger adds the consumer attribution
+        # when persisting it in the dead_letters section.
+        letter = _validate_public_dead_letter(raw["dead_letter"])
+        if letter["owner"] != request["owner"] \
+                or letter["position"] != request["position"] \
+                or letter["reason"] != request["reason"] \
+                or letter["rejected_at"] != request["now"]:
+            raise ValueError("a reject audit result must record its "
+                             "request's dead letter")
+        if position != request["position"]:
+            raise ValueError("a reject audit result position must name "
+                             "the rejected event")
+        return {"consumer": raw["consumer"], "owner": owner, "until": until,
+                "position": position, "dead_letter": letter}
     if request["operation"] == "claim":
         key = raw["key"]
         job_id = raw["job_id"]
@@ -2951,12 +3157,17 @@ def _validate_consumer_result(
 def _validate_consumer_ledger(
     data: object, coordination_real: str,
 ) -> tuple[dict[str, dict[str, Any]], dict[str, dict[str, Any]],
-           dict[str, dict[str, Any]], list[dict[str, Any]]]:
+           dict[str, dict[str, Any]], list[dict[str, Any]],
+           list[dict[str, Any]] | None]:
     if not isinstance(data, dict) \
-            or list(data.keys()) != list(_CONSUMER_ROOT_FIELDS):
+            or list(data.keys()) not in (
+                list(_CONSUMER_ROOT_FIELDS),
+                list(_CONSUMER_ROOT_FIELDS_WITH_DEAD_LETTERS)):
         raise ValueError("consumer ledger root must be an object with "
                          "version, coordination, subscriptions, consumers, "
-                         "idempotency and audit")
+                         "idempotency and audit, and once upgraded "
+                         "dead_letters")
+    document_legacy = _CONSUMER_DEAD_LETTERS_FIELD not in data
     if not _is_plain_int(data["version"]) \
             or data["version"] != _CONSUMER_VERSION:
         raise ValueError("unsupported consumer ledger version")
@@ -2971,12 +3182,15 @@ def _validate_consumer_ledger(
     consumers_raw = data["consumers"]
     idempotency_raw = data["idempotency"]
     audit_raw = data["audit"]
+    dead_letters_raw = ([] if document_legacy
+                        else data[_CONSUMER_DEAD_LETTERS_FIELD])
     if not isinstance(subscriptions_raw, dict) \
             or not isinstance(consumers_raw, dict) \
             or not isinstance(idempotency_raw, dict) \
-            or not isinstance(audit_raw, list):
+            or not isinstance(audit_raw, list) \
+            or not isinstance(dead_letters_raw, list):
         raise ValueError("subscriptions, consumers and idempotency must be "
-                         "objects and audit a list")
+                         "objects and audit and dead_letters lists")
     _check_sorted_keys(subscriptions_raw, "subscriptions")
     _check_sorted_keys(consumers_raw, "consumers")
     _check_sorted_keys(idempotency_raw, "idempotency")
@@ -3056,14 +3270,24 @@ def _validate_consumer_ledger(
                       "result": result})
         bound_requests.append(request)
 
+    dead_letters: list[dict[str, Any]] = []
+    for raw in dead_letters_raw:
+        letter = _validate_dead_letter(raw)
+        if letter["consumer"] not in consumers:
+            raise ValueError("a dead letter must reference a recorded "
+                             "consumer")
+        dead_letters.append(letter)
+
     # Replay the append-only audit into scratch state: it has to
     # reconstruct every subscription and state record exactly, which
     # pins the subscription immutability, a takeover's strict-expiry
-    # precondition, the lease windows, monotonic ack positions and each
-    # event's recorded result. The stream an ack named is a historical
-    # fact not re-followed here; the live check happens on consume.
+    # precondition, the lease windows, monotonic ack and reject
+    # positions and each event's recorded result. The stream an ack or
+    # reject named is a historical fact not re-followed here; the live
+    # check happens on consume.
     replay_subs: dict[str, dict[str, Any]] = {}
     replay_state: dict[str, dict[str, Any]] = {}
+    replay_rejects: list[dict[str, Any]] = []
     for event in audit:
         request = event["request"]
         consumer_id = request["consumer"]
@@ -3112,16 +3336,29 @@ def _validate_consumer_ledger(
         if current["owner"] != request["owner"] \
                 or request["now"] > current["until"]:
             raise ValueError("only the current owner during a valid lease "
-                             "may acknowledge")
+                             "may acknowledge or reject")
         target = request["position"]
         previous = current["position"]
         if previous is not None and target <= previous:
-            raise ValueError("an appended ack must advance the position "
-                             "past the previous one")
+            raise ValueError("an appended ack or reject must advance the "
+                             "position past the previous one")
         current["position"] = target
-        if event["result"] != _state_result(consumer_id, current):
-            raise ValueError("consumer ack audit result does not match "
-                             "its replay")
+        if request["operation"] == "reject":
+            # The reject result is the post-reject state plus exactly
+            # the dead letter the dead_letters section keeps; collect
+            # the attributed ledger record so the section can be
+            # matched against the reject audit events one to one.
+            letter = event["result"]["dead_letter"]
+            replay_rejects.append(
+                {"consumer": consumer_id, **copy.deepcopy(letter)})
+            expected_result = {
+                **_state_result(consumer_id, current), "dead_letter": letter}
+        else:
+            expected_result = _state_result(consumer_id, current)
+        if event["result"] != expected_result:
+            raise ValueError(
+                f"consumer {request['operation']} audit result does not "
+                "match its replay")
     if replay_subs != subscriptions or replay_state != consumers:
         raise ValueError("the consumer audit must reconstruct the "
                          "recorded subscriptions and states")
@@ -3140,13 +3377,36 @@ def _validate_consumer_ledger(
     if binding_keys != event_keys:
         raise ValueError("consumer idempotency bindings and audit events "
                          "must match one to one")
-    return subscriptions, consumers, idempotency, audit
+
+    # The dead-letter section matches the reject audit events one to
+    # one as a multiset: reject requests are idempotency-bound and the
+    # audit pins each result's exact letter, so this additionally pins
+    # that the section holds precisely the reject letters, no more and
+    # no fewer.
+    letter_keys = sorted(
+        _request_key(_consumer_canonical_dead_letter(letter))
+        for letter in dead_letters)
+    reject_keys = sorted(
+        _request_key(_consumer_canonical_dead_letter(letter))
+        for letter in replay_rejects)
+    if letter_keys != reject_keys:
+        raise ValueError("consumer dead letters must match the reject "
+                         "audit events one to one")
+    if document_legacy and dead_letters:
+        raise ValueError("a pre-dead-letter consumer ledger must carry "
+                         "no dead letter section")
+    # A ledger upgraded with the section keeps it even when empty; the
+    # None return marks the original six-field shape for byte-exact
+    # reproduction.
+    return subscriptions, consumers, idempotency, audit, \
+        (None if document_legacy else dead_letters)
 
 
 def _load_consumer_bytes(
     consumer_real: str, coordination_real: str, raw: bytes,
 ) -> tuple[dict[str, dict[str, Any]], dict[str, dict[str, Any]],
-           dict[str, dict[str, Any]], list[dict[str, Any]]]:
+           dict[str, dict[str, Any]], list[dict[str, Any]],
+           list[dict[str, Any]] | None]:
     try:
         data = finite_loads(raw.decode("utf-8"))
     except (UnicodeDecodeError, ValueError) as exc:
@@ -3154,17 +3414,18 @@ def _load_consumer_bytes(
             f"consumer ledger {consumer_real!r} is not valid canonical "
             "JSON") from exc
     try:
-        subscriptions, consumers, idempotency, audit = \
+        subscriptions, consumers, idempotency, audit, dead_letters = \
             _validate_consumer_ledger(data, coordination_real)
         canonical = _consumer_canonical_bytes(
-            coordination_real, subscriptions, consumers, idempotency, audit)
+            coordination_real, subscriptions, consumers, idempotency, audit,
+            dead_letters)
     except ValueError as exc:
         raise ConsumerLedgerInvalid(str(exc)) from exc
     if raw != canonical:
         raise ConsumerLedgerInvalid(
             f"consumer ledger {consumer_real!r} is not in canonical "
             "compact form")
-    return subscriptions, consumers, idempotency, audit
+    return subscriptions, consumers, idempotency, audit, dead_letters
 
 
 def _preliminary_coordination(coordination_real: str) -> None:
@@ -3275,17 +3536,20 @@ def _state_result(consumer: str, state: dict[str, Any]) -> dict[str, Any]:
 
 def _check_owner(state: dict[str, Any], owner: str, now: int) -> None:
     # Only the current owner while the lease is strictly valid may act.
-    # A different owner is a PermissionError while the lease holds and a
-    # TimeoutError once the previous owner's lease has strictly expired;
-    # the current owner gets the same TimeoutError after strict expiry.
+    # A different owner is a ConsumerOwnershipError while the lease
+    # holds and a ConsumerLeaseExpired once the previous owner's lease
+    # has strictly expired; the current owner gets the same
+    # ConsumerLeaseExpired after strict expiry. Both stay ordinary
+    # PermissionError/TimeoutError subclasses to library callers.
     if state["owner"] != owner:
         if now <= state["until"]:
-            raise PermissionError(
+            raise ConsumerOwnershipError(
                 "consumer is owned by another owner until "
                 f"{state['until']}")
-        raise TimeoutError("the previous owner's consumer lease has expired")
+        raise ConsumerLeaseExpired(
+            "the previous owner's consumer lease has expired")
     if now > state["until"]:
-        raise TimeoutError("the consumer lease has expired")
+        raise ConsumerLeaseExpired("the consumer lease has expired")
 
 
 def consume(
@@ -3300,10 +3564,11 @@ def consume(
     job_id: str | None = None,
     lease: int | None = None,
     position: int | None = None,
+    reason: str | None = None,
     limit: int = _DEFAULT_LIMIT,
     idem: str | None = None,
 ) -> tuple[dict[str, Any], bool]:
-    """Claim, pull from or acknowledge one persistent event consumer.
+    """Claim, pull from, acknowledge or reject one persistent consumer.
 
     ``coordination`` is the fixed migration-batch coordination ledger
     and ``ledger`` the independent consumer ledger; both are non-empty
@@ -3312,7 +3577,7 @@ def consume(
     write; a later call presenting a different coordination ledger
     raises ``ValueError``. No request field selects a file path.
 
-    The three operations are:
+    The four operations are:
 
     ``claim``
         First claim of ``consumer`` by ``owner`` at non-negative moment
@@ -3337,7 +3602,8 @@ def consume(
         "events", "next"}`` where ``events``/``next`` follow the
         stream's fixed order and paging semantics over events strictly
         after the acknowledged position; ``limit`` is 1..1000 (default
-        100). A pull never advances the checkpoint and never writes.
+        100). A pull never advances the checkpoint and never writes; a
+        rejected event is never returned.
 
     ``ack``
         Moves the checkpoint forward to ``position``, which must name a
@@ -3347,19 +3613,39 @@ def consume(
         stream truncated, rewrote or reused behind the cursor raises
         ``LookupError`` and never resets the cursor.
 
-    Only the current owner while the lease is strictly valid may pull
-    or ack; a different owner gets ``PermissionError`` while the lease
-    holds and an expired lease (for either owner) ``TimeoutError``. An
-    unknown consumer raises ``KeyError``. Claim and ack require the
-    non-empty idempotency key ``idem``: replaying it with the
-    equivalent complete request returns the original result with
-    ``False`` without writing, while the same key with a changed
-    request raises ``ValueError``; a pull takes no such key.
+    ``reject``
+        Dead-letters the single earliest unacknowledged event the fixed
+        subscription still matches and atomically advances the
+        checkpoint to it. ``position`` must name exactly that event:
+        skipping a still-pending predecessor, naming a non-matching
+        position or passing the stream tail all raise ``ValueError``,
+        and, like an ack, a confirmed position the stream truncated,
+        rewrote or reused raises ``LookupError``. ``reason`` is a
+        string; surrounding whitespace is stripped and the remainder
+        must span 1..512 Unicode code points. The result carries
+        ``consumer``, ``owner``, ``until``, ``position`` and
+        ``dead_letter``; the dead letter keeps the event's original
+        position, its complete event snapshot, the trimmed reason,
+        ``rejected_at`` (the reject moment) and the rejecting owner.
+        Rejecting is idempotent through ``idem`` exactly like an ack.
+        The first successful reject upgrades a pre-dead-letter ledger
+        with its append-only ``dead_letters`` section; claim, pull and
+        ack never change such a ledger's shape.
+
+    Only the current owner while the lease is strictly valid may pull,
+    ack or reject; a different owner gets ``PermissionError`` while the
+    lease holds and an expired lease (for either owner)
+    ``TimeoutError``. An unknown consumer raises ``KeyError``. Claim,
+    ack and reject require the non-empty idempotency key ``idem``:
+    replaying it with the equivalent complete request returns the
+    original result with ``False`` without writing, while the same key
+    with a changed request raises ``ValueError``; a pull takes no such
+    key.
 
     Returns ``(result, created)``; ``created`` is ``True`` only for the
-    first claim that creates the consumer and for an ack that actually
-    moves the checkpoint. A lease-renewing repeat claim and an expired
-    -lease takeover write a new binding and audit event but, like
+    first claim that creates the consumer and for an ack or reject that
+    actually moves the checkpoint. A lease-renewing repeat claim and an
+    expired-lease takeover write a new binding and audit event but, like
     :func:`run`'s takeover, report ``False`` because they create no new
     consumer; an in-place or idempotent replay also reports ``False``.
     A missing coordination ledger or the consumer ledger parent raises
@@ -3372,7 +3658,7 @@ def consume(
             raise ValueError("coordination and ledger must be non-empty "
                              "strings")
     if operation not in _CONSUMER_OPERATIONS:
-        raise ValueError("operation must be claim, pull or ack")
+        raise ValueError("operation must be claim, pull, ack or reject")
     if not isinstance(consumer, str) or not consumer:
         raise ValueError("consumer must be a non-empty string")
     if not isinstance(owner, str) or not owner:
@@ -3390,11 +3676,13 @@ def consume(
                     f"{name} must be null or a non-empty string")
         if not _is_plain_int(lease) or lease < 1:
             raise ValueError("lease must be a non-boolean positive integer")
-    elif operation == "ack":
+    if operation in ("ack", "reject"):
         if not _is_plain_int(position) or position < 0:
             raise ValueError("position must be a non-boolean non-negative "
                              "integer")
-    if operation in ("claim", "ack"):
+    if operation == "reject":
+        reason = _validate_reason(reason)
+    if operation in ("claim", "ack", "reject"):
         if not isinstance(idem, str) or not idem:
             raise ValueError("a write operation requires a non-empty "
                              "idempotency key")
@@ -3417,7 +3705,7 @@ def consume(
                         raw = handle.read()
                 except FileNotFoundError:
                     raise KeyError(consumer)
-                subscriptions, consumers, _idem, _audit = \
+                subscriptions, consumers, _idem, _audit, _dead = \
                     _load_consumer_bytes(
                         consumer_real, coordination_real, raw)
                 state = consumers.get(consumer)
@@ -3442,11 +3730,14 @@ def consume(
                   "now": now},
         "ack": {"operation": "ack", "consumer": consumer, "owner": owner,
                 "position": position, "now": now},
+        "reject": {"operation": "reject", "consumer": consumer,
+                   "owner": owner, "position": position, "reason": reason,
+                   "now": now},
     }[operation]
     request = _validate_consumer_request(request_shape)
 
-    # ack is the only write that needs the stream itself; a claim only
-    # proves the coordination ledger exists and is well formed.
+    # ack and reject need the stream itself; a claim only proves the
+    # coordination ledger exists and is well formed.
     _preliminary_coordination(coordination_real)
     _consumer_parent(consumer_real)
     store = _get_store(consumer_real)
@@ -3462,10 +3753,14 @@ def consume(
                 consumers: dict[str, dict[str, Any]] = {}
                 idempotency: dict[str, dict[str, Any]] = {}
                 audit: list[dict[str, Any]] = []
+                # A new ledger is born in the original six-field shape;
+                # the section is added below only by the first reject,
+                # exactly like an old ledger's first reject.
+                dead_letters: list[dict[str, Any]] | None = None
                 old_bytes: bytes | None = None
             else:
-                subscriptions, consumers, idempotency, audit = \
-                    _load_consumer_bytes(
+                subscriptions, consumers, idempotency, audit, \
+                    dead_letters = _load_consumer_bytes(
                         consumer_real, coordination_real, raw)
                 old_bytes = raw
 
@@ -3482,13 +3777,18 @@ def consume(
 
             progress = (
                 _read_locked_progress(coordination_real)
-                if operation == "ack" else None)
+                if operation in ("ack", "reject") else None)
+            # The first reject upgrades a pre-dead-letter (or newly
+            # created) ledger with the empty section; claim and ack
+            # leave the six-field shape untouched.
+            if operation == "reject" and dead_letters is None:
+                dead_letters = []
             result, changed = _consume_apply(
                 request, idem, subscriptions, consumers, idempotency,
-                audit, progress)
+                audit, dead_letters, progress)
             payload = _consumer_canonical_bytes(
                 coordination_real, subscriptions, consumers, idempotency,
-                audit)
+                audit, dead_letters)
             _commit_file(consumer_real, payload, old_bytes,
                          prefix=_CONSUMER_PREFIX)
             return result, changed
@@ -3500,6 +3800,7 @@ def _consume_apply(
     consumers: dict[str, dict[str, Any]],
     idempotency: dict[str, dict[str, Any]],
     audit: list[dict[str, Any]],
+    dead_letters: list[dict[str, Any]] | None,
     progress: list[dict[str, Any]] | None,
 ) -> tuple[dict[str, Any], bool]:
     operation = request["operation"]
@@ -3535,14 +3836,14 @@ def _consume_apply(
             # in place -- a claim then raises TimeoutError and writes
             # nothing, just like a pull or ack would.
             if now > state["until"]:
-                raise TimeoutError("the consumer lease has expired")
+                raise ConsumerLeaseExpired("the consumer lease has expired")
             state["until"] = now + request["lease"]
             result = _claim_result(
                 consumer_id, subscriptions[consumer_id], state, False)
             bind(result)
             return result, False
         if now <= state["until"]:
-            raise PermissionError(
+            raise ConsumerOwnershipError(
                 "consumer is owned by another owner until "
                 f"{state['until']}")
         # Strict expiry: another owner may take over, keeping the
@@ -3559,13 +3860,55 @@ def _consume_apply(
         raise KeyError(consumer_id)
     _check_owner(state, request["owner"], now)
 
-    # ack
     assert progress is not None
     target = request["position"]
     subscription = subscriptions[consumer_id]
     _require_checkpoint_current(progress, subscription, state["position"])
     if state["position"] is not None and target < state["position"]:
         raise ValueError("the acknowledged position cannot move backwards")
+
+    if operation == "reject":
+        # A reject names exactly the earliest still-unacknowledged
+        # event the fixed subscription matches: an already-confirmed
+        # position, a skipped predecessor, a non-matching stream
+        # position and a position past the tail are all invalid.
+        if target == state["position"]:
+            raise ValueError("the rejected position is already "
+                             "acknowledged")
+        earliest: dict[str, Any] | None = None
+        for event in progress:
+            if state["position"] is not None \
+                    and event["position"] <= state["position"]:
+                continue
+            if _consumer_matches(event, subscription):
+                earliest = event
+                break
+        tail = progress[-1]["position"] if progress else None
+        if tail is None or target > tail:
+            raise ValueError("the rejected position is past the stream tail")
+        if earliest is None or target != earliest["position"]:
+            raise ValueError("the rejected position must be the earliest "
+                             "unacknowledged event the subscription matches")
+        letter = {
+            "position": target,
+            "event": _progress_entry(earliest),
+            "reason": request["reason"],
+            "rejected_at": now,
+            "owner": request["owner"],
+        }
+        assert dead_letters is not None
+        # The ledger record attributes the public letter to the
+        # consumer; the state result and the later query expose the
+        # five-field letter without repeating the consumer.
+        dead_letters.append(
+            {"consumer": consumer_id, **copy.deepcopy(letter)})
+        state["position"] = target
+        result = {**_state_result(consumer_id, state),
+                  "dead_letter": copy.deepcopy(letter)}
+        bind(result)
+        return result, True
+
+    # ack
     if target == state["position"]:
         # An in-place replay (also acking position 0 when the cursor is
         # already there) changes and writes nothing.
@@ -3634,7 +3977,7 @@ def consumer_subscription(
                     raw = handle.read()
             except FileNotFoundError:
                 raise KeyError(consumer)
-            subscriptions, consumers, _idempotency, _audit = \
+            subscriptions, consumers, _idempotency, _audit, _dead = \
                 _load_consumer_bytes(consumer_real, coordination_real, raw)
             if consumer not in consumers:
                 raise KeyError(consumer)
@@ -3660,7 +4003,7 @@ def _status_snapshot(
                 # No consumer ledger yet means the consumer was never
                 # claimed: an unknown consumer, exactly like a pull.
                 raise KeyError(consumer)
-            subscriptions, consumers, _idempotency, _audit = \
+            subscriptions, consumers, _idempotency, _audit, _dead = \
                 _load_consumer_bytes(consumer_real, coordination_real, raw)
             state = consumers.get(consumer)
             if state is None:
@@ -3766,3 +4109,105 @@ def consumer_status_response(
     one complete version.
     """
     return _render(consumer_status(coordination, ledger, consumer, now))
+
+
+def consumer_dead_letters(
+    coordination: str, ledger: str, consumer: str, *,
+    cursor: int | None = None, limit: int = _DEFAULT_LIMIT,
+) -> dict[str, Any]:
+    """Return one page of one consumer's dead letters without writing.
+
+    ``coordination`` is the fixed migration-batch coordination ledger
+    and ``ledger`` the independent consumer ledger; both are non-empty
+    strings resolving to distinct real paths and ``consumer`` a
+    non-empty string. ``cursor`` is ``None`` or a non-boolean
+    non-negative integer: only letters whose original position is
+    strictly greater are considered, so omitting it reads from the
+    start. ``limit`` is a non-boolean integer from 1 to 1000,
+    defaulting to 100. Bad arguments or coinciding real paths raise
+    ``ValueError`` before any file is opened.
+
+    The result carries, in fixed order, ``consumer``, ``entries`` and
+    ``next``. The entries are that consumer's dead letters ordered by
+    their original stream position (the reject order for one consumer):
+    each in the five-field public shape, in order ``position``,
+    ``event`` (the complete event in the event stream's full shape),
+    ``reason``, ``rejected_at`` and ``owner``. Positions the
+    subscription's rejects skipped never occur here -- every reject
+    advances the cursor -- and filtered positions never consume page
+    capacity. ``next`` is the page's last original position when more
+    letters remain, else ``None``. The query reads only the consumer
+    ledger: a dead letter is a self-contained historical record and the
+    coordination stream is never opened.
+
+    A consumer ledger written before dead letters existed answers an
+    empty page without being upgraded. An unknown consumer (including a
+    consumer ledger that was never created) raises ``KeyError``; a
+    missing consumer ledger parent raises ``FileNotFoundError``;
+    malformed or non-canonical consumer bytes raise
+    :class:`ConsumerLedgerInvalid`; any other locking or I/O failure
+    raises ``OSError``.
+    """
+    for value in (coordination, ledger):
+        if not isinstance(value, str) or not value:
+            raise ValueError("coordination and ledger must be non-empty "
+                             "strings")
+    if not isinstance(consumer, str) or not consumer:
+        raise ValueError("consumer must be a non-empty string")
+    if cursor is not None and (not _is_plain_int(cursor) or cursor < 0):
+        raise ValueError("cursor must be None or a non-boolean "
+                         "non-negative integer")
+    if not _is_plain_int(limit) or not 1 <= limit <= _MAX_LIMIT:
+        raise ValueError("limit must be a non-boolean integer between 1 "
+                         "and 1000")
+    coordination_real = os.path.realpath(coordination)
+    consumer_real = os.path.realpath(ledger)
+    if coordination_real == consumer_real:
+        raise ValueError("the consumer ledger must be distinct from the "
+                         "coordination ledger")
+    _consumer_parent(consumer_real)
+    store = _get_store(consumer_real)
+    with store.lock:
+        with _lock(consumer_real, shared=True):
+            try:
+                with open(consumer_real, "rb") as handle:
+                    raw = handle.read()
+            except FileNotFoundError:
+                raise KeyError(consumer)
+            subscriptions, consumers, _idempotency, _audit, \
+                dead_letters = _load_consumer_bytes(
+                    consumer_real, coordination_real, raw)
+            if consumer not in consumers:
+                raise KeyError(consumer)
+            # The section is append-only across consumers; rejects for
+            # one consumer strictly advance that consumer's cursor, so
+            # its letters already arrive in original-position order --
+            # but the page is sorted explicitly to pin the promise
+            # independently of inter-consumer interleaving.
+            letters = sorted((record for record in (dead_letters or [])
+                              if record["consumer"] == consumer),
+                             key=lambda record: record["position"])
+    matched = [record for record in letters
+               if cursor is None or record["position"] > cursor]
+    if len(matched) > limit:
+        page = matched[:limit]
+        next_cursor: int | None = page[-1]["position"]
+    else:
+        page = matched
+        next_cursor = None
+    return {"consumer": consumer,
+            "entries": [_public_dead_letter(record) for record in page],
+            "next": next_cursor}
+
+
+def consumer_dead_letters_response(
+    coordination: str, ledger: str, consumer: str, *,
+    cursor: int | None = None, limit: int = _DEFAULT_LIMIT,
+) -> bytes:
+    """Serialize :func:`consumer_dead_letters`' page from one snapshot.
+
+    The dead-letter section is read under the consumer ledger's shared
+    lock, and the compact response bytes reflect that one version.
+    """
+    return _render(consumer_dead_letters(
+        coordination, ledger, consumer, cursor=cursor, limit=limit))

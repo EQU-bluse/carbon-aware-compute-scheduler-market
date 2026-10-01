@@ -26,15 +26,19 @@ _MIGRATION_BATCHES_PARAMS = ("key", "cursor", "limit")
 # stream by the exclusive zero-based position cursor with an optional
 # batch key and related job filter, combined by logical AND.
 _MIGRATION_EVENTS_PARAMS = ("cursor", "limit", "key", "job")
-# POST /migration-consumers/{claim,pull,ack} each accept one fixed
-# JSON field set; the client never names a ledger path, which is fixed
-# at startup alongside --migration-batches.
+# POST /migration-consumers/{claim,pull,ack,reject} each accept one
+# fixed JSON field set; the client never names a ledger path, which is
+# fixed at startup alongside --migration-batches.
 _MIGRATION_CONSUMER_PATHS = (
     "/migration-consumers/claim", "/migration-consumers/pull",
-    "/migration-consumers/ack")
+    "/migration-consumers/ack", "/migration-consumers/reject")
 # GET /migration-consumers/status takes exactly the named consumer and
-# the query moment, each once; the ledger paths stay fixed at startup.
+# the query moment; GET /migration-consumers/dead-letters pages one
+# consumer's dead letters by an exclusive position cursor. The ledger
+# paths stay fixed at startup and each parameter may appear at most
+# once.
 _MIGRATION_CONSUMER_STATUS_PARAMS = ("consumer", "now")
+_MIGRATION_DEAD_LETTERS_PARAMS = ("consumer", "cursor", "limit")
 _MIGRATION_CLAIM_FIELDS = frozenset(
     ("consumer", "owner", "now", "lease", "idem", "key", "job_id"))
 _MIGRATION_CLAIM_REQUIRED = frozenset(
@@ -43,6 +47,8 @@ _MIGRATION_PULL_FIELDS = frozenset(("consumer", "owner", "now", "limit"))
 _MIGRATION_PULL_REQUIRED = frozenset(("consumer", "owner", "now"))
 _MIGRATION_ACK_FIELDS = frozenset(
     ("consumer", "owner", "now", "position", "idem"))
+_MIGRATION_REJECT_FIELDS = frozenset(
+    ("consumer", "owner", "now", "position", "reason", "idem"))
 _MIGRATION_MAX_BODY = 1 << 20
 _ACCEPTANCE_STATES = ("pending", "active", "quarantined")
 _OPS = ("copy", "restore")
@@ -177,6 +183,26 @@ def _parse_migration_consumer_status_params(query: str) -> dict[str, str]:
     return params
 
 
+def _parse_migration_dead_letters_params(query: str) -> dict[str, str]:
+    params = _parse_query(query, _MIGRATION_DEAD_LETTERS_PARAMS)
+    # The consumer id is mandatory; cursor is an exclusive decimal
+    # non-negative integer and limit a decimal integer from 1 to 1000,
+    # each at most once. Defaults (no cursor, limit 100) are applied by
+    # the caller.
+    if "consumer" not in params:
+        raise ValueError("consumer is required")
+    cursor = params.get("cursor")
+    if cursor is not None and not all("0" <= char <= "9" for char in cursor):
+        raise ValueError("cursor must be a decimal non-negative integer")
+    limit = params.get("limit")
+    if limit is not None:
+        if not all("0" <= char <= "9" for char in limit):
+            raise ValueError("limit must be a decimal integer")
+        if not 1 <= int(limit) <= _MAX_LIMIT:
+            raise ValueError("limit must be between 1 and 1000")
+    return params
+
+
 class Handler(BaseHTTPRequestHandler):
     server_version = "CarbonMarket/0.1"
 
@@ -220,6 +246,13 @@ class Handler(BaseHTTPRequestHandler):
                 is not None:
             self._migration_consumer_status(query)
             return
+        if path == "/migration-consumers/dead-letters" \
+                and getattr(self.server, "migration_batches", None) \
+                is not None \
+                and getattr(self.server, "migration_consumers", None) \
+                is not None:
+            self._migration_consumer_dead_letters(query)
+            return
         self._json(HTTPStatus.NOT_FOUND, {"error": "not_found"})
 
     def do_POST(self) -> None:  # noqa: N802 - BaseHTTPRequestHandler contract
@@ -242,6 +275,7 @@ class Handler(BaseHTTPRequestHandler):
             "claim": (_MIGRATION_CLAIM_FIELDS, _MIGRATION_CLAIM_REQUIRED),
             "pull": (_MIGRATION_PULL_FIELDS, _MIGRATION_PULL_REQUIRED),
             "ack": (_MIGRATION_ACK_FIELDS, _MIGRATION_ACK_FIELDS),
+            "reject": (_MIGRATION_REJECT_FIELDS, _MIGRATION_REJECT_FIELDS),
         }[operation]
 
         def reject_duplicates(pairs):
@@ -298,6 +332,26 @@ class Handler(BaseHTTPRequestHandler):
             position = body["position"]
             if not isinstance(position, int) or isinstance(position, bool) \
                     or position < 0:
+                self._bad_request()
+                return None
+            if not isinstance(body["idem"], str) or not body["idem"]:
+                self._bad_request()
+                return None
+        elif operation == "reject":
+            position = body["position"]
+            if not isinstance(position, int) or isinstance(position, bool) \
+                    or position < 0:
+                self._bad_request()
+                return None
+            # The content rule is a parameter validity check, enforced
+            # here like position's range so an invalid reason answers
+            # 400 before the subscription scope is read or the consumer
+            # is looked up: surrounding whitespace is stripped and the
+            # remainder must span 1..512 Unicode code points (code
+            # points, not UTF-16 units or bytes).
+            reason = body["reason"]
+            if not isinstance(reason, str) \
+                    or not 1 <= len(reason.strip()) <= 512:
                 self._bad_request()
                 return None
             if not isinstance(body["idem"], str) or not body["idem"]:
@@ -388,6 +442,10 @@ class Handler(BaseHTTPRequestHandler):
         elif operation == "ack":
             kwargs["position"] = body["position"]
             kwargs["idem"] = body["idem"]
+        elif operation == "reject":
+            kwargs["position"] = body["position"]
+            kwargs["reason"] = body["reason"]
+            kwargs["idem"] = body["idem"]
         elif "limit" in body:
             kwargs["limit"] = body["limit"]
 
@@ -398,9 +456,12 @@ class Handler(BaseHTTPRequestHandler):
         except KeyError:
             self._json(HTTPStatus.NOT_FOUND,
                        {"error": "migration_consumer_not_found"})
-        except (PermissionError, TimeoutError):
+        except (migration_batch.ConsumerOwnershipError,
+                migration_batch.ConsumerLeaseExpired):
             # A live lease owned by another caller, or an expired lease
-            # the caller no longer holds: an ownership conflict.
+            # the caller no longer holds: an ownership conflict. These
+            # dedicated subclasses keep a filesystem PermissionError
+            # from the commit falling through as 503 instead of 409.
             self._json(HTTPStatus.CONFLICT,
                        {"error": "migration_consumer_ownership"})
         except LookupError:
@@ -511,6 +572,84 @@ class Handler(BaseHTTPRequestHandler):
         except migration_batch.CoordinationLedgerMissing:
             self._json(HTTPStatus.NOT_FOUND,
                        {"error": "migration_batches_not_found"})
+        except migration_batch.ConsumersLedgerMissing:
+            self._json(HTTPStatus.NOT_FOUND,
+                       {"error": "migration_consumers_not_found"})
+        except FileNotFoundError:
+            self._json(HTTPStatus.NOT_FOUND,
+                       {"error": "migration_consumers_not_found"})
+        except ValueError:
+            self._json(HTTPStatus.BAD_REQUEST, {"error": "invalid_request"})
+        except OSError:
+            self._json(HTTPStatus.SERVICE_UNAVAILABLE,
+                       {"error": "migration_consumers_unavailable"})
+        else:
+            self._bytes(HTTPStatus.OK, payload)
+
+    def _migration_consumer_dead_letters(self, query: str) -> None:
+        # Read-only dead-letter query: identity, parameters, the
+        # persisted subscription read for scope, and only then the
+        # consumer ledger's dead-letter section. The page is a
+        # self-contained historical record, so the coordination and
+        # business ledgers are never opened; a failure at one stage
+        # still never opens a later stage's files.
+        coordination = getattr(self.server, "migration_batches")
+        consumers = getattr(self.server, "migration_consumers")
+        authorized, record = self._authorize()
+        if not authorized:
+            return
+        try:
+            params = _parse_migration_dead_letters_params(query)
+        except ValueError:
+            self._bad_request()
+            return
+        consumer = params["consumer"]
+        cursor = int(params["cursor"]) if "cursor" in params else None
+        limit = int(params["limit"]) if "limit" in params else 100
+
+        # Same scope order as status: operation- and stage-scoped
+        # tokens are rejected before the subscription is read; a
+        # key-scoped token reads the fixed subscription and passes only
+        # a fixed-batch range naming an allowed batch.
+        if record is not None and (record.ops is not None
+                                   or record.stages is not None):
+            self._json(HTTPStatus.FORBIDDEN, {"error": "forbidden"})
+            return
+        if record is not None and record.keys is not None:
+            try:
+                subscription = migration_batch.consumer_subscription(
+                    coordination, consumers, consumer)
+            except KeyError:
+                self._json(HTTPStatus.NOT_FOUND,
+                           {"error": "migration_consumer_not_found"})
+                return
+            except migration_batch.ConsumerLedgerInvalid:
+                self._json(HTTPStatus.CONFLICT,
+                           {"error": "migration_consumers_invalid"})
+                return
+            except FileNotFoundError:
+                self._json(HTTPStatus.NOT_FOUND,
+                           {"error": "migration_consumers_not_found"})
+                return
+            except OSError:
+                self._json(HTTPStatus.SERVICE_UNAVAILABLE,
+                           {"error": "migration_consumers_unavailable"})
+                return
+            batch_key = subscription["key"]
+            if batch_key is None or batch_key not in record.keys:
+                self._json(HTTPStatus.FORBIDDEN, {"error": "forbidden"})
+                return
+
+        try:
+            payload = migration_batch.consumer_dead_letters_response(
+                coordination, consumers, consumer, cursor=cursor,
+                limit=limit)
+        except KeyError:
+            self._json(HTTPStatus.NOT_FOUND,
+                       {"error": "migration_consumer_not_found"})
+        except migration_batch.ConsumerLedgerInvalid:
+            self._json(HTTPStatus.CONFLICT,
+                       {"error": "migration_consumers_invalid"})
         except migration_batch.ConsumersLedgerMissing:
             self._json(HTTPStatus.NOT_FOUND,
                        {"error": "migration_consumers_not_found"})
