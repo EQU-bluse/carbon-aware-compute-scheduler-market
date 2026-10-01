@@ -7,12 +7,14 @@ generation and resource version :func:`carbon_market.rebalance.current`
 shows at the completion moment, together with the business outcome and
 the actual cost and carbon figures.
 
-Two public calls share one independent completion ledger:
+Three public calls share one independent completion ledger:
 
 * :func:`complete` registers the terminal completion record, its
   idempotency request binding and an audit event in one synced atomic
   commit.
 * :func:`get` answers the recorded terminal state for one job id.
+* :func:`search` answers one page of recorded terminal states in
+  job-id code-point order, with outcome and budget-exceeded filters.
 
 The migration advice, intent and settlement ledgers are not part of the
 call shape: exactly as :func:`carbon_market.rebalance.evaluate` does,
@@ -32,6 +34,7 @@ from __future__ import annotations
 import contextlib
 import copy
 import fcntl
+import hashlib
 import json
 import os
 import tempfile
@@ -46,7 +49,7 @@ from . import resources as _resources
 from . import signals as _signals
 from ._jsonio import finite_loads
 
-__all__ = ["complete", "get"]
+__all__ = ["complete", "get", "search", "get_response", "search_response"]
 
 _VERSION = 1
 _ROOT_FIELDS = ("version", "completions", "idempotency", "audit")
@@ -59,6 +62,13 @@ _EVENT_FIELDS = ("key", "request", "result")
 _REQUEST_FIELDS = ("job_id", "at", "outcome", "actual_cost",
                    "actual_carbon")
 _LOCK_SUFFIX = ".lock"
+_DEFAULT_LIMIT = 100
+_MAX_LIMIT = 1000
+# The exceeded filter names which budget-overrun flag a record must
+# carry: the cost flag alone, the carbon flag alone, at least one of
+# them ("any") or neither ("none").
+_EXCEEDED_FILTERS = ("cost", "carbon", "any", "none")
+_HEXADECIMAL = frozenset("0123456789abcdef")
 
 
 class _Store:
@@ -786,10 +796,234 @@ def get(completions: str, job_id: str) -> dict[str, object]:
                              "strings")
 
     realpath = os.path.realpath(completions)
+    # Validation and selection happen under the shared lock, so the
+    # returned copy is one complete ledger version.
     with _lock(realpath, shared=True):
         records, _idempotency, _events, _raw = _load_completion_ledger(
             realpath)
-    record = _record_for_job(records, job_id)
-    if record is None:
-        raise KeyError(job_id)
-    return copy.deepcopy(record)
+        record = _record_for_job(records, job_id)
+        if record is None:
+            raise KeyError(job_id)
+        return copy.deepcopy(record)
+
+
+def _matches_exceeded(record: dict[str, Any], exceeded: str) -> bool:
+    cost_exceeded = record["cost_exceeded"]
+    carbon_exceeded = record["carbon_exceeded"]
+    if exceeded == "cost":
+        return cost_exceeded
+    if exceeded == "carbon":
+        return carbon_exceeded
+    if exceeded == "any":
+        return cost_exceeded or carbon_exceeded
+    return not cost_exceeded and not carbon_exceeded
+
+
+def _read_existing(realpath: str) -> dict[str, dict[str, Any]]:
+    # Read-only path for the queries: unlike the complete() path, a
+    # missing ledger is a FileNotFoundError the caller maps. The shared
+    # flock is held across the read and the canonical validation, so a
+    # query racing a writer observes either the complete previous
+    # document or the complete new one, never a half-replaced file.
+    records, _idempotency, _events, raw = _load_completion_ledger(realpath)
+    if raw is None:
+        raise FileNotFoundError(realpath)
+    return records
+
+
+def search(
+    completions: str,
+    cursor: str | None = None,
+    limit: int = _DEFAULT_LIMIT,
+    outcome: str | None = None,
+    exceeded: str | None = None,
+) -> dict[str, Any]:
+    """Return one page of completion records matching the given filters.
+
+    ``completions`` must be a non-empty string. ``cursor`` is ``None`` or
+    a non-empty string -- it need not name an existing job -- and only
+    records whose ``job_id`` is strictly greater than it in Unicode
+    code-point order are considered. ``limit`` is the page size: an
+    integer from 1 to 1000 (booleans are rejected), defaulting to 100.
+    Each of ``outcome`` and ``exceeded`` is an optional filter and both
+    given filters must hold simultaneously (logical AND). ``outcome`` is
+    ``"succeeded"`` or ``"failed"``; ``exceeded`` is one of ``"cost"``
+    (the cost flag is set), ``"carbon"`` (the carbon flag is set),
+    ``"any"`` (at least one flag is set) or ``"none"`` (neither flag is
+    set). Any other value raises ``ValueError``.
+
+    The ledger is scanned in ascending ``job_id`` code-point order after
+    filtering, so non-matching records never consume page capacity.
+    Returns ``{"entries": [[job_id, record], ...], "next":
+    cursor_or_none}``: each record is a fresh independent copy in the
+    record's fixed field order, and ``next`` is the job id of the page's
+    last item when further matching records remain, else ``None``. With
+    no matching records the page is empty and ``next`` is ``None``.
+
+    Validation, filtering and pagination complete under one shared-lock
+    snapshot: a missing completion ledger raises
+    ``FileNotFoundError``; malformed JSON or UTF-8, a negative-zero
+    literal, or an unsupported version, structure, ordering, reference
+    or non-canonical bytes raise ``ValueError``; any other locking or
+    I/O failure raises ``OSError``.
+    """
+    if not isinstance(completions, str) or not completions:
+        raise ValueError("completions must be a non-empty string")
+    if cursor is not None and (not isinstance(cursor, str) or not cursor):
+        raise ValueError("cursor must be None or a non-empty string")
+    # bool is a subclass of int and must be rejected as a page size.
+    if not _is_plain_int(limit) or not 1 <= limit <= _MAX_LIMIT:
+        raise ValueError("limit must be an integer between 1 and 1000")
+    if outcome is not None and outcome not in _OUTCOMES:
+        raise ValueError("outcome filter must be succeeded or failed")
+    if exceeded is not None and exceeded not in _EXCEEDED_FILTERS:
+        raise ValueError(
+            "exceeded filter must be one of cost, carbon, any, none")
+
+    realpath = os.path.realpath(completions)
+    with _lock(realpath, shared=True):
+        records = _read_existing(realpath)
+
+        # Records are keyed by idempotency key; order the independent
+        # completion entries by job id in code-point order, as the
+        # ledger's uniqueness check guarantees one record per job.
+        ordered = sorted(records.values(),
+                         key=lambda record: record["job_id"])
+        matches: list[list[Any]] = []
+        for record in ordered:
+            job_id = record["job_id"]
+            if cursor is not None and job_id <= cursor:
+                continue
+            if outcome is not None and record["outcome"] != outcome:
+                continue
+            if exceeded is not None and not _matches_exceeded(
+                    record, exceeded):
+                continue
+            matches.append([job_id, copy.deepcopy(record)])
+            if len(matches) > limit:
+                break
+
+    if len(matches) > limit:
+        page = matches[:limit]
+        next_cursor: str | None = page[-1][0]
+    else:
+        page = matches
+        next_cursor = None
+    return {"entries": page, "next": next_cursor}
+
+
+def _validate_condition(condition: str | None) -> None:
+    if condition is None:
+        return
+    if not isinstance(condition, str) or len(condition) != 64 \
+            or any(char not in _HEXADECIMAL for char in condition):
+        raise ValueError(
+            "condition must be None or a 64-digit lowercase hexadecimal "
+            "digest")
+
+
+def _respond(payload: Any, condition: str | None
+             ) -> tuple[bytes | None, str]:
+    # Serialize, digest and compare while the caller holds the ledger's
+    # shared lock: the tag summarizes exactly the bytes a 200 would
+    # serve and both come from the same complete ledger version. The
+    # body is compact UTF-8 JSON, non-ASCII written through, no
+    # trailing newline.
+    body = json.dumps(payload, ensure_ascii=False, separators=(",", ":"),
+                      allow_nan=False).encode("utf-8")
+    etag = hashlib.sha256(body).hexdigest()
+    if condition is not None and condition == etag:
+        return None, etag
+    return body, etag
+
+
+def get_response(completions: str, job_id: str,
+                 condition: str | None = None
+                 ) -> tuple[bytes | None, str]:
+    """Read one completion record as a conditional, HTTP-ready response.
+
+    ``completions`` and ``job_id`` follow :func:`get`; ``condition`` is
+    ``None`` or a single 64-digit lowercase hexadecimal digest -- the
+    tag a previous response carried, without its quotes. The ledger is
+    read under its shared flock and the record is serialized to the
+    response's compact UTF-8 JSON bytes and digested while the lock is
+    held, so a completion racing the query is observed as either the
+    complete old ledger or the complete new one and the tag always
+    summarizes the bytes of one version.
+
+    Returns ``(None, etag)`` when ``condition`` equals the current tag
+    -- the endpoint answers 304 with an empty body and the same tag --
+    and ``(body, etag)`` otherwise. The error mapping is :func:`get`'s:
+    ``ValueError`` for bad arguments or an invalid ledger,
+    ``FileNotFoundError`` for a missing ledger, ``KeyError`` for an
+    unknown job and ``OSError`` for any other locking or I/O failure.
+    """
+    for value in (completions, job_id):
+        if not isinstance(value, str) or not value:
+            raise ValueError("completions and job_id must be non-empty "
+                             "strings")
+    _validate_condition(condition)
+
+    realpath = os.path.realpath(completions)
+    with _lock(realpath, shared=True):
+        records = _read_existing(realpath)
+        record = _record_for_job(records, job_id)
+        if record is None:
+            raise KeyError(job_id)
+        return _respond(copy.deepcopy(record), condition)
+
+
+def search_response(completions: str, cursor: str | None = None,
+                    limit: int = _DEFAULT_LIMIT,
+                    outcome: str | None = None,
+                    exceeded: str | None = None,
+                    condition: str | None = None
+                    ) -> tuple[bytes | None, str]:
+    """Read one completion page as a conditional, HTTP-ready response.
+
+    The filters follow :func:`search` and ``condition`` follows
+    :func:`get_response`. The page object is formed, serialized and
+    digested under the ledger's shared flock, so any visible record,
+    order or cursor change changes the tag and a racing completion is
+    observed as one complete ledger version. Returns ``(None, etag)``
+    on a conditional hit and ``(body, etag)`` otherwise; the error
+    mapping is :func:`search`'s.
+    """
+    if not isinstance(completions, str) or not completions:
+        raise ValueError("completions must be a non-empty string")
+    if cursor is not None and (not isinstance(cursor, str) or not cursor):
+        raise ValueError("cursor must be None or a non-empty string")
+    if not _is_plain_int(limit) or not 1 <= limit <= _MAX_LIMIT:
+        raise ValueError("limit must be an integer between 1 and 1000")
+    if outcome is not None and outcome not in _OUTCOMES:
+        raise ValueError("outcome filter must be succeeded or failed")
+    if exceeded is not None and exceeded not in _EXCEEDED_FILTERS:
+        raise ValueError(
+            "exceeded filter must be one of cost, carbon, any, none")
+    _validate_condition(condition)
+
+    realpath = os.path.realpath(completions)
+    with _lock(realpath, shared=True):
+        records = _read_existing(realpath)
+        ordered = sorted(records.values(),
+                         key=lambda record: record["job_id"])
+        matches: list[list[Any]] = []
+        for record in ordered:
+            job_id = record["job_id"]
+            if cursor is not None and job_id <= cursor:
+                continue
+            if outcome is not None and record["outcome"] != outcome:
+                continue
+            if exceeded is not None and not _matches_exceeded(
+                    record, exceeded):
+                continue
+            matches.append([job_id, copy.deepcopy(record)])
+            if len(matches) > limit:
+                break
+        if len(matches) > limit:
+            page = matches[:limit]
+            next_cursor: str | None = page[-1][0]
+        else:
+            page = matches
+            next_cursor = None
+        return _respond({"entries": page, "next": next_cursor}, condition)

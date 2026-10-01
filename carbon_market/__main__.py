@@ -59,6 +59,10 @@ def parser() -> argparse.ArgumentParser:
              "POST /migration-consumers/{claim,pull,ack,reject} and "
              "GET /migration-consumers/{status,dead-letters}, requires "
              "--migration-batches")
+    server.add_argument(
+        "--completions", action=_Once, metavar="PATH",
+        help="job completion ledger to expose at GET /completions, "
+             "requires --audit and --auth, incompatible with --token")
     bundle = subcommands.add_parser(
         "verify-bundle",
         help="verify a downloaded checkpoint/proof pair offline")
@@ -145,11 +149,12 @@ def main() -> None:
                     or args.checkpoint is not None \
                     or args.acceptance is not None \
                     or args.migration_batches is not None \
-                    or args.migration_consumers is not None:
+                    or args.migration_consumers is not None \
+                    or args.completions is not None:
                 command.error(
                     "--token, --auth, --checkpoint, --acceptance, "
-                    "--migration-batches and --migration-consumers require "
-                    "--audit")
+                    "--migration-batches, --migration-consumers and "
+                    "--completions require --audit")
         else:
             if not args.audit:
                 command.error("--audit must be non-empty")
@@ -180,6 +185,11 @@ def main() -> None:
                         "--migration-consumers requires --migration-batches")
                 if args.auth is None:
                     command.error("--migration-consumers requires --auth")
+            if args.completions is not None:
+                if not args.completions:
+                    command.error("--completions must be non-empty")
+                if args.auth is None:
+                    command.error("--completions requires --auth")
         if args.auth:
             # The whole configuration is validated before the port is
             # bound; any failure is a usage error with status 2.
@@ -191,7 +201,8 @@ def main() -> None:
               auth=args.auth, checkpoint=args.checkpoint,
               acceptance=args.acceptance,
               migration_batches=args.migration_batches,
-              migration_consumers=args.migration_consumers)
+              migration_consumers=args.migration_consumers,
+              completions=args.completions)
     elif args.command == "verify-bundle":
         _verify_bundle(args)
 
