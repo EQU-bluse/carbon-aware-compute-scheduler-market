@@ -416,56 +416,68 @@ def publish(
     if not isinstance(idempotency_key, str) or not idempotency_key:
         raise ValueError("idempotency_key must be a non-empty string")
     normalized = _normalize_signal(signal)
-    region = normalized["region"]
 
     store = _get_store(path)
     with store.lock:
         # Opening the companion lock in a missing directory surfaces as
         # FileNotFoundError before the data file is created.
         with _process_lock(store.realpath):
-            history, idempotency, events, old_bytes = _load_file(
-                store.realpath)
+            return _publish_locked(store.realpath, normalized,
+                                   idempotency_key)
 
-            existing_region = idempotency.get(idempotency_key)
-            if existing_region is not None:
-                event = events[idempotency_key]
-                existing = history[existing_region][event["version"] - 1]
-                if {field: existing[field] for field in _SIGNAL_FIELDS} \
-                        != normalized:
-                    raise ValueError("idempotency key was already used with "
-                                     "a different signal")
-                return dict(existing), False
 
-            versions = history.get(region)
-            if versions is None:
-                versions = []
-                history[region] = versions
-                version = 1
-            else:
-                if normalized["observed"] <= versions[-1]["observed"]:
-                    raise ValueError("signal observation must increase "
-                                     "across versions")
-                version = versions[-1]["version"] + 1
+def _publish_locked(
+    realpath: str,
+    normalized: dict[str, Any],
+    idempotency_key: str,
+) -> tuple[dict[str, Any], bool]:
+    # Lock-free core of :func:`publish`; the caller already holds the
+    # per-real-path in-process lock and the cross-process flock (or, as
+    # signal_ingest does, holds both while coordinating the publication
+    # with another ledger). The signal is already fully validated.
+    history, idempotency, events, old_bytes = _load_file(realpath)
 
-            record: dict[str, Any] = {
-                "region": region,
-                "version": version,
-                "observed": normalized["observed"],
-                "expires": normalized["expires"],
-                "mix": dict(normalized["mix"]),
-                "unit_cost": normalized["unit_cost"],
-                "carbon_intensity": normalized["carbon_intensity"],
-            }
-            versions.append(record)
-            idempotency[idempotency_key] = region
-            events[idempotency_key] = {
-                "key": idempotency_key,
-                "region": region,
-                "version": version,
-            }
-            _commit_file(store.realpath,
-                         _serialize(history, idempotency, events), old_bytes)
-            return dict(record), True
+    region = normalized["region"]
+    existing_region = idempotency.get(idempotency_key)
+    if existing_region is not None:
+        event = events[idempotency_key]
+        existing = history[existing_region][event["version"] - 1]
+        if {field: existing[field] for field in _SIGNAL_FIELDS} \
+                != normalized:
+            raise ValueError("idempotency key was already used with "
+                             "a different signal")
+        return dict(existing), False
+
+    versions = history.get(region)
+    if versions is None:
+        versions = []
+        history[region] = versions
+        version = 1
+    else:
+        if normalized["observed"] <= versions[-1]["observed"]:
+            raise ValueError("signal observation must increase "
+                             "across versions")
+        version = versions[-1]["version"] + 1
+
+    record: dict[str, Any] = {
+        "region": region,
+        "version": version,
+        "observed": normalized["observed"],
+        "expires": normalized["expires"],
+        "mix": dict(normalized["mix"]),
+        "unit_cost": normalized["unit_cost"],
+        "carbon_intensity": normalized["carbon_intensity"],
+    }
+    versions.append(record)
+    idempotency[idempotency_key] = region
+    events[idempotency_key] = {
+        "key": idempotency_key,
+        "region": region,
+        "version": version,
+    }
+    _commit_file(realpath,
+                 _serialize(history, idempotency, events), old_bytes)
+    return dict(record), True
 
 
 def get(path: str, region: str, at: int) -> dict[str, object]:
