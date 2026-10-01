@@ -11,6 +11,7 @@ import tempfile
 import threading
 from typing import Any, Callable, Iterator
 
+from . import completion as _completion
 from . import jobs as _jobs
 from . import offers as _offers
 from . import resources as _resources
@@ -492,6 +493,7 @@ def _validate_clear_ledger(
     accepted: dict[str, dict[str, Any]],
     history: dict[str, list[dict[str, Any]]],
     signal_history: dict[str, list[dict[str, Any]]] | None = None,
+    completed: dict[str, dict[str, Any]] | None = None,
 ) -> tuple[dict[str, dict[str, Any]], dict[str, dict[str, Any]]]:
     if not isinstance(data, dict) or set(data.keys()) != set(_CLEAR_ROOT_FIELDS):
         raise ValueError("clearing ledger root must be an object with keys "
@@ -590,14 +592,34 @@ def _validate_clear_ledger(
         raise ValueError("every trade must be bound to an idempotency key")
 
     # Recorded bookings may not oversell any published version; every
-    # winner was feasible with the earlier trades' work deducted.
-    booked: dict[tuple[str, int], int] = {}
-    for trade in trades.values():
+    # winner was feasible with the earlier trades' work deducted. When a
+    # completion ledger is supplied, each booking whose job completed at
+    # or before a later booking's trade moment no longer occupies its
+    # version for that later booking; absent a completion ledger every
+    # trade counts exactly as before.
+    completed = completed or {}
+    timeline = sorted(trades.values(), key=lambda trade: trade["at"])
+    for index, trade in enumerate(timeline):
+        moment = trade["at"]
+        active: dict[tuple[str, int], int] = {}
+        for other in timeline:
+            if other is trade:
+                continue
+            if other["at"] > moment:
+                # A later booking could not occupy capacity when this
+                # trade was decided.
+                continue
+            completion = completed.get(other["job_id"])
+            if completion is not None and completion["at"] <= moment:
+                # The other run had already finished and released its
+                # booking by this trade's moment.
+                continue
+            slot = (other["resource_id"], other["version"])
+            active[slot] = active.get(slot, 0) + other["work"]
         slot = (trade["resource_id"], trade["version"])
-        booked[slot] = booked.get(slot, 0) + trade["work"]
-    for (resource_id, version), amount in booked.items():
-        record = history[resource_id][version - 1]
-        if record["capacity"] < amount:
+        active[slot] = active.get(slot, 0) + trade["work"]
+        record = history[slot[0]][slot[1] - 1]
+        if record["capacity"] < active[slot]:
             raise ValueError("ledger oversells a published resource version")
 
     return trades, idempotency
@@ -630,6 +652,7 @@ def _load_clear_ledger(
     accepted: dict[str, dict[str, Any]],
     history: dict[str, list[dict[str, Any]]],
     signal_history: dict[str, list[dict[str, Any]]] | None = None,
+    completed: dict[str, dict[str, Any]] | None = None,
 ) -> tuple[dict[str, dict[str, Any]], dict[str, dict[str, Any]], bytes | None]:
     try:
         with open(realpath, "rb") as handle:
@@ -648,7 +671,7 @@ def _load_clear_ledger(
         raise ValueError(
             f"clearing ledger {realpath!r} is not valid JSON") from exc
     trades, idempotency = _validate_clear_ledger(
-        data, accepted, history, signal_history)
+        data, accepted, history, signal_history, completed)
     # As for the supply file, the ledger is accepted only in canonical
     # compact form with a single trailing newline.
     if raw != _canonical_clear_bytes(trades, idempotency):
@@ -726,6 +749,8 @@ def clear(
     job_id: str,
     key: str,
     at: int,
+    *,
+    completion: str | None = None,
 ) -> tuple[dict[str, object], bool]:
     """Clear one accepted job against the versioned supply idempotently.
 
@@ -765,6 +790,12 @@ def clear(
     leaving a ledger or temporary fragment. Invalid structure,
     references, ordering or canonical bytes raise ``ValueError``; other
     locking, read/write or sync failures raise ``OSError``.
+
+    The optional keyword-only ``completion`` path names a
+    :mod:`carbon_market.completion` ledger read in the same snapshot:
+    bookings of jobs completed at or before ``at`` release their
+    resource-version capacity. Omitting it leaves every result
+    unchanged.
     """
     for value in (jobs, supply, ledger, job_id, key):
         if not isinstance(value, str) or not value:
@@ -772,21 +803,30 @@ def clear(
                              "non-empty strings")
     if not _is_plain_int(at) or at < 0:
         raise ValueError("at must be a non-boolean non-negative integer")
+    if completion is not None and (not isinstance(completion, str)
+                                   or not completion):
+        raise ValueError("completion must be a non-empty string when given")
 
     job_real = os.path.realpath(jobs)
     supply_real = os.path.realpath(supply)
     ledger_real = os.path.realpath(ledger)
-    if len({job_real, supply_real, ledger_real}) != 3:
-        raise ValueError("jobs, supply and ledger paths must be distinct "
-                         "real paths")
+    completion_real = (os.path.realpath(completion)
+                       if completion is not None else None)
+    locked_reals = {job_real, supply_real, ledger_real}
+    if completion_real is not None:
+        locked_reals.add(completion_real)
+    if len(locked_reals) != (4 if completion_real is not None else 3):
+        raise ValueError("jobs, supply, ledger and completion paths must "
+                         "be distinct real paths")
 
     store = _get_store(ledger)
     with store.lock:
         # Locks are taken in one resolved-real-path order shared by
         # every caller, so concurrent clears can never deadlock; the
-        # ledger lock is exclusive, both snapshots shared.
+        # ledger lock is exclusive, both snapshots and an explicitly
+        # supplied completion ledger shared.
         with contextlib.ExitStack() as stack:
-            for locked in sorted({job_real, supply_real, ledger_real}):
+            for locked in sorted(locked_reals):
                 stack.enter_context(
                     _clear_lock(locked, shared=(locked != ledger_real)))
 
@@ -809,8 +849,19 @@ def clear(
             if supply_raw is None:
                 raise FileNotFoundError(
                     f"supply file {supply_real!r} does not exist")
+            # An explicitly supplied completion ledger is read as part
+            # of the same snapshot; a missing ledger simply means no job
+            # has completed yet. Its records release completed
+            # bookings in the capacity timeline below.
+            completed_all: dict[str, dict[str, Any]] = {}
+            if completion_real is not None:
+                completion_records, _c_ids, _c_events = \
+                    _completion._load_standalone(completion_real)[:3]
+                completed_all = {
+                    record["job_id"]: record
+                    for record in completion_records.values()}
             trades, idempotency, old_bytes = _load_clear_ledger(
-                ledger_real, accepted, history)
+                ledger_real, accepted, history, None, completed_all)
 
             job = accepted.get(job_id)
             if job is None:
@@ -826,13 +877,21 @@ def clear(
                 raise ValueError("job is already traded under another "
                                  "idempotency key")
 
-            # Capacity already sold per exact resource version; replays
+            # Capacity still occupied per exact resource version; replays
             # never re-enter this path, so every recorded trade counts
-            # exactly once and bookings never cross versions.
+            # exactly once and bookings never cross versions. A booking
+            # whose job completed at or before ``at`` has released its
+            # capacity and no longer counts; without a completion ledger
+            # every trade counts as before.
             sold: dict[tuple[str, int], int] = {}
-            for trade in trades.values():
-                slot = (trade["resource_id"], trade["version"])
-                sold[slot] = sold.get(slot, 0) + trade["work"]
+            for other_id, other in trades.items():
+                if other_id == job_id:
+                    continue
+                completion = completed_all.get(other_id)
+                if completion is not None and completion["at"] <= at:
+                    continue
+                slot = (other["resource_id"], other["version"])
+                sold[slot] = sold.get(slot, 0) + other["work"]
 
             work = job["work"]
             regions = set(job["regions"])
@@ -902,6 +961,8 @@ def clear_live(
     job_id: str,
     key: str,
     at: int,
+    *,
+    completion: str | None = None,
 ) -> tuple[dict[str, object], bool]:
     """Clear one accepted job against live signals idempotently.
 
@@ -948,6 +1009,12 @@ def clear_live(
     other locking, read/write or sync failures raise ``OSError``. The
     existing :func:`match`, :func:`clear`, the ``resources`` interfaces,
     serving and HTTP behavior are unchanged.
+
+    The optional keyword-only ``completion`` path names a
+    :mod:`carbon_market.completion` ledger read in the same snapshot:
+    bookings of jobs completed at or before ``at`` release their
+    resource-version capacity for either clearing path. Omitting it
+    leaves every result unchanged.
     """
     for value in (jobs, supply, signals, ledger, job_id, key):
         if not isinstance(value, str) or not value:
@@ -955,23 +1022,32 @@ def clear_live(
                              "must be non-empty strings")
     if not _is_plain_int(at) or at < 0:
         raise ValueError("at must be a non-boolean non-negative integer")
+    if completion is not None and (not isinstance(completion, str)
+                                   or not completion):
+        raise ValueError("completion must be a non-empty string when given")
 
     job_real = os.path.realpath(jobs)
     supply_real = os.path.realpath(supply)
     signal_real = os.path.realpath(signals)
     ledger_real = os.path.realpath(ledger)
-    if len({job_real, supply_real, signal_real, ledger_real}) != 4:
-        raise ValueError("jobs, supply, signals and ledger paths must be "
-                         "distinct real paths")
+    completion_real = (os.path.realpath(completion)
+                       if completion is not None else None)
+    locked_reals = {job_real, supply_real, signal_real, ledger_real}
+    if completion_real is not None:
+        locked_reals.add(completion_real)
+    expected = 5 if completion_real is not None else 4
+    if len(locked_reals) != expected:
+        raise ValueError("jobs, supply, signals, ledger and completion "
+                         "paths must be distinct real paths")
 
     store = _get_store(ledger)
     with store.lock:
         # Locks are taken in one resolved-real-path order shared by
         # every caller, so concurrent clears can never deadlock; the
-        # ledger lock is exclusive, all three snapshots shared.
+        # ledger lock is exclusive, all snapshots and an explicitly
+        # supplied completion ledger shared.
         with contextlib.ExitStack() as stack:
-            for locked in sorted({job_real, supply_real, signal_real,
-                                  ledger_real}):
+            for locked in sorted(locked_reals):
                 stack.enter_context(
                     _clear_lock(locked, shared=(locked != ledger_real)))
 
@@ -997,9 +1073,18 @@ def clear_live(
                     f"signal file {signal_real!r} does not exist")
             # The ledger now accepts live trades, each freezing the
             # signal version it priced on; static trades validate as
-            # before.
+            # before. When a completion ledger is supplied it is read in
+            # the same snapshot and releases completed bookings.
+            completed_all: dict[str, dict[str, Any]] = {}
+            if completion_real is not None:
+                completion_records, _c_ids, _c_events = \
+                    _completion._load_standalone(completion_real)[:3]
+                completed_all = {
+                    record["job_id"]: record
+                    for record in completion_records.values()}
             trades, idempotency, old_bytes = _load_clear_ledger(
-                ledger_real, accepted, history, signal_history)
+                ledger_real, accepted, history, signal_history,
+                completed_all)
 
             job = accepted.get(job_id)
             if job is None:
@@ -1015,13 +1100,21 @@ def clear_live(
                 raise ValueError("job is already traded under another "
                                  "idempotency key")
 
-            # Capacity already sold per exact resource version counts
+            # Capacity still occupied per exact resource version counts
             # every trade -- static and live alike -- so either clearing
-            # path can oversell, and bookings never cross versions.
+            # path can oversell, and bookings never cross versions. A
+            # booking whose job completed at or before ``at`` has
+            # released its capacity and no longer counts; without a
+            # completion ledger every trade counts as before.
             sold: dict[tuple[str, int], int] = {}
-            for trade in trades.values():
-                slot = (trade["resource_id"], trade["version"])
-                sold[slot] = sold.get(slot, 0) + trade["work"]
+            for other_id, other in trades.items():
+                if other_id == job_id:
+                    continue
+                completion = completed_all.get(other_id)
+                if completion is not None and completion["at"] <= at:
+                    continue
+                slot = (other["resource_id"], other["version"])
+                sold[slot] = sold.get(slot, 0) + other["work"]
 
             work = job["work"]
             regions = set(job["regions"])

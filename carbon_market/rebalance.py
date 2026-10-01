@@ -162,6 +162,7 @@ from . import jobs as _jobs
 from . import market as _market
 from . import resources as _resources
 from . import signals as _signals
+from . import completion as _completion
 from ._jsonio import finite_loads
 
 __all__ = ["evaluate", "apply", "start", "record", "recover", "settle",
@@ -796,6 +797,8 @@ def evaluate(
     job_id: str,
     key: str,
     at: int,
+    *,
+    completion: str | None = None,
 ) -> tuple[dict[str, object], bool]:
     """Re-evaluate one unfinished trade and advise keep or migrate.
 
@@ -842,6 +845,13 @@ def evaluate(
     raise ``FileNotFoundError``; invalid arguments, structure, ordering,
     references or non-canonical bytes raise ``ValueError``; other
     locking, read/write or sync failures raise ``OSError``.
+
+    The optional keyword-only ``completion`` path names a
+    :mod:`carbon_market.completion` ledger read in the same snapshot:
+    bookings and reservations of jobs completed at or before ``at`` no
+    longer occupy capacity, and a job already recorded as completed is
+    refused with ``ValueError``; omitting it leaves every result
+    unchanged.
     """
     for value in (jobs, supply, signals, trades, dispatch, execution,
                   ledger, job_id, key):
@@ -850,6 +860,9 @@ def evaluate(
                              "non-empty strings")
     if not _is_plain_int(at) or at < 0:
         raise ValueError("at must be a non-boolean non-negative integer")
+    if completion is not None and (not isinstance(completion, str)
+                                   or not completion):
+        raise ValueError("completion must be a non-empty string when given")
 
     job_real = os.path.realpath(jobs)
     supply_real = os.path.realpath(supply)
@@ -858,21 +871,29 @@ def evaluate(
     dispatch_real = os.path.realpath(dispatch)
     execution_real = os.path.realpath(execution)
     ledger_real = os.path.realpath(ledger)
-    all_paths = (job_real, supply_real, signal_real, trades_real,
-                 dispatch_real, execution_real, ledger_real)
-    if len(set(all_paths)) != 7:
-        raise ValueError("the seven paths must be distinct real paths")
+    completion_real = (os.path.realpath(completion)
+                       if completion is not None else None)
+    all_paths = tuple(real for real in (
+        job_real, supply_real, signal_real, trades_real,
+        dispatch_real, execution_real, ledger_real, completion_real)
+        if real is not None)
+    if len(set(all_paths)) != len(all_paths):
+        raise ValueError("the seven paths and the completion path must be "
+                         "distinct real paths")
 
     store = _get_store(ledger)
     with store.lock:
         # Locks are taken in one resolved-real-path order shared by every
         # caller, so concurrent evaluations can never deadlock; the
-        # advice ledger lock is exclusive, the six snapshot locks shared.
-        # The independent intent and settlement ledgers beside the
-        # snapshots are discovered before locking and added to the same
-        # ordered set, all shared (evaluate never writes them).
-        anchor_reals = (job_real, supply_real, signal_real, trades_real,
-                        dispatch_real, execution_real, ledger_real)
+        # advice ledger lock is exclusive, the six snapshot locks and an
+        # explicitly supplied completion ledger shared. The independent
+        # intent and settlement ledgers beside the snapshots are
+        # discovered before locking and added to the same ordered set,
+        # all shared (evaluate never writes them).
+        anchor_reals = tuple(real for real in (
+            job_real, supply_real, signal_real, trades_real,
+            dispatch_real, execution_real, ledger_real, completion_real)
+            if real is not None)
         discovered = _discover_lineage_paths(
             anchor_reals, ("intent", "settlement"))
         extra_reals = {real for kind in ("intent", "settlement")
@@ -968,6 +989,21 @@ def evaluate(
             for advice_record in records.values():
                 _ground_advice_current(advice_record, cleared, currents)
 
+            # An explicitly supplied completion ledger participates in
+            # the same snapshot: its frozen bindings are revalidated
+            # against the settlement lineage, a completed job may no
+            # longer request advice, and completed other jobs no longer
+            # occupy capacity at moments at or after their completion.
+            completions_by_job: dict[str, dict[str, Any]] = {}
+            if completion_real is not None:
+                completion_records, _c_ids, _c_events = \
+                    _completion._load_standalone(completion_real)[:3]
+                for completion_record in completion_records.values():
+                    _completion._cross_validate_record(
+                        completion_record, accepted, cleared, completed)
+                    completions_by_job[completion_record["job_id"]] = \
+                        completion_record
+
             request = {"job_id": job_id, "at": at}
             binding = records.get(key)
             if binding is not None:
@@ -994,10 +1030,18 @@ def evaluate(
             active_lineage_plan = any(
                 plan["job_id"] == job_id and plan["state"] == "active"
                 for plan in lineage_plans.values())
+            # A job already recorded in the completion ledger is past any
+            # further migration advice; the check is explicit (and only
+            # active when a completion ledger is supplied) though a
+            # completion also implies the succeeded/completed state the
+            # fixed-order check below rejects.
+            job_completed = completion_real is not None \
+                and job_id in completions_by_job
             # Refusal order is fixed: a finished booking is a ValueError,
             # work still in flight is a PermissionError, and a moment
             # past the deadline is a TimeoutError.
-            if decision["state"] == "succeeded" \
+            if job_completed \
+                    or decision["state"] == "succeeded" \
                     or any(plan["state"] == "completed"
                            for plan in job_plans.values()):
                 raise ValueError("a finished booking cannot be "
@@ -1028,10 +1072,16 @@ def evaluate(
 
             # Capacity already booked per exact resource version by
             # every OTHER job; this job's own frozen occupancy is never
-            # deducted against itself.
+            # deducted against itself. Another job whose completion is
+            # visible at ``at`` has released every occupancy and does
+            # not count; without a completion ledger every trade counts.
             booked: dict[tuple[str, int], int] = {}
             for other_id, other in cleared.items():
                 if other_id == job_id:
+                    continue
+                other_completion = completions_by_job.get(other_id)
+                if other_completion is not None \
+                        and other_completion["at"] <= at:
                     continue
                 slot = (other["resource_id"], other["version"])
                 booked[slot] = booked.get(slot, 0) + other["work"]
@@ -2176,6 +2226,8 @@ def apply(
     advice_key: str,
     key: str,
     at: int,
+    *,
+    completion: str | None = None,
 ) -> tuple[dict[str, object], bool]:
     """Apply one migrate advice as a persisted re-reservation.
 
@@ -2238,6 +2290,13 @@ def apply(
     ``FileNotFoundError``; invalid arguments, structure, ordering,
     references or non-canonical bytes raise ``ValueError``; other
     locking, read/write or sync failures raise ``OSError``.
+
+    The optional keyword-only ``completion`` path names a
+    :mod:`carbon_market.completion` ledger read in the same snapshot:
+    trades and historical migration reservations of jobs completed at
+    or before ``at`` no longer occupy capacity, and a job already
+    recorded as completed is refused with ``ValueError``; omitting it
+    leaves every result unchanged.
     """
     for value in (jobs, supply, signals, trades, dispatch, execution,
                   advice, ledger, job_id, advice_key, key):
@@ -2246,6 +2305,9 @@ def apply(
                              "key must be non-empty strings")
     if not _is_plain_int(at) or at < 0:
         raise ValueError("at must be a non-boolean non-negative integer")
+    if completion is not None and (not isinstance(completion, str)
+                                   or not completion):
+        raise ValueError("completion must be a non-empty string when given")
 
     job_real = os.path.realpath(jobs)
     supply_real = os.path.realpath(supply)
@@ -2255,18 +2317,23 @@ def apply(
     execution_real = os.path.realpath(execution)
     advice_real = os.path.realpath(advice)
     ledger_real = os.path.realpath(ledger)
-    all_paths = (job_real, supply_real, signal_real, trades_real,
-                 dispatch_real, execution_real, advice_real, ledger_real)
-    if len(set(all_paths)) != 8:
-        raise ValueError("the eight paths must be distinct real paths")
+    completion_real = (os.path.realpath(completion)
+                       if completion is not None else None)
+    all_paths = tuple(real for real in (
+        job_real, supply_real, signal_real, trades_real,
+        dispatch_real, execution_real, advice_real, ledger_real,
+        completion_real) if real is not None)
+    if len(set(all_paths)) != len(all_paths):
+        raise ValueError("the eight paths and the completion path must be "
+                         "distinct real paths")
 
     store = _get_store(ledger)
     with store.lock:
         # Locks are taken in one resolved-real-path order shared by
         # every caller, so concurrent calls can never deadlock; the
-        # intent ledger lock is exclusive, the seven snapshot locks and
-        # the independent settlement ledger discovered beside them are
-        # shared.
+        # intent ledger lock is exclusive, the seven snapshot locks, an
+        # explicitly supplied completion ledger and the independent
+        # settlement ledger discovered beside them are shared.
         anchor_reals = all_paths
         discovered_settlements = _discover_lineage_paths(
             anchor_reals, ("settlement",))
@@ -2352,6 +2419,23 @@ def apply(
                 _ground_advice_current(advice_record, cleared,
                                        settlement_currents)
 
+            # An explicitly supplied completion ledger is part of the
+            # same snapshot: its frozen bindings are revalidated against
+            # the completed settlement lineage, a completed job can no
+            # longer reserve, and completed other jobs release both
+            # their trade occupancy and their historical migration
+            # reservations at moments at or after their completion.
+            completions_by_job: dict[str, dict[str, Any]] = {}
+            if completion_real is not None:
+                completion_records, _c_ids, _c_events = \
+                    _completion._load_standalone(completion_real)[:3]
+                for completion_record in completion_records.values():
+                    _completion._cross_validate_record(
+                        completion_record, accepted, cleared,
+                        settlement_completed)
+                    completions_by_job[completion_record["job_id"]] = \
+                        completion_record
+
             request = {"job_id": job_id, "advice_key": advice_key,
                        "at": at}
             binding = idempotency.get(key)
@@ -2423,11 +2507,17 @@ def apply(
                 raise KeyError(job_id)
 
             job_plans = plans.get(job_id, {})
+            # A completed job is past any further reservation, and the
+            # explicit check holds even when the snapshot's dispatch or
+            # execution states alone would not.
+            job_completed = completion_real is not None \
+                and job_id in completions_by_job
             # Refusal order is fixed: a finished booking is a
             # ValueError, work claimed or in flight is a
             # PermissionError, and a moment past the deadline is a
             # TimeoutError.
-            if decision["state"] == "succeeded" \
+            if job_completed \
+                    or decision["state"] == "succeeded" \
                     or any(plan["state"] == "completed"
                            for plan in job_plans.values()):
                 raise ValueError("a finished booking cannot be "
@@ -2481,20 +2571,28 @@ def apply(
                 for plan in plans_by_key.values():
                     intent_plan[plan["job_id"]] = plan
             booked: dict[tuple[str, int], int] = {}
+
+            def released(other_id: str) -> bool:
+                # A job whose completion is visible at the reservation
+                # moment occupies neither current capacity nor a
+                # historical migration reservation.
+                completion = completions_by_job.get(other_id)
+                return completion is not None and completion["at"] <= at
+
             # Each OTHER job occupies exactly one version: the after of
             # its latest completed settlement when one exists, otherwise
             # its traded version adjusted for the open/terminal migration
             # plan the intent ledger still holds.
             settled_binding: dict[str, dict[str, Any]] = {}
             for other_id in cleared:
-                if other_id == job_id:
+                if other_id == job_id or released(other_id):
                     continue
                 latest_other = _latest_completed_binding(
                     settlement_completed, other_id)
                 if latest_other is not None:
                     settled_binding[other_id] = latest_other["after"]
             for other_id, other in cleared.items():
-                if other_id == job_id:
+                if other_id == job_id or released(other_id):
                     continue
                 if other_id in settled_binding:
                     binding = settled_binding[other_id]
@@ -2530,7 +2628,7 @@ def apply(
             # nothing more, and a compensation holds no target.
             for ref, intent in intent_items:
                 other_id = intent["job_id"]
-                if other_id == job_id:
+                if other_id == job_id or released(other_id):
                     continue
                 other_plan = intent_plan.get(ref)
                 if other_plan is not None:
