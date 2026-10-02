@@ -2,13 +2,14 @@ from __future__ import annotations
 
 import hmac
 import json
+import math
 import re
 import urllib.parse
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 from . import acceptance, audit, audit_proof, auth, completion, \
-    migration_batch
+    migration_batch, signal_ingest
 
 # Query parameters GET /audit accepts; anything else is an invalid request.
 _AUDIT_PARAMS = ("cursor", "limit", "op", "stage", "key")
@@ -58,6 +59,13 @@ _MIGRATION_ACK_FIELDS = frozenset(
 _MIGRATION_REJECT_FIELDS = frozenset(
     ("consumer", "owner", "now", "position", "reason", "idem"))
 _MIGRATION_MAX_BODY = 1 << 20
+# POST /signals/ingest accepts one signed signal envelope from a trusted
+# source; the signal ledger, the trust file and the receipt ledger are
+# fixed at startup and can never be selected through the request, which
+# carries exactly the envelope and its idempotency key.
+_SIGNAL_INGEST_PATH = "/signals/ingest"
+_SIGNAL_INGEST_MAX_BODY = 1 << 20
+_SIGNAL_INGEST_FIELDS = frozenset(("envelope", "key"))
 _ACCEPTANCE_STATES = ("pending", "active", "quarantined")
 _OPS = ("copy", "restore")
 _STAGES = ("成功", "校验", "执行", "同步", "回滚")
@@ -293,6 +301,12 @@ class Handler(BaseHTTPRequestHandler):
 
     def do_POST(self) -> None:  # noqa: N802 - BaseHTTPRequestHandler contract
         path, _, query = self.path.partition("?")
+        if path == _SIGNAL_INGEST_PATH and all(
+                getattr(self.server, name, None) is not None
+                for name in ("signals_path", "signal_trust",
+                             "signal_receipts")):
+            self._signal_ingest(query)
+            return
         configured = getattr(self.server, "migration_batches", None) \
             is not None and getattr(self.server, "migration_consumers",
                                    None) is not None
@@ -301,6 +315,104 @@ class Handler(BaseHTTPRequestHandler):
             self._migration_consumer(operation, query)
             return
         self._json(HTTPStatus.NOT_FOUND, {"error": "not_found"})
+
+    def _signal_invalid(self) -> None:
+        self._json(HTTPStatus.BAD_REQUEST, {"error": "signal_ingest_invalid"})
+
+    def _read_signal_body(self) -> tuple[dict[str, object], str] | None:
+        # One JSON object with exactly the envelope and the idempotency
+        # key: no duplicate members, no non-finite numbers, at most
+        # 1 MiB of UTF-8. Anything else is a 400 and never reaches a
+        # ledger.
+        def reject_duplicates(pairs):
+            keys = [name for name, _value in pairs]
+            if len(keys) != len(set(keys)):
+                raise ValueError("duplicate JSON object member")
+            return dict(pairs)
+
+        def reject_constant(_token: str) -> float:
+            # NaN/Infinity are never valid request literals.
+            raise ValueError("non-finite JSON literal")
+
+        def finite_float(token: str) -> float:
+            # An overflowing exponent (1e999) parses to infinity without
+            # reaching the constant hook; reject it here.
+            value = float(token)
+            if not math.isfinite(value):
+                raise ValueError("non-finite JSON number")
+            return value
+
+        try:
+            length = int(self.headers.get("Content-Length", "0"))
+            if length < 0 or length > _SIGNAL_INGEST_MAX_BODY:
+                raise ValueError("bad content length")
+            raw = self.rfile.read(length) if length else b""
+            body = json.loads(raw.decode("utf-8"),
+                              parse_float=finite_float,
+                              parse_constant=reject_constant,
+                              object_pairs_hook=reject_duplicates)
+        except (ValueError, UnicodeDecodeError):
+            self._signal_invalid()
+            return None
+        if not isinstance(body, dict) \
+                or not set(body) == _SIGNAL_INGEST_FIELDS:
+            self._signal_invalid()
+            return None
+        envelope = body["envelope"]
+        key = body["key"]
+        if not isinstance(envelope, dict) \
+                or not isinstance(key, str) or not key:
+            self._signal_invalid()
+            return None
+        return envelope, key
+
+    def _signal_ingest(self, query: str) -> None:
+        # The query and content-type decisions are made before any
+        # business file is opened; the error bodies never carry paths,
+        # key material, signatures or system messages.
+        if query:
+            self._signal_invalid()
+            return
+        content_type = self.headers.get("Content-Type")
+        if content_type is None or content_type.split(";", 1)[0] \
+                .strip().lower() != "application/json":
+            self._signal_invalid()
+            return
+        parsed = self._read_signal_body()
+        if parsed is None:
+            return
+        envelope, key = parsed
+        try:
+            receipt, created = signal_ingest.ingest(
+                getattr(self.server, "signals_path"),
+                getattr(self.server, "signal_trust"),
+                getattr(self.server, "signal_receipts"),
+                envelope, key)
+        except PermissionError as exc:
+            if exc.errno is not None:
+                # A filesystem permission failure while locking or
+                # writing is an availability problem, not an
+                # authentication one.
+                self._json(HTTPStatus.SERVICE_UNAVAILABLE,
+                           {"error": "signal_ingest_unavailable"})
+            else:
+                # An unknown source or key identifier, or a mismatched
+                # signature; the three stay indistinguishable.
+                self._json(HTTPStatus.FORBIDDEN,
+                           {"error": "signal_ingest_forbidden"})
+        except FileNotFoundError:
+            # A missing trust file or a missing parent directory of
+            # either written file; the configured paths never leak.
+            self._json(HTTPStatus.NOT_FOUND,
+                       {"error": "signal_ingest_not_found"})
+        except ValueError:
+            self._signal_invalid()
+        except OSError:
+            self._json(HTTPStatus.SERVICE_UNAVAILABLE,
+                       {"error": "signal_ingest_unavailable"})
+        else:
+            self._json(HTTPStatus.CREATED if created else HTTPStatus.OK,
+                       {"receipt": receipt, "created": created})
 
     def _read_consumer_body(self, operation: str) -> dict[str, object] | None:
         # One fixed JSON object per operation: exact field set, no
@@ -1206,7 +1318,10 @@ def serve(host: str, port: int, audit_path: str | None = None,
           acceptance: str | None = None,
           migration_batches: str | None = None,
           migration_consumers: str | None = None,
-          completions: str | None = None) -> None:
+          completions: str | None = None,
+          signals: str | None = None,
+          signal_trust: str | None = None,
+          signal_receipts: str | None = None) -> None:
     with ThreadingHTTPServer((host, port), Handler) as server:
         server.audit_path = audit_path  # type: ignore[attr-defined]
         server.audit_token = token  # type: ignore[attr-defined]
@@ -1216,4 +1331,7 @@ def serve(host: str, port: int, audit_path: str | None = None,
         server.migration_batches = migration_batches  # type: ignore[attr-defined]
         server.migration_consumers = migration_consumers  # type: ignore[attr-defined]
         server.completions_path = completions  # type: ignore[attr-defined]
+        server.signals_path = signals  # type: ignore[attr-defined]
+        server.signal_trust = signal_trust  # type: ignore[attr-defined]
+        server.signal_receipts = signal_receipts  # type: ignore[attr-defined]
         server.serve_forever()

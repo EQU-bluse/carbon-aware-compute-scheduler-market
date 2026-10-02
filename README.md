@@ -309,6 +309,18 @@ The same authorization as `GET /audit` applies, in the same order: a missing, bl
 
 The queries only take the ledger's shared-lock read-only path. A missing ledger gets 404 `completion_not_found`, an unknown job id 404 `completion_job_not_found`, an invalid ledger 409 `completion_invalid`, and other read failures 503 `completion_unavailable`; real paths and system messages never appear in an error.
 
+## Signal ingestion endpoint
+
+```bash
+python -m carbon_market serve --host 127.0.0.1 --port 8000 --signals SIGNALS --signal-trust TRUST --signal-receipts RECEIPTS
+```
+
+`--signals`, `--signal-trust` and `--signal-receipts` expose the authenticated ingestion of signed live signals as `POST /signals/ingest`, writing the existing signal ledger at `SIGNALS`, authenticating against the trust file at `TRUST` and recording receipts at `RECEIPTS` — the three files `signal_ingest.ingest` already handles. The three options form one group independent of `--audit`: all three exactly once and non-empty, or none of them; a partial group, an empty value or a repeated option is a usage error (exit status 2) and nothing listens. Without the group the path stays a plain 404 like any other unknown path, and every other interface is unchanged. The client never names a ledger path: all three are fixed at startup.
+
+The endpoint accepts only `POST` with a `Content-Type` of `application/json`; any other method is a plain 404 and any query string is 400 `signal_ingest_invalid`, and neither decision opens a business file. The body is a single UTF-8 JSON object of at most 1 MiB carrying exactly `envelope` and `key` — the signed envelope with its public `source`, `key_id`, `sequence`, `signal` and `signature` contract, and the non-empty idempotency key of the ingest call. An empty or over-limit body, undecodable or malformed JSON, a duplicate object member, a non-finite number, or an unknown, missing or misshaped field is 400 `signal_ingest_invalid` and never reaches a ledger.
+
+A first acceptance — and a retry that resumes an interrupted `pending` receipt — answers 201; an exact replay of an already `active` request answers 200. The body carries, in order, `receipt` and `created`: the receipt keeps the library entry's fixed field order (`source`, `key_id`, `sequence`, `region`, `signal_version`, `signature`, `state`) and `created` is `true` exactly for the 201. Concurrent identical requests publish exactly one signal version; the same key carrying any changed envelope field, a new key while the source has an unresolved pending receipt, a non-increasing sequence, a key outside its validity window and an unauthorized region are all 400 `signal_ingest_invalid` and leave the ledgers untouched. An unknown source, an unknown `key_id` or a mismatched signature is 403 `signal_ingest_forbidden`; a missing trust file or a missing parent directory of either written file is 404 `signal_ingest_not_found`; any other locking or read/write failure is 503 `signal_ingest_unavailable`. Error bodies contain only `error` and never leak a path, key material, a signature, a system message or the trust configuration; success bodies are compact UTF-8 JSON with no trailing newline.
+
 ## Test
 
 ```bash

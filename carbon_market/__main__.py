@@ -63,6 +63,18 @@ def parser() -> argparse.ArgumentParser:
         "--completions", action=_Once, metavar="PATH",
         help="completion ledger to expose at GET /completions, "
              "requires --audit and --auth")
+    server.add_argument(
+        "--signals", action=_Once, metavar="PATH",
+        help="signal ledger to expose at POST /signals/ingest, requires "
+             "--signal-trust and --signal-receipts")
+    server.add_argument(
+        "--signal-trust", action=_Once, metavar="PATH",
+        help="trust file authenticating POST /signals/ingest sources, "
+             "requires --signals and --signal-receipts")
+    server.add_argument(
+        "--signal-receipts", action=_Once, metavar="PATH",
+        help="ingest receipt ledger for POST /signals/ingest, requires "
+             "--signals and --signal-trust")
     bundle = subcommands.add_parser(
         "verify-bundle",
         help="verify a downloaded checkpoint/proof pair offline")
@@ -190,6 +202,19 @@ def main() -> None:
                     command.error("--completions must be non-empty")
                 if args.auth is None:
                     command.error("--completions requires --auth")
+        # --signals, --signal-trust and --signal-receipts form one
+        # group independent of --audit: all three exactly once and
+        # non-empty, or none of them; anything else is a usage error
+        # and exits with argparse's status 2 before the port is bound.
+        signal_group = (args.signals, args.signal_trust,
+                        args.signal_receipts)
+        if any(option is not None for option in signal_group):
+            if any(option is None for option in signal_group):
+                command.error("--signals, --signal-trust and "
+                              "--signal-receipts must be given together")
+            if any(not option for option in signal_group):
+                command.error("--signals, --signal-trust and "
+                              "--signal-receipts must be non-empty")
         if args.auth:
             # The whole configuration is validated before the port is
             # bound; any failure is a usage error with status 2.
@@ -202,7 +227,9 @@ def main() -> None:
               acceptance=args.acceptance,
               migration_batches=args.migration_batches,
               migration_consumers=args.migration_consumers,
-              completions=args.completions)
+              completions=args.completions,
+              signals=args.signals, signal_trust=args.signal_trust,
+              signal_receipts=args.signal_receipts)
     elif args.command == "verify-bundle":
         _verify_bundle(args)
 
