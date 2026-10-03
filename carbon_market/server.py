@@ -6,6 +6,7 @@ import re
 import urllib.parse
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from typing import Callable, NamedTuple
 
 from . import acceptance, audit, audit_proof, auth, completion, \
     migration_batch, signal_ingest
@@ -74,6 +75,37 @@ _MAX_LIMIT = 1000
 # of the full validated response bytes. Weak tags, lists, wildcards and
 # surrounding whitespace are invalid requests.
 _ETAG_RE = re.compile(r'"[0-9a-f]{64}"')
+
+
+class _QueryErrors(NamedTuple):
+    # The error names of one conditional query endpoint: one 404 for a
+    # missing ledger or snapshot, an optional second 404 for a missing
+    # key inside a valid ledger, one 409 for invalid content and one
+    # 503 for any other locking or I/O failure.
+    not_found: str
+    invalid: str
+    unavailable: str
+    key_not_found: str | None = None
+
+
+def _scope_unrestricted(record: auth.Record) -> bool:
+    # Downloading the whole snapshot requires unrestricted scope on
+    # every axis: a scoped token may only audit through its filters.
+    return record.ops is None and record.stages is None \
+        and record.keys is None
+
+
+def _scope_exact_or_page(record: auth.Record, params: dict[str, str],
+                         name: str) -> bool:
+    # An exact lookup on ``name`` requires unrestricted operation and
+    # stage scopes and a key scope that is unrestricted or names the
+    # requested key; a paginated query requires all three scopes
+    # unrestricted.
+    if record.ops is not None or record.stages is not None:
+        return False
+    if name in params:
+        return record.keys is None or params[name] in record.keys
+    return record.keys is None
 
 
 def _decode_component(text: str) -> str:
@@ -873,6 +905,85 @@ class Handler(BaseHTTPRequestHandler):
                 return False, None
         return True, record
 
+    def _conditional_header(self) -> tuple[bool, str | None]:
+        # The conditional header of the snapshot download and the ledger
+        # queries: absent (allowed) or exactly one strong tag of the
+        # documented shape. A blank value, a repeated header, a weak
+        # tag, a list, a wildcard or any other shape is an invalid
+        # request answered before any ledger or checkpoint is opened.
+        # Returns (True, condition) with the unquoted digest or None,
+        # or (False, None) once the 400 response was sent.
+        conditions = self.headers.get_all("If-None-Match")
+        if conditions is None:
+            return True, None
+        if len(conditions) != 1 or not _ETAG_RE.fullmatch(conditions[0]):
+            self._json(HTTPStatus.BAD_REQUEST,
+                       {"error": "invalid_request"})
+            return False, None
+        return True, conditions[0][1:-1]
+
+    def _conditional_query(
+            self, query: str,
+            parse: Callable[[str], dict[str, str]],
+            scoped: Callable[[auth.Record, dict[str, str]], bool],
+            read: Callable[[dict[str, str], str | None],
+                           tuple[bytes | None, str]],
+            errors: _QueryErrors) -> None:
+        # The shared request pipeline of the checkpoint download and the
+        # acceptance/completion ledger queries. One fixed order: the
+        # caller's identity first, then the endpoint's own query-string
+        # validation, then the conditional header, then the token's
+        # scope, and only then the locked snapshot read. A rejection at
+        # one stage never opens a later stage's files, and no response
+        # leaks a configured path, a system message or file content.
+        authorized, record = self._authorize()
+        if not authorized:
+            return
+
+        try:
+            params = parse(query)
+        except ValueError:
+            self._json(HTTPStatus.BAD_REQUEST,
+                       {"error": "invalid_request"})
+            return
+
+        valid, condition = self._conditional_header()
+        if not valid:
+            return
+
+        # Scope checks follow parameter and header validation and
+        # precede any file access: a forbidden request never opens the
+        # ledger or the checkpoint.
+        if record is not None and not scoped(record, params):
+            self._json(HTTPStatus.FORBIDDEN, {"error": "forbidden"})
+            return
+
+        try:
+            body, etag = read(params, condition)
+        except FileNotFoundError:
+            # Never leak the configured path or the system message.
+            self._json(HTTPStatus.NOT_FOUND, {"error": errors.not_found})
+        except KeyError:
+            if errors.key_not_found is None:
+                raise
+            self._json(HTTPStatus.NOT_FOUND,
+                       {"error": errors.key_not_found})
+        except ValueError:
+            self._json(HTTPStatus.CONFLICT, {"error": errors.invalid})
+        except OSError:
+            self._json(HTTPStatus.SERVICE_UNAVAILABLE,
+                       {"error": errors.unavailable})
+        else:
+            # The 304 decision compares the validated condition against
+            # the tag of the same locked snapshot the body was read and
+            # serialized from, so a concurrent write can never mix an
+            # old tag with a new body. The ledger builders report a hit
+            # as a None body; the checkpoint download compares here.
+            if body is None or condition == etag:
+                self._raw(HTTPStatus.NOT_MODIFIED, b"", etag)
+            else:
+                self._raw(HTTPStatus.OK, body, etag)
+
     def _audit(self, query: str) -> None:
         authorized, record = self._authorize()
         if not authorized:
@@ -955,223 +1066,74 @@ class Handler(BaseHTTPRequestHandler):
             self._json(HTTPStatus.OK, proof)
 
     def _checkpoint(self, query: str) -> None:
-        authorized, record = self._authorize()
-        if not authorized:
-            return
-
         # The snapshot entry takes no query parameters; any query string
         # fails the same "unknown, repeated or empty parameter" parsing
-        # used by the other endpoints.
-        try:
-            _parse_query(query, ())
-        except ValueError:
-            self._json(HTTPStatus.BAD_REQUEST, {"error": "invalid_request"})
-            return
+        # used by the other endpoints. The checkpoint bytes are served
+        # verbatim -- the original UTF-8 written by the exporter, with
+        # its field order intact.
+        self._conditional_query(
+            query,
+            parse=lambda text: _parse_query(text, ()),
+            scoped=lambda record, _params: _scope_unrestricted(record),
+            read=lambda _params, _condition: audit_proof.read_snapshot(
+                getattr(self.server, "audit_checkpoint")),
+            errors=_QueryErrors(not_found="checkpoint_not_found",
+                                invalid="checkpoint_invalid",
+                                unavailable="checkpoint_unavailable"))
 
-        # The conditional header is validated before the checkpoint is
-        # ever opened: absent (allowed) or exactly one strong tag of the
-        # documented shape. A blank value, a repeated header, a weak tag,
-        # a list, a wildcard or any other shape is an invalid request.
-        conditions = self.headers.get_all("If-None-Match")
-        condition: str | None = None
-        if conditions is not None:
-            if len(conditions) != 1 or not _ETAG_RE.fullmatch(conditions[0]):
-                self._json(HTTPStatus.BAD_REQUEST,
-                           {"error": "invalid_request"})
-                return
-            condition = conditions[0][1:-1]
-
-        # A scoped token may only audit through its filters; downloading
-        # the whole snapshot requires unrestricted scope on every axis.
-        if record is not None and (record.ops is not None
-                                   or record.stages is not None
-                                   or record.keys is not None):
-            self._json(HTTPStatus.FORBIDDEN, {"error": "forbidden"})
-            return
-
-        try:
-            body, etag = audit_proof.read_snapshot(
-                getattr(self.server, "audit_checkpoint"))
-        except FileNotFoundError:
-            # Never leak the configured path or a system message.
-            self._json(HTTPStatus.NOT_FOUND,
-                       {"error": "checkpoint_not_found"})
-        except ValueError:
-            self._json(HTTPStatus.CONFLICT, {"error": "checkpoint_invalid"})
-        except OSError:
-            self._json(HTTPStatus.SERVICE_UNAVAILABLE,
-                       {"error": "checkpoint_unavailable"})
-        else:
-            # The 304 decision uses the ETag of the same validated bytes
-            # a 200 would serve, so a concurrent export can never mix an
-            # old tag with a new body.
-            if condition == etag:
-                self._raw(HTTPStatus.NOT_MODIFIED, b"", etag)
-            else:
-                self._raw(HTTPStatus.OK, body, etag)
+    def _read_acceptance(self, params: dict[str, str],
+                         condition: str | None) -> tuple[bytes | None, str]:
+        ledger_dir = getattr(self.server, "acceptance_dir")
+        if "key" in params:
+            return acceptance.get_response(
+                ledger_dir, params["key"], condition)
+        kwargs: dict[str, object] = {}
+        for name in ("cursor", "state"):
+            if name in params:
+                kwargs[name] = params[name]
+        if "limit" in params:
+            kwargs["limit"] = int(params["limit"])
+        return acceptance.search_response(
+            ledger_dir, condition=condition, **kwargs)
 
     def _acceptance(self, query: str) -> None:
-        authorized, record = self._authorize()
-        if not authorized:
-            return
+        self._conditional_query(
+            query,
+            parse=_parse_acceptance_params,
+            scoped=lambda record, params: _scope_exact_or_page(
+                record, params, "key"),
+            read=self._read_acceptance,
+            errors=_QueryErrors(not_found="acceptance_not_found",
+                                invalid="acceptance_invalid",
+                                unavailable="acceptance_unavailable",
+                                key_not_found="acceptance_key_not_found"))
 
-        try:
-            params = _parse_acceptance_params(query)
-        except ValueError:
-            self._json(HTTPStatus.BAD_REQUEST, {"error": "invalid_request"})
-            return
-
-        # The conditional header is validated together with the query,
-        # before the scope decision and any ledger access: absent
-        # (allowed) or exactly one strong tag of the documented shape.
-        # A blank value, a repeated header, a weak tag, a list, a
-        # wildcard or any other shape is an invalid request that never
-        # opens the ledger.
-        conditions = self.headers.get_all("If-None-Match")
-        condition: str | None = None
-        if conditions is not None:
-            if len(conditions) != 1 or not _ETAG_RE.fullmatch(conditions[0]):
-                self._json(HTTPStatus.BAD_REQUEST,
-                           {"error": "invalid_request"})
-                return
-            condition = conditions[0][1:-1]
-
-        # Scope checks follow parameter validation and precede any
-        # ledger access: an exact lookup requires unrestricted operation
-        # and stage scopes and a key scope that is unrestricted or names
-        # the requested key; a paginated query requires all three scopes
-        # unrestricted. A forbidden request never opens the ledger.
-        if record is not None:
-            if record.ops is not None or record.stages is not None:
-                self._json(HTTPStatus.FORBIDDEN, {"error": "forbidden"})
-                return
-            if "key" in params:
-                if record.keys is not None \
-                        and params["key"] not in record.keys:
-                    self._json(HTTPStatus.FORBIDDEN,
-                               {"error": "forbidden"})
-                    return
-            elif record.keys is not None:
-                self._json(HTTPStatus.FORBIDDEN, {"error": "forbidden"})
-                return
-
-        ledger_dir = getattr(self.server, "acceptance_dir")
-        try:
-            if "key" in params:
-                body, etag = acceptance.get_response(
-                    ledger_dir, params["key"], condition)
-            else:
-                kwargs: dict[str, object] = {}
-                for name in ("cursor", "state"):
-                    if name in params:
-                        kwargs[name] = params[name]
-                if "limit" in params:
-                    kwargs["limit"] = int(params["limit"])
-                body, etag = acceptance.search_response(
-                    ledger_dir, condition=condition, **kwargs)
-        except FileNotFoundError:
-            # Never leak the configured path or the system message.
-            self._json(HTTPStatus.NOT_FOUND,
-                       {"error": "acceptance_not_found"})
-        except KeyError:
-            self._json(HTTPStatus.NOT_FOUND,
-                       {"error": "acceptance_key_not_found"})
-        except ValueError:
-            self._json(HTTPStatus.CONFLICT, {"error": "acceptance_invalid"})
-        except OSError:
-            self._json(HTTPStatus.SERVICE_UNAVAILABLE,
-                       {"error": "acceptance_unavailable"})
-        else:
-            # The 304 decision was made under the ledger's shared lock
-            # against the same serialized bytes a 200 carries, so a
-            # concurrent submission can never mix an old tag with a new
-            # body.
-            if body is None:
-                self._raw(HTTPStatus.NOT_MODIFIED, b"", etag)
-            else:
-                self._raw(HTTPStatus.OK, body, etag)
+    def _read_completions(self, params: dict[str, str],
+                          condition: str | None) -> tuple[bytes | None, str]:
+        ledger = getattr(self.server, "completions_path")
+        if "job" in params:
+            return completion.get_response(
+                ledger, params["job"], condition)
+        kwargs: dict[str, object] = {}
+        for name in ("cursor", "outcome", "exceeded"):
+            if name in params:
+                kwargs[name] = params[name]
+        if "limit" in params:
+            kwargs["limit"] = int(params["limit"])
+        return completion.search_response(
+            ledger, condition=condition, **kwargs)
 
     def _completions(self, query: str) -> None:
-        authorized, record = self._authorize()
-        if not authorized:
-            return
-
-        try:
-            params = _parse_completions_params(query)
-        except ValueError:
-            self._json(HTTPStatus.BAD_REQUEST, {"error": "invalid_request"})
-            return
-
-        # The conditional header is validated together with the query,
-        # before the scope decision and any ledger access: absent
-        # (allowed) or exactly one strong tag of the documented shape.
-        # A blank value, a repeated header, a weak tag, a list, a
-        # wildcard or any other shape is an invalid request that never
-        # opens the ledger.
-        conditions = self.headers.get_all("If-None-Match")
-        condition: str | None = None
-        if conditions is not None:
-            if len(conditions) != 1 or not _ETAG_RE.fullmatch(conditions[0]):
-                self._json(HTTPStatus.BAD_REQUEST,
-                           {"error": "invalid_request"})
-                return
-            condition = conditions[0][1:-1]
-
-        # Scope checks follow parameter validation and precede any
-        # ledger access: an exact lookup requires unrestricted operation
-        # and stage scopes and a key scope that is unrestricted or names
-        # the requested job id; a paginated query requires all three
-        # scopes unrestricted. A forbidden request never opens the
-        # ledger.
-        if record is not None:
-            if record.ops is not None or record.stages is not None:
-                self._json(HTTPStatus.FORBIDDEN, {"error": "forbidden"})
-                return
-            if "job" in params:
-                if record.keys is not None \
-                        and params["job"] not in record.keys:
-                    self._json(HTTPStatus.FORBIDDEN,
-                               {"error": "forbidden"})
-                    return
-            elif record.keys is not None:
-                self._json(HTTPStatus.FORBIDDEN, {"error": "forbidden"})
-                return
-
-        ledger = getattr(self.server, "completions_path")
-        try:
-            if "job" in params:
-                body, etag = completion.get_response(
-                    ledger, params["job"], condition)
-            else:
-                kwargs: dict[str, object] = {}
-                for name in ("cursor", "outcome", "exceeded"):
-                    if name in params:
-                        kwargs[name] = params[name]
-                if "limit" in params:
-                    kwargs["limit"] = int(params["limit"])
-                body, etag = completion.search_response(
-                    ledger, condition=condition, **kwargs)
-        except FileNotFoundError:
-            # Never leak the configured path or the system message.
-            self._json(HTTPStatus.NOT_FOUND,
-                       {"error": "completion_not_found"})
-        except KeyError:
-            self._json(HTTPStatus.NOT_FOUND,
-                       {"error": "completion_job_not_found"})
-        except ValueError:
-            self._json(HTTPStatus.CONFLICT, {"error": "completion_invalid"})
-        except OSError:
-            self._json(HTTPStatus.SERVICE_UNAVAILABLE,
-                       {"error": "completion_unavailable"})
-        else:
-            # The 304 decision was made under the ledger's shared lock
-            # against the same serialized bytes a 200 carries, so a
-            # concurrent completion can never mix an old tag with a new
-            # body.
-            if body is None:
-                self._raw(HTTPStatus.NOT_MODIFIED, b"", etag)
-            else:
-                self._raw(HTTPStatus.OK, body, etag)
+        self._conditional_query(
+            query,
+            parse=_parse_completions_params,
+            scoped=lambda record, params: _scope_exact_or_page(
+                record, params, "job"),
+            read=self._read_completions,
+            errors=_QueryErrors(not_found="completion_not_found",
+                                invalid="completion_invalid",
+                                unavailable="completion_unavailable",
+                                key_not_found="completion_job_not_found"))
 
     def _migration_batches(self, query: str) -> None:
         ledger = getattr(self.server, "migration_batches")
