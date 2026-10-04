@@ -3,13 +3,14 @@ from __future__ import annotations
 import hmac
 import json
 import re
+import time
 import urllib.parse
 from collections.abc import Callable
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 from . import acceptance, audit, audit_proof, auth, completion, \
-    migration_batch, signal_ingest
+    metrics as metrics_mod, migration_batch, signal_ingest
 
 # Query parameters GET /audit accepts; anything else is an invalid request.
 _AUDIT_PARAMS = ("cursor", "limit", "op", "stage", "key")
@@ -99,6 +100,29 @@ _COMPLETION_ERRORS = {
     "invalid": "completion_invalid",
     "unavailable": "completion_unavailable",
 }
+# The process metrics classify requests by the public fixed path with
+# the query string removed. Only these routes can open their own
+# dimension; every other path -- disabled entries included -- is
+# "other", so an arbitrary URL can never create an unbounded set of keys.
+_METRICS_ROUTES = frozenset((
+    "/health",
+    "/audit",
+    "/audit/proof",
+    "/audit/checkpoint",
+    "/acceptance",
+    "/migration-batches",
+    "/migration-batches/events",
+    "/migration-consumers/status",
+    "/migration-consumers/dead-letters",
+    "/migration-consumers/claim",
+    "/migration-consumers/pull",
+    "/migration-consumers/ack",
+    "/migration-consumers/reject",
+    "/completions",
+    "/signals/ingest",
+    "/metrics",
+))
+_METRICS_PATH = "/metrics"
 
 
 def _decode_component(text: str) -> str:
@@ -269,11 +293,56 @@ def _parse_migration_dead_letters_params(query: str) -> dict[str, str]:
 class Handler(BaseHTTPRequestHandler):
     server_version = "CarbonMarket/0.1"
 
+    # Per-request count guard (reset in handle_one_request, which runs
+    # once per keep-alive request on the same handler instance).
+    _metrics_counted = False
+
+    def handle_one_request(self) -> None:
+        # One handler instance serves several keep-alive requests, so
+        # the per-request count guard and the parsed target are reset
+        # before each request is parsed; a malformed follow-up request
+        # line must not be classified (or counted) under the previous
+        # request's path.
+        self._metrics_counted = False
+        self.path = None
+        super().handle_one_request()
+
+    def send_response_only(self, code, message=None) -> None:  # type: ignore[override]
+        # Every final response funnels through here: the normal
+        # _json/_bytes/_raw path arrives via send_response, and the base
+        # class's own send_error (an unsupported method's 501, a
+        # malformed request line's 400) calls this directly. Counting
+        # here -- guarded so one request is counted exactly once, and
+        # ignoring the provisional 100 Continue of Expect handling --
+        # covers every decided status. A successful GET /metrics reads
+        # its snapshot in the handler before this runs, so its own count
+        # only shows up in a later snapshot.
+        if not (100 <= int(code) < 200):
+            self._count_metrics(int(code))
+        super().send_response_only(code, message)
+
+    def _count_metrics(self, status: int) -> None:
+        store = getattr(self.server, "metrics", None)
+        if store is None or self._metrics_counted:
+            return
+        self._metrics_counted = True
+        # Classify by the fixed public path with the query removed; a
+        # request line that never parsed has no self.path at all and is
+        # an "other" count like any unknown path.
+        raw_path = getattr(self, "path", "") or ""
+        path = raw_path.partition("?")[0]
+        route = path if path in _METRICS_ROUTES else metrics_mod.OTHER
+        store.record(route, status)
+
     def do_GET(self) -> None:  # noqa: N802 - BaseHTTPRequestHandler contract
         if self.path == "/health":
             self._json(HTTPStatus.OK, {"status": "ok"})
             return
         path, _, query = self.path.partition("?")
+        if path == _METRICS_PATH \
+                and getattr(self.server, "metrics", None) is not None:
+            self._metrics()
+            return
         if path == "/audit" \
                 and getattr(self.server, "audit_path", None) is not None:
             self._audit(query)
@@ -341,11 +410,12 @@ class Handler(BaseHTTPRequestHandler):
         self._json(HTTPStatus.NOT_FOUND, {"error": "not_found"})
 
     def _method_not_post(self) -> None:
-        # A non-POST method on the ingest path is a plain 404 like any
-        # other unknown route and never opens a business file; every
-        # other path keeps the default 501 for unsupported methods.
+        # A non-POST method on the ingest path or the metrics path is a
+        # plain 404 like any other unknown route and never opens a
+        # business file; every other path keeps the default 501 for
+        # unsupported methods.
         path, _, _query = self.path.partition("?")
-        if path == _SIGNAL_INGEST_PATH:
+        if path == _SIGNAL_INGEST_PATH or path == _METRICS_PATH:
             self._json(HTTPStatus.NOT_FOUND, {"error": "not_found"})
             return
         self.send_error(HTTPStatus.NOT_IMPLEMENTED,
@@ -1026,6 +1096,33 @@ class Handler(BaseHTTPRequestHandler):
         else:
             self._json(HTTPStatus.OK, result)
 
+    def _metrics(self) -> None:
+        # The read-only process snapshot reuses the audit entry's
+        # verification order: header presence and identity first
+        # (401/503/403), then this entry's parameter and scope checks,
+        # and only then is the snapshot read. The entry takes no
+        # parameters, so any query string -- even an empty one after a
+        # bare '?' -- is an invalid request.
+        authorized, record = self._authorize()
+        if not authorized:
+            return
+        if "?" in self.path:
+            self._json(HTTPStatus.BAD_REQUEST, {"error": "invalid_request"})
+            return
+        # A metrics token must be unrestricted on every audit axis:
+        # operation, stage and history key all have to be wildcards.
+        if record is not None and (record.ops is not None
+                                   or record.stages is not None
+                                   or record.keys is not None):
+            self._json(HTTPStatus.FORBIDDEN, {"error": "forbidden"})
+            return
+        # The snapshot is taken before the response is sent (and this
+        # request counted), so a successful GET /metrics never appears
+        # in its own snapshot but is counted exactly once afterwards and
+        # shows up in the next one.
+        store = getattr(self.server, "metrics")
+        self._json(HTTPStatus.OK, store.snapshot())
+
     def _proof(self, query: str) -> None:
         authorized, record = self._authorize()
         if not authorized:
@@ -1299,7 +1396,8 @@ def serve(host: str, port: int, audit_path: str | None = None,
           completions: str | None = None,
           signals: str | None = None,
           signal_trust: str | None = None,
-          signal_receipts: str | None = None) -> None:
+          signal_receipts: str | None = None,
+          enable_metrics: bool = False) -> None:
     with ThreadingHTTPServer((host, port), Handler) as server:
         server.audit_path = audit_path  # type: ignore[attr-defined]
         server.audit_token = token  # type: ignore[attr-defined]
@@ -1312,4 +1410,10 @@ def serve(host: str, port: int, audit_path: str | None = None,
         server.signals_path = signals  # type: ignore[attr-defined]
         server.signal_trust = signal_trust  # type: ignore[attr-defined]
         server.signal_receipts = signal_receipts  # type: ignore[attr-defined]
+        # The counters are process-local: they start at zero exactly
+        # when listening begins, are reset by a restart and never touch
+        # a file. When the entry is disabled it stays None and
+        # GET /metrics is an ordinary unknown path.
+        server.metrics = (  # type: ignore[attr-defined]
+            metrics_mod.Metrics(int(time.time())) if enable_metrics else None)
         server.serve_forever()

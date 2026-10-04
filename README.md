@@ -321,6 +321,20 @@ The same authorization as `GET /audit` applies, in the same order: a missing, bl
 
 The queries only take the ledger's shared-lock read-only path. A missing ledger gets 404 `completion_not_found`, an unknown job id 404 `completion_job_not_found`, an invalid ledger 409 `completion_invalid`, and other read failures 503 `completion_unavailable`; real paths and system messages never appear in an error.
 
+## Process metrics
+
+```bash
+python -m carbon_market serve --host 127.0.0.1 --port 8000 --audit PATH --auth CONFIG --metrics
+```
+
+`--metrics` is a valueless switch that exposes the process-local, read-only request snapshot at `GET /metrics`. It may only be given together with `--audit` and the multi-token `--auth` method: missing either dependency, pairing it with the single `--token`, giving it more than once or attaching a value is a usage error (exit status 2) and nothing listens. Without the switch `GET /metrics` stays a plain 404 like any other unknown path, and every other interface is unchanged.
+
+The snapshot is initialized to zero when the process starts listening, lives only in that process (a restart clears it) and is never written to or read from a file. Every request whose status code has been decided and whose response has been constructed is counted exactly once — including metrics requests, business refusals, authorization failures and unknown paths. Requests are classified by the public fixed path with the query string removed; every path that is not one of the fixed endpoints is counted under `other`, so arbitrary URLs cannot create unbounded dimensions.
+
+`GET /metrics` uses the same authorization as `GET /audit`, in the same order: a missing, blank or duplicated `X-Audit-Token` gets 401 `unauthorized`; an unknown or expired token gets 403 `forbidden`; and an authorization file that cannot be read or validated at request time gets 503 `auth_unavailable`. The entry takes no query parameters, so any query string is 400 `invalid_request`, checked together with the scope after identity and before the snapshot is read: a token whose operation, stage or history-key scope is anything but the wildcard gets 403 `forbidden`. Every other method on the path is a plain 404, and error bodies never carry the path, the token or a system message.
+
+A successful snapshot answers 200 with compact UTF-8 JSON and no trailing newline. The object carries, in order, `version`, `started`, `total` and `routes`; `version` is fixed at 1, `started` is the non-negative Unix second at which listening began, `total` is the number of counted requests, and `routes` holds only path keys that have occurred, ordered by Unicode code point. Each route value carries, in order, `total` and `statuses`; `statuses` keys are decimal status codes ordered numerically, and every layer's subtotal equals `total`. The successful `GET /metrics` request is counted exactly once like any other request, but the snapshot is taken before that response is sent, so it never appears in its own snapshot — it first shows up in the next one. Concurrent requests and a concurrent snapshot read observe one complete point in time: no count is lost or doubled and the totals never contradict.
+
 ## Test
 
 ```bash
