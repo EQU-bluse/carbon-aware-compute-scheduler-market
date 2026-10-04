@@ -321,6 +321,26 @@ The same authorization as `GET /audit` applies, in the same order: a missing, bl
 
 The queries only take the ledger's shared-lock read-only path. A missing ledger gets 404 `completion_not_found`, an unknown job id 404 `completion_job_not_found`, an invalid ledger 409 `completion_invalid`, and other read failures 503 `completion_unavailable`; real paths and system messages never appear in an error.
 
+## Process metrics endpoint
+
+```bash
+python -m carbon_market serve --host 127.0.0.1 --port 8000 --audit PATH --auth CONFIG --metrics
+```
+
+`--metrics` is a valueless switch exposing the read-only `GET /metrics` snapshot. It may only be given together with `--audit` and the multi-token `--auth` method: alone, without one of those two, alongside the single `--token`, repeated, or with an attached value (`--metrics=on`) it is a usage error (exit status 2) and nothing listens. Without it the path stays a plain 404 like any other unknown path, and every other interface — its authentication, status codes and response bytes — is unchanged.
+
+Authorization follows the audit entry's order with the same compact error objects: a missing, blank or duplicated `X-Audit-Token` gets 401 `unauthorized`; an unknown or expired token gets 403 `forbidden`; and an authorization file that cannot be read or validated at request time gets 503 `auth_unavailable`. On top of identity, the entry is restricted to a token whose operation, stage and history-key scopes are all `"*"` — any one of them being a concrete range is a plain 403. The entry accepts no query parameters at all: any query string answers 400 `invalid_request`, and the parameter and scope checks both complete before the snapshot is read. Every method other than GET answers 404. Error bodies never contain the path, a token or a system message.
+
+The counters start at zero when the socket begins serving, live only in that process, and reset on a restart; no file is created or rewritten. Every request whose status code has been decided and whose response has been built is counted exactly once — metrics requests, business rejections, authorization failures and unknown paths included — and classified by its public fixed path with the query string stripped. A path that is not one of the fixed routes collapses into `other`, so an arbitrary URL can never create an unbounded set of dimensions.
+
+A successful snapshot answers 200 with compact UTF-8 JSON and no trailing newline. The object has, in order, `version`, `started`, `total` and `routes`: `version` is fixed at `1`, `started` is the non-negative Unix second serving began, `total` is the number of counted requests, and `routes` holds only the path keys that have appeared, sorted by Unicode code point. Each route value has `total` followed by `statuses`; the latter keys are decimal status codes sorted numerically. The route and status sums always equal `total`.
+
+```json
+{"version":1,"started":1791144065,"total":5,"routes":{"/health":{"total":1,"statuses":{"200":1}},"/metrics":{"total":3,"statuses":{"400":1,"401":1,"403":1}},"other":{"total":1,"statuses":{"404":1}}}}
+```
+
+The current request is never present in its own snapshot: the bytes describe the counters as they stand immediately before that response is sent, and the request is folded in once when its own response is committed. Counts and reads are taken under one lock, so a request racing other traffic observes a single complete point in time — no count is lost or doubled and the layered totals never contradict one another.
+
 ## Test
 
 ```bash

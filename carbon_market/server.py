@@ -3,6 +3,7 @@ from __future__ import annotations
 import hmac
 import json
 import re
+import time
 import urllib.parse
 from collections.abc import Callable
 from http import HTTPStatus
@@ -10,6 +11,32 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 from . import acceptance, audit, audit_proof, auth, completion, \
     migration_batch, signal_ingest
+from .metrics import OTHER_ROUTE, Metrics
+
+# The process metrics classify a request by the public fixed path it
+# targeted after stripping the query string. These paths are a fixed
+# property of the service whether or not the backing feature was
+# configured, so a hit on a disabled entry still groups under its own
+# path; every other path collapses into "other" and an arbitrary URL
+# can never create a new dimension.
+_KNOWN_PATHS = frozenset((
+    "/health",
+    "/audit",
+    "/audit/proof",
+    "/audit/checkpoint",
+    "/acceptance",
+    "/migration-batches",
+    "/migration-batches/events",
+    "/migration-consumers/claim",
+    "/migration-consumers/pull",
+    "/migration-consumers/ack",
+    "/migration-consumers/reject",
+    "/migration-consumers/status",
+    "/migration-consumers/dead-letters",
+    "/completions",
+    "/signals/ingest",
+    "/metrics",
+))
 
 # Query parameters GET /audit accepts; anything else is an invalid request.
 _AUDIT_PARAMS = ("cursor", "limit", "op", "stage", "key")
@@ -269,11 +296,48 @@ def _parse_migration_dead_letters_params(query: str) -> dict[str, str]:
 class Handler(BaseHTTPRequestHandler):
     server_version = "CarbonMarket/0.1"
 
+    # A response is counted at most once per parsed request; flipped
+    # back to False by handle_one_request for keep-alive connections
+    # that serve several requests on one handler instance.
+    _metrics_counted = True
+
+    def handle_one_request(self) -> None:  # noqa: N802 - contract
+        self._metrics_counted = False
+        super().handle_one_request()
+
+    def send_response(self, status, message=None) -> None:  # noqa: ANN001
+        # Every response the service sends passes through here exactly
+        # once: the plain JSON replies, the raw snapshot bytes and
+        # send_error's 400/501 alike. Counting at this chokepoint makes
+        # each decided response reach the registry once, classified by
+        # the fixed public path with the query stripped.
+        super().send_response(status, message)
+        self._count_response(int(status))
+
+    def _count_response(self, status: int) -> None:
+        registry = getattr(self.server, "metrics", None)
+        if registry is None or self._metrics_counted:
+            return
+        self._metrics_counted = True
+        # A request line rejected while it was being parsed may never
+        # have reached the point that assigns self.path.
+        path = getattr(self, "path", None)
+        if path is None:
+            route = OTHER_ROUTE
+        else:
+            path = path.partition("?")[0]
+            route = path if path in _KNOWN_PATHS else OTHER_ROUTE
+        registry.record(route, status)
+
     def do_GET(self) -> None:  # noqa: N802 - BaseHTTPRequestHandler contract
         if self.path == "/health":
             self._json(HTTPStatus.OK, {"status": "ok"})
             return
         path, _, query = self.path.partition("?")
+        if path == "/metrics" \
+                and getattr(self.server, "metrics", None) is not None:
+            self._metrics(query)
+            return
         if path == "/audit" \
                 and getattr(self.server, "audit_path", None) is not None:
             self._audit(query)
@@ -342,10 +406,16 @@ class Handler(BaseHTTPRequestHandler):
 
     def _method_not_post(self) -> None:
         # A non-POST method on the ingest path is a plain 404 like any
-        # other unknown route and never opens a business file; every
-        # other path keeps the default 501 for unsupported methods.
+        # other unknown route and never opens a business file; the
+        # enabled metrics entry answers every non-GET method the same
+        # plain 404. Every other path keeps the default 501 for
+        # unsupported methods.
         path, _, _query = self.path.partition("?")
         if path == _SIGNAL_INGEST_PATH:
+            self._json(HTTPStatus.NOT_FOUND, {"error": "not_found"})
+            return
+        if path == "/metrics" \
+                and getattr(self.server, "metrics", None) is not None:
             self._json(HTTPStatus.NOT_FOUND, {"error": "not_found"})
             return
         self.send_error(HTTPStatus.NOT_IMPLEMENTED,
@@ -988,6 +1058,32 @@ class Handler(BaseHTTPRequestHandler):
             else:
                 self._raw(HTTPStatus.OK, body, etag)
 
+    def _metrics(self, query: str) -> None:
+        # Read-only process metrics. Identity follows exactly the audit
+        # entry's order (401 missing/blank/duplicate, 503 when the live
+        # authorization file is unreadable or invalid, 403 for an
+        # unknown or expired token); the entry takes no query parameter
+        # at all and only a token whose operation, stage and key scopes
+        # are all wildcards may read it. Parameters and scope are
+        # settled before the counters are read, so a rejected request
+        # never observes a snapshot.
+        authorized, record = self._authorize()
+        if not authorized:
+            return
+        if query:
+            self._json(HTTPStatus.BAD_REQUEST, {"error": "invalid_request"})
+            return
+        if record is not None and (record.ops is not None
+                                   or record.stages is not None
+                                   or record.keys is not None):
+            self._json(HTTPStatus.FORBIDDEN, {"error": "forbidden"})
+            return
+        # The bytes describe the counters exactly as they stand before
+        # this response is sent; this request joins them once
+        # send_response runs, so a metrics request never appears in its
+        # own snapshot yet is still counted exactly once overall.
+        self._bytes(HTTPStatus.OK, self.server.metrics.snapshot())
+
     def _audit(self, query: str) -> None:
         authorized, record = self._authorize()
         if not authorized:
@@ -1299,8 +1395,14 @@ def serve(host: str, port: int, audit_path: str | None = None,
           completions: str | None = None,
           signals: str | None = None,
           signal_trust: str | None = None,
-          signal_receipts: str | None = None) -> None:
+          signal_receipts: str | None = None,
+          metrics: bool = False) -> None:
     with ThreadingHTTPServer((host, port), Handler) as server:
+        # The registry starts zeroed the instant the socket is serving
+        # and lives only in this process; nothing is persisted, so a
+        # restart clears every count.
+        registry = Metrics(int(time.time())) if metrics else None
+        server.metrics = registry  # type: ignore[attr-defined]
         server.audit_path = audit_path  # type: ignore[attr-defined]
         server.audit_token = token  # type: ignore[attr-defined]
         server.audit_auth = auth  # type: ignore[attr-defined]

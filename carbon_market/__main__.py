@@ -17,6 +17,25 @@ class _Once(argparse.Action):
         setattr(namespace, self.dest, values)
 
 
+class _FlagOnce(argparse.Action):
+    """Valueless switch that may be given at most once."""
+
+    def __init__(self, option_strings, dest, **kwargs):
+        # nargs=0 makes the switch take no value and turns an attached
+        # "--flag=value" into argparse's usage error; const carries the
+        # value setting the switch implies. argparse itself supplies
+        # const and default, so override what it passed.
+        kwargs["nargs"] = 0
+        kwargs["const"] = True
+        kwargs["default"] = False
+        super().__init__(option_strings, dest, **kwargs)
+
+    def __call__(self, parser, namespace, values, option_string=None):
+        if getattr(namespace, self.dest, False):
+            parser.error(f"{option_string} must not be given more than once")
+        setattr(namespace, self.dest, True)
+
+
 class _UsageError(Exception):
     """A verify-bundle usage error, reported as invalid_request."""
 
@@ -41,6 +60,10 @@ def parser() -> argparse.ArgumentParser:
         "--auth", action=_Once,
         help="multi-token scoped authorization file for GET /audit, "
              "exclusive with --token")
+    server.add_argument(
+        "--metrics", action=_FlagOnce,
+        help="expose the read-only process metrics at GET /metrics; "
+             "requires --audit and --auth")
     server.add_argument(
         "--checkpoint", action=_Once,
         help="proof checkpoint file to expose at GET /audit/proof, "
@@ -156,17 +179,20 @@ def main() -> None:
         # --acceptance and --migration-batches are stricter still: they
         # require --audit together with the multi-token --auth method,
         # never the single --token. --completions follows the same rule.
+        # --metrics is a valueless switch that likewise requires the
+        # --audit/--auth pair and may never accompany --token.
         if args.audit is None:
             if args.token is not None or args.auth is not None \
                     or args.checkpoint is not None \
                     or args.acceptance is not None \
                     or args.migration_batches is not None \
                     or args.migration_consumers is not None \
-                    or args.completions is not None:
+                    or args.completions is not None \
+                    or args.metrics:
                 command.error(
                     "--token, --auth, --checkpoint, --acceptance, "
-                    "--migration-batches, --migration-consumers and "
-                    "--completions require --audit")
+                    "--migration-batches, --migration-consumers, "
+                    "--completions and --metrics require --audit")
         else:
             if not args.audit:
                 command.error("--audit must be non-empty")
@@ -177,6 +203,8 @@ def main() -> None:
                 command.error("--token must be non-empty")
             if args.auth is not None and not args.auth:
                 command.error("--auth must be non-empty")
+            if args.metrics and args.auth is None:
+                command.error("--metrics requires --auth")
             if args.checkpoint is not None and not args.checkpoint:
                 command.error("--checkpoint must be non-empty")
             if args.acceptance is not None:
@@ -231,7 +259,7 @@ def main() -> None:
               migration_consumers=args.migration_consumers,
               completions=args.completions,
               signals=args.signals, signal_trust=args.signal_trust,
-              signal_receipts=args.signal_receipts)
+              signal_receipts=args.signal_receipts, metrics=args.metrics)
     elif args.command == "verify-bundle":
         _verify_bundle(args)
 
