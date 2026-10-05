@@ -95,14 +95,13 @@ record never leaves a partially updated file.
 from __future__ import annotations
 
 import contextlib
-import fcntl
 import hashlib
 import json
 import os
 import tempfile
-import threading
-from typing import Any, Iterator
+from typing import Any
 
+from . import _lifecycle
 from ._jsonio import strict_loads
 
 __all__ = ["record", "get", "search", "verify"]
@@ -189,45 +188,18 @@ def emit(audit_path: str, audit_key: str, op: str, target: str,
     return None
 
 
-class _Store:
-    def __init__(self, realpath: str) -> None:
-        self.realpath = realpath
-        self.lock = threading.Lock()
-
-
-_stores_lock = threading.Lock()
-_stores: dict[str, _Store] = {}
-
-
-def _get_store(realpath: str) -> _Store:
-    with _stores_lock:
-        store = _stores.get(realpath)
-        if store is None:
-            store = _Store(realpath)
-            _stores[realpath] = store
-        return store
-
-
-@contextlib.contextmanager
-def _file_lock(realpath: str, *, shared: bool = False) -> Iterator[None]:
-    # Cross-process exclusion via a kernel flock on the companion lock
-    # file: flock serializes separate opens of the same lock file across
-    # processes (and across separate opens in this process), and the
-    # kernel releases it automatically when the holding process exits --
-    # even on a crash -- so a leftover lock file never blocks anyone. The
-    # file is deliberately never unlinked: removing it while another
-    # process waits on the old inode would split the lock domain. Any
-    # failure to open or lock surfaces unchanged as OSError.
-    lock_path = realpath + ".lock"
-    fd = os.open(lock_path, os.O_CREAT | os.O_RDWR, 0o666)
-    try:
-        fcntl.flock(fd, fcntl.LOCK_SH if shared else fcntl.LOCK_EX)
-        try:
-            yield
-        finally:
-            fcntl.flock(fd, fcntl.LOCK_UN)
-    finally:
-        os.close(fd)
+# The per-realpath in-process mutex registry and the companion-flock
+# discipline are the shared infrastructure of carbon_market._lifecycle:
+# equivalent real paths -- however spelled -- collapse onto one store and
+# one lock file across every ledger module. The private names below stay
+# as this module's seam (existing callers and probes reference them).
+_Store = _lifecycle.Store
+_get_store = _lifecycle.get_store
+_file_lock = _lifecycle.file_lock
+# The shared registry itself, under its former private name, so the
+# restart-simulation seam (dropping all in-process lock state) keeps
+# working unchanged.
+_stores = _lifecycle._stores
 
 
 def _validate_event(raw: object, *, strict_order: bool) -> dict[str, Any]:

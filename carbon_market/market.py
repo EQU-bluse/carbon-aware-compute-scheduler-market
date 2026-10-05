@@ -4,13 +4,12 @@ from __future__ import annotations
 
 import contextlib
 import copy
-import fcntl
 import json
 import os
 import tempfile
-import threading
-from typing import Any, Callable, Iterator
+from typing import Any, Callable
 
+from . import _lifecycle
 from . import jobs as _jobs
 from . import offers as _offers
 from . import resources as _resources
@@ -24,24 +23,13 @@ _MATCH_FIELDS = ("job_id", "resource_id")
 _ROOT_FIELDS = ("version", "matches", "idempotency")
 
 
-class _Store:
-    def __init__(self, realpath: str) -> None:
-        self.realpath = realpath
-        self.lock = threading.Lock()
-
-
-_stores_lock = threading.Lock()
-_stores: dict[str, _Store] = {}
-
-
-def _get_store(path: str) -> _Store:
-    realpath = os.path.realpath(path)
-    with _stores_lock:
-        store = _stores.get(realpath)
-        if store is None:
-            store = _Store(realpath)
-            _stores[realpath] = store
-        return store
+# The per-realpath in-process mutex registry and the companion-flock
+# discipline are the shared infrastructure of carbon_market._lifecycle:
+# equivalent real paths -- however spelled -- collapse onto one store and
+# one lock file across every ledger module. The private names below stay
+# as this module's seam (existing callers and probes reference them).
+_Store = _lifecycle.Store
+_get_store = _lifecycle.get_store
 
 
 def _is_plain_int(value: object) -> bool:
@@ -257,24 +245,12 @@ _EVENT_FIELDS = ("key", "job_id", "at", "resource_id", "version")
 _STATIC_CANDIDATE_FIELDS = ("resource", "total_cost", "total_carbon")
 _LIVE_CANDIDATE_FIELDS = ("resource", "signal", "total_cost",
                           "total_carbon")
-_LOCK_SUFFIX = ".lock"
 
-
-@contextlib.contextmanager
-def _clear_lock(realpath: str, *, shared: bool = False) -> Iterator[None]:
-    # As in resources.jobs, the companion lock file is never unlinked and
-    # an flock is released by the kernel on process exit, so equivalent
-    # real paths share one lock across threads and processes.
-    lock_path = realpath + _LOCK_SUFFIX
-    fd = os.open(lock_path, os.O_CREAT | os.O_RDWR, 0o666)
-    try:
-        fcntl.flock(fd, fcntl.LOCK_SH if shared else fcntl.LOCK_EX)
-        try:
-            yield
-        finally:
-            fcntl.flock(fd, fcntl.LOCK_UN)
-    finally:
-        os.close(fd)
+# The shared companion-flock discipline, under this module's private
+# name: the companion lock file is never unlinked and an flock is
+# released by the kernel on process exit, so equivalent real paths share
+# one lock across threads and processes.
+_clear_lock = _lifecycle.file_lock
 
 
 def _check_sorted_keys(mapping: dict[Any, Any], label: str) -> None:

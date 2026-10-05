@@ -23,6 +23,17 @@ share through ``carbon_market._lifecycle``:
   replay under thread contention and between independent processes;
 * byte-identical output versus the pre-refactor ledgers.
 
+A second section pins the unified lock infrastructure itself: every
+persistent ledger module -- including the nine that once kept their own
+lock-file plumbing (audit, audit_proof, jobs, market, rebalance,
+execution_sync, migration_batch, recover_all, signal_ingest) -- now
+shares one in-process store per resolved real path and one companion
+flock domain, so shared reads overlap, reads and writes exclude each
+other, writes exclude writes, aliases of one file funnel into one lock,
+exceptions always release, and multi-ledger operations take their locks
+in one resolved-real-path order no matter how the paths were spelled or
+ordered.
+
 Every check goes through the public entry points and the on-disk
 bytes; only the read-validation and lock-order probes touch module
 privates, and those privates are deliberately kept as module seams.
@@ -31,6 +42,9 @@ privates, and those privates are deliberately kept as module seams.
 from __future__ import annotations
 
 import contextlib
+import fcntl
+import hashlib
+import hmac
 import json
 import multiprocessing
 import os
@@ -42,11 +56,20 @@ from tempfile import TemporaryDirectory
 from unittest import mock
 
 from carbon_market import _lifecycle
+from carbon_market import audit as audit_module
+from carbon_market import audit_proof as audit_proof_module
+from carbon_market import cancellation as cancellation_module
 from carbon_market import completion as completion_module
 from carbon_market import dispatch as dispatch_module
 from carbon_market import execution as execution_module
 from carbon_market import execution_sync as execution_sync_module
+from carbon_market import jobs as jobs_module
+from carbon_market import market as market_module
+from carbon_market import migration_batch as migration_batch_module
+from carbon_market import rebalance as rebalance_module
+from carbon_market import recover_all as recover_all_module
 from carbon_market import resources as resources_module
+from carbon_market import signal_ingest as signal_ingest_module
 from carbon_market import signals as signals_module
 from carbon_market.completion import (
     complete, get as completion_get, get_response, search,
@@ -1614,6 +1637,455 @@ class ProcessRaceTest(LifecycleTestBase):
 
 
 # ---------------------------------------------------------------------------
+# The unified lock infrastructure shared by every persistent ledger
+# ---------------------------------------------------------------------------
+
+# Every module that persists a ledger, including the nine that formerly
+# kept their own lock-file open/flock/release plumbing.
+_LOCK_MODULES = (
+    audit_module, audit_proof_module, cancellation_module,
+    completion_module, dispatch_module, execution_module,
+    execution_sync_module, jobs_module, market_module,
+    migration_batch_module, rebalance_module, recover_all_module,
+    resources_module, signal_ingest_module, signals_module,
+)
+
+# The formerly independent lock implementations, exercised here against
+# one another on the same file: (reader/writer alias pairs).
+_FORMERLY_INDEPENDENT_LOCKS = (
+    audit_module._file_lock,
+    audit_proof_module._file_lock,
+    execution_sync_module._lock,
+    jobs_module._process_lock,
+    market_module._clear_lock,
+    migration_batch_module._lock,
+    rebalance_module._lock,
+    recover_all_module._file_lock,
+    signal_ingest_module._file_lock,
+)
+
+_INGEST_SECRET_HEX = "ab" * 32
+_INGEST_SECRET = bytes.fromhex(_INGEST_SECRET_HEX)
+_INGEST_SIGNAL_FIELDS = ("region", "observed", "expires", "mix",
+                         "unit_cost", "carbon_intensity")
+
+
+def _ingest_signal() -> dict[str, object]:
+    return {"region": "eu-north", "observed": 10, "expires": 100,
+            "mix": {"solar": 6000, "wind": 4000}, "unit_cost": 3,
+            "carbon_intensity": 7}
+
+
+def _ingest_envelope(sequence: int = 1) -> dict[str, object]:
+    signal = _ingest_signal()
+    ordered = {field: signal[field] for field in _INGEST_SIGNAL_FIELDS}
+    ordered["mix"] = {name: ordered["mix"][name]
+                      for name in sorted(ordered["mix"])}
+    payload = json.dumps(["src-a", "key-a", sequence, ordered],
+                         ensure_ascii=False, separators=(",", ":")).encode()
+    return {"source": "src-a", "key_id": "key-a", "sequence": sequence,
+            "signal": signal,
+            "signature": hmac.new(_INGEST_SECRET, payload,
+                                  hashlib.sha256).hexdigest()}
+
+
+def _ingest_trust_bytes() -> bytes:
+    doc = {"src-a": {"key_id": "key-a", "key": _INGEST_SECRET_HEX,
+                     "regions": ["eu-north", "us-west"],
+                     "valid_from": 0, "valid_until": 1000}}
+    return signal_ingest_module._serialize_trust(doc)
+
+
+def _audit_event() -> dict[str, object]:
+    return {"op": "copy", "target": "t.history", "key": "batch-k",
+            "changed": True, "error": None, "stage": None}
+
+
+def _probe_exclusive(realpath: str) -> None:
+    # A non-blocking exclusive flock on a fresh descriptor: succeeds only
+    # when no shared or exclusive lock on the companion file is held by
+    # anyone, so a still-held lock fails immediately and deterministically
+    # as BlockingIOError instead of surfacing as a timeout.
+    fd = os.open(realpath + ".lock", os.O_CREAT | os.O_RDWR, 0o666)
+    try:
+        fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        fcntl.flock(fd, fcntl.LOCK_UN)
+    finally:
+        os.close(fd)
+
+
+class UnifiedLockInfrastructureTest(LifecycleTestBase):
+    """One store and one flock domain per resolved real path, shared by
+    every persistent ledger module.
+
+    The blocking checks use gates, not sleeps: a contender that must not
+    enter yet is observed not entering inside a short negative window,
+    and one that must enter is given the full ``_WAIT`` budget, so a
+    failure reads as "not mutually exclusive", "deadlock" or "lock not
+    released" rather than as a lost race.
+    """
+
+    def test_one_store_per_real_path_across_every_ledger(self) -> None:
+        target = os.path.join(self.tmp.name, "shared-target.json")
+        Path(target).write_bytes(b"{}\n")
+        alias = os.path.join(self.tmp.name, "shared-alias.json")
+        os.symlink(target, alias)
+        relative = os.path.join(
+            self.tmp.name, "..", os.path.basename(self.tmp.name),
+            "shared-target.json")
+        store = _lifecycle.get_store(target)
+        self.assertEqual(store.realpath, os.path.realpath(target))
+        for module in _LOCK_MODULES:
+            with self.subTest(module=module.__name__):
+                # Canonical path, symlink and ".." relative spelling all
+                # collapse onto the same in-process mutex, across modules.
+                self.assertIs(module._get_store(target), store)
+                self.assertIs(module._get_store(alias), store)
+                self.assertIs(module._get_store(relative), store)
+
+    def test_shared_reads_overlap_across_modules(self) -> None:
+        real = os.path.realpath(self.stack.jobs)
+        barrier = threading.Barrier(2)
+        outcomes: dict[str, object] = {}
+
+        def reader(name: str, lock) -> None:
+            try:
+                with lock(real, shared=True):
+                    # Both readers rendezvous inside the critical section:
+                    # a "shared" lock that serialized them would trip the
+                    # barrier instead.
+                    barrier.wait(_WAIT)
+                    outcomes[name] = "overlapped"
+            except BaseException as exc:  # noqa: BLE001 - asserted below
+                outcomes[name] = exc
+
+        readers = [
+            threading.Thread(target=reader, args=("audit",
+                                                  audit_module._file_lock)),
+            threading.Thread(target=reader, args=("ingest",
+                                                  signal_ingest_module
+                                                  ._file_lock)),
+        ]
+        for thread in readers:
+            thread.start()
+        for thread in readers:
+            thread.join(_WAIT)
+            self.assertFalse(thread.is_alive(),
+                             "a shared-read thread never finished: the "
+                             "shared lock deadlocked or was never released")
+        self.assertEqual(outcomes, {"audit": "overlapped",
+                                    "ingest": "overlapped"})
+
+    def test_shared_read_excludes_exclusive_write_across_modules(
+        self) -> None:
+        real = os.path.realpath(self.stack.jobs)
+        held = threading.Event()
+        release = threading.Event()
+        entered = threading.Event()
+
+        def share() -> None:
+            # The shared hold comes from one formerly independent lock
+            # implementation (audit)...
+            with audit_module._file_lock(real, shared=True):
+                held.set()
+                release.wait(_WAIT)
+
+        holder = threading.Thread(target=share)
+        holder.start()
+        self.assertTrue(held.wait(_WAIT))
+
+        def exclusive() -> None:
+            # ...the exclusive contender from another (audit_proof).
+            with audit_proof_module._file_lock(real):
+                entered.set()
+
+        contender = threading.Thread(target=exclusive)
+        contender.start()
+        self.assertFalse(entered.wait(0.3),
+                         "exclusive lock entered while a shared read lock "
+                         "was held: read/write are not mutually exclusive")
+        release.set()
+        self.assertTrue(entered.wait(_WAIT),
+                        "exclusive lock never entered after the shared "
+                        "lock was released: deadlock or lock not released")
+        holder.join(_WAIT)
+        contender.join(_WAIT)
+        self.assertFalse(holder.is_alive() or contender.is_alive())
+
+    def test_exclusive_writes_are_mutually_exclusive_across_modules(
+        self) -> None:
+        real = os.path.realpath(self.stack.jobs)
+        held = threading.Event()
+        release = threading.Event()
+        entered = threading.Event()
+
+        def hold() -> None:
+            with jobs_module._process_lock(real):
+                held.set()
+                release.wait(_WAIT)
+
+        holder = threading.Thread(target=hold)
+        holder.start()
+        self.assertTrue(held.wait(_WAIT))
+
+        def contend() -> None:
+            with market_module._clear_lock(real):
+                entered.set()
+
+        contender = threading.Thread(target=contend)
+        contender.start()
+        self.assertFalse(entered.wait(0.3),
+                         "a second exclusive lock entered while the first "
+                         "was held: write/write are not mutually exclusive")
+        release.set()
+        self.assertTrue(entered.wait(_WAIT),
+                        "the second exclusive lock never entered after "
+                        "release: deadlock or lock not released")
+        holder.join(_WAIT)
+        contender.join(_WAIT)
+        self.assertFalse(holder.is_alive() or contender.is_alive())
+
+    def test_lock_is_released_when_the_critical_section_raises(
+        self) -> None:
+        real = os.path.realpath(self.stack.jobs)
+        for lock in _FORMERLY_INDEPENDENT_LOCKS:
+            for shared in (False, True):
+                with self.subTest(lock=lock, shared=shared):
+                    with self.assertRaises(RuntimeError):
+                        with lock(real, shared=shared):
+                            raise RuntimeError("injected body failure")
+                    try:
+                        _probe_exclusive(real)
+                    except BlockingIOError:
+                        self.fail("the flock was still held after the "
+                                  "critical section raised: lock not "
+                                  "released")
+
+    def test_in_process_mutex_is_released_when_the_body_raises(
+        self) -> None:
+        store = _lifecycle.get_store(os.path.realpath(self.stack.jobs))
+        with self.assertRaises(RuntimeError):
+            with store.lock:
+                raise RuntimeError("injected body failure")
+        self.assertTrue(store.lock.acquire(blocking=False),
+                        "the in-process mutex was still held after the "
+                        "critical section raised: lock not released")
+        store.lock.release()
+
+    def test_equivalent_spellings_funnel_into_one_flock(self) -> None:
+        target = os.path.join(self.tmp.name, "alias-flock.json")
+        Path(target).write_bytes(b"{}\n")
+        alias = os.path.join(self.tmp.name, "alias-flock-link.json")
+        os.symlink(target, alias)
+        relative = os.path.join(
+            self.tmp.name, "..", os.path.basename(self.tmp.name),
+            "alias-flock.json")
+        canonical = os.path.realpath(target)
+        self.assertEqual(os.path.realpath(alias), canonical)
+        self.assertEqual(os.path.realpath(relative), canonical)
+        # An exclusive hold taken through the symlink spelling blocks a
+        # non-blocking probe through the canonical spelling...
+        with _lifecycle.file_lock(os.path.realpath(alias)):
+            with self.assertRaises(BlockingIOError,
+                                   msg="the symlink spelling and the "
+                                       "canonical spelling did not land "
+                                       "on the same lock"):
+                _probe_exclusive(canonical)
+        # ...and the hold is gone once the section exits.
+        _probe_exclusive(canonical)
+
+    def test_multi_file_operations_lock_in_sorted_realpath_order(
+        self) -> None:
+        # The path roles are assigned so that the argument order is not
+        # the resolved-real-path order; the recorded acquisitions must
+        # still be exactly the sorted real paths with the per-role
+        # shared/exclusive flags.
+        trust = os.path.join(self.tmp.name, "zz-trust.json")
+        ledger = os.path.join(self.tmp.name, "aa-ledger.json")
+        signals = os.path.join(self.tmp.name, "mm-signals.json")
+        Path(trust).write_bytes(_ingest_trust_bytes())
+        acquired: list[tuple[str, bool]] = []
+        real_lock = signal_ingest_module._file_lock
+
+        @contextlib.contextmanager
+        def probed(realpath, *, shared=False):
+            acquired.append((realpath, shared))
+            with real_lock(realpath, shared=shared):
+                yield
+
+        with mock.patch.object(signal_ingest_module, "_file_lock", probed):
+            signal_ingest_module.ingest(signals=signals, trust=trust,
+                                        ledger=ledger, key="k-1",
+                                        envelope=_ingest_envelope())
+        self.assertEqual(acquired, sorted(
+            ((os.path.realpath(trust), True),
+             (os.path.realpath(ledger), False),
+             (os.path.realpath(signals), False)),
+            key=lambda item: item[0]))
+
+        # market.clear_live: the trades ledger is the one exclusive lock,
+        # every other path is shared, all in sorted real-path order.
+        self.stack.submit(1)
+        cleared: list[tuple[str, bool]] = []
+        real_clear_lock = market_module._clear_lock
+
+        @contextlib.contextmanager
+        def probed_clear(realpath, *, shared=False):
+            cleared.append((realpath, shared))
+            with real_clear_lock(realpath, shared=shared):
+                yield
+
+        with mock.patch.object(market_module, "_clear_lock", probed_clear):
+            market_module.clear_live(self.stack.jobs, self.stack.supply,
+                                     self.stack.signals, self.stack.trades,
+                                     "j-1", "tk-1", 10)
+        trades_real = os.path.realpath(self.stack.trades)
+        expected = sorted(
+            ((os.path.realpath(self.stack.jobs), True),
+             (os.path.realpath(self.stack.supply), True),
+             (os.path.realpath(self.stack.signals), True),
+             (trades_real, False)),
+            key=lambda item: item[0])
+        self.assertEqual(cleared, expected)
+
+    def test_reversed_multi_file_acquisition_does_not_deadlock(
+        self) -> None:
+        # Two threads take the same three exclusive locks; one is handed
+        # the paths in reverse order. Both sort by resolved real path
+        # before locking, so neither can ever hold what the other waits
+        # for; a regression to argument-order locking deadlocks here.
+        paths = [os.path.realpath(os.path.join(self.tmp.name, name))
+                 for name in ("one.json", "two.json", "three.json")]
+        barrier = threading.Barrier(2)
+        outcomes: dict[str, object] = {}
+
+        def worker(name: str, ordered: list[str]) -> None:
+            try:
+                for _ in range(10):
+                    barrier.wait(_WAIT)
+                    with contextlib.ExitStack() as stack:
+                        for real in sorted(ordered):
+                            stack.enter_context(_lifecycle.file_lock(real))
+            except BaseException as exc:  # noqa: BLE001 - asserted below
+                outcomes[name] = exc
+            else:
+                outcomes[name] = "done"
+
+        forward = threading.Thread(target=worker, args=("forward", paths))
+        backward = threading.Thread(
+            target=worker, args=("backward", list(reversed(paths))))
+        forward.start()
+        backward.start()
+        forward.join(_WAIT)
+        backward.join(_WAIT)
+        self.assertFalse(forward.is_alive() or backward.is_alive(),
+                         "reversed multi-file acquisition never finished: "
+                         "deadlock")
+        self.assertEqual(outcomes, {"forward": "done", "backward": "done"})
+
+    def test_concurrent_identical_ingests_publish_exactly_once(self) -> None:
+        # Two formerly independent lock domains -- the ingest receipt
+        # ledger and the signal ledger -- now serialize on the same
+        # infrastructure: a same-key race replays, never double-writes.
+        trust = os.path.join(self.tmp.name, "ingest-trust.json")
+        ledger = os.path.join(self.tmp.name, "ingest-ledger.json")
+        signals = os.path.join(self.tmp.name, "ingest-signals.json")
+        Path(trust).write_bytes(_ingest_trust_bytes())
+        barrier = threading.Barrier(2)
+        outcomes: dict[str, object] = {}
+
+        def worker(name: str) -> None:
+            try:
+                barrier.wait(_WAIT)
+                outcomes[name] = signal_ingest_module.ingest(
+                    signals=signals, trust=trust, ledger=ledger,
+                    key="k-race", envelope=_ingest_envelope())
+            except BaseException as exc:  # noqa: BLE001 - asserted below
+                outcomes[name] = exc
+
+        threads = [threading.Thread(target=worker, args=(name,))
+                   for name in ("first", "second")]
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join(_WAIT)
+            self.assertFalse(thread.is_alive(),
+                             "an ingest thread never finished: deadlock")
+        first, second = outcomes["first"], outcomes["second"]
+        self.assertIsInstance(first, tuple, repr(first))
+        self.assertIsInstance(second, tuple, repr(second))
+        self.assertEqual(sorted(created for _receipt, created
+                                in (first, second)), [False, True])
+        self.assertEqual(first[0], second[0])
+        ledger_doc = json.loads(Path(ledger).read_text(encoding="utf-8"))
+        self.assertEqual(list(ledger_doc["receipts"]), ["k-race"])
+        signals_doc = json.loads(Path(signals).read_text(encoding="utf-8"))
+        self.assertEqual(len(signals_doc["history"]["eu-north"]), 1)
+
+    def test_record_and_export_contend_on_one_journal(self) -> None:
+        # audit.record and audit_proof.export kept fully separate lock
+        # implementations before the unification; here they race on one
+        # journal, the writer against the snapshot reader.
+        journal = os.path.join(self.tmp.name, "contended-audit.json")
+        checkpoint = os.path.join(self.tmp.name, "contended-checkpoint.json")
+        audit_module.record(journal, "seed", _audit_event())
+        barrier = threading.Barrier(2)
+        outcomes: dict[str, object] = {"proofs": []}
+
+        def writer() -> None:
+            try:
+                barrier.wait(_WAIT)
+                for index in range(5):
+                    audit_module.record(journal, f"w-{index}",
+                                        _audit_event())
+                outcomes["writer"] = "done"
+            except BaseException as exc:  # noqa: BLE001 - asserted below
+                outcomes["writer"] = exc
+
+        def exporter() -> None:
+            try:
+                barrier.wait(_WAIT)
+                for _index in range(5):
+                    # One open generation: each export pins the journal
+                    # snapshot complete at that moment as another anchor.
+                    outcomes["proofs"].append(audit_proof_module.export(
+                        journal, checkpoint, "g1"))
+                outcomes["exporter"] = "done"
+            except BaseException as exc:  # noqa: BLE001 - asserted below
+                outcomes["exporter"] = exc
+
+        threads = [threading.Thread(target=writer),
+                   threading.Thread(target=exporter)]
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join(_WAIT)
+            self.assertFalse(thread.is_alive(),
+                             "record/export contention never finished: "
+                             "deadlock")
+        self.assertEqual(outcomes["writer"], "done",
+                         repr(outcomes["writer"]))
+        self.assertEqual(outcomes["exporter"], "done",
+                         repr(outcomes["exporter"]))
+        # Every write landed exactly once and the journal still parses as
+        # one complete document -- no torn read ever reached an export.
+        document = json.loads(Path(journal).read_text(encoding="utf-8"))
+        self.assertEqual(sorted(document["events"]),
+                         ["seed", "w-0", "w-1", "w-2", "w-3", "w-4"])
+        generations = json.loads(Path(checkpoint).read_text(
+            encoding="utf-8"))["generations"]
+        self.assertEqual([g["name"] for g in generations], ["g1"])
+        # Each export whose snapshot had grown appended one anchor; an
+        # export that observed an unchanged snapshot replayed. Either
+        # way every anchor pinned a complete journal.
+        anchors = generations[0]["anchors"]
+        self.assertGreaterEqual(len(anchors), 1)
+        self.assertLessEqual(len(anchors), 5)
+        # The final proof, exported against the complete journal, verifies.
+        audit_proof_module.verify(checkpoint, outcomes["proofs"][-1])
+
+
+# ---------------------------------------------------------------------------
 # Public surface: no new entries, exports unchanged
 # ---------------------------------------------------------------------------
 
@@ -1631,6 +2103,35 @@ class PublicSurfaceTest(unittest.TestCase):
         self.assertTrue(_lifecycle.__name__.startswith("carbon_market._"))
         self.assertFalse(hasattr(_lifecycle, "commit"))
         self.assertFalse(hasattr(_lifecycle, "complete"))
+
+    def test_unified_lock_modules_keep_their_exports(self) -> None:
+        # The lock unification added no public name anywhere.
+        self.assertEqual(audit_module.__all__,
+                         ["record", "get", "search", "verify"])
+        self.assertEqual(audit_proof_module.__all__,
+                         ["export", "verify", "verify_bundle",
+                          "read_snapshot", "BundleFormatError",
+                          "BundleMismatchError"])
+        self.assertEqual(jobs_module.__all__, ["register", "submit", "get"])
+        self.assertEqual(market_module.__all__,
+                         ["match", "clear", "clear_live"])
+        self.assertEqual(rebalance_module.__all__,
+                         ["evaluate", "apply", "start", "record", "recover",
+                          "settle", "current"])
+        self.assertEqual(execution_sync_module.__all__, ["run"])
+        self.assertEqual(recover_all_module.__all__, ["run"])
+        self.assertEqual(signal_ingest_module.__all__, ["ingest"])
+        self.assertEqual(migration_batch_module.__all__,
+                         ["run", "get", "search", "get_response",
+                          "search_response", "events", "events_response",
+                          "consume", "consume_response",
+                          "consumer_subscription", "consumer_status",
+                          "consumer_status_response", "consumer_dead_letters",
+                          "consumer_dead_letters_response",
+                          "ConsumerLedgerInvalid", "ConsumerOwnershipError",
+                          "ConsumerLeaseExpired", "CoordinationLedgerInvalid",
+                          "CoordinationLedgerMissing",
+                          "ConsumersLedgerMissing"])
 
 
 if __name__ == "__main__":
