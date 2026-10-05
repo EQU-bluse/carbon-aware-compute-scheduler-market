@@ -398,6 +398,7 @@ def commit(
     job_id: str,
     key: str,
     at: int,
+    cancellations: str | None = None,
 ) -> tuple[dict[str, object], bool]:
     """Create the dispatch decision for one traded job idempotently.
 
@@ -432,6 +433,17 @@ def commit(
     ``FileNotFoundError``; invalid structure, values, ordering,
     references or canonical bytes raise ``ValueError``; other locking,
     read/write or sync failures raise ``OSError``.
+
+    When ``cancellations`` explicitly names a
+    :mod:`carbon_market.cancellation` ledger (a non-empty string
+    resolving to a location distinct from every other path, else
+    ``ValueError``), it is read under its shared lock in the same
+    resolved real-path order, so a concurrent
+    :func:`carbon_market.cancellation.cancel` and this commit are
+    decided against one consistent snapshot: committing a cancelled job
+    raises ``ValueError`` and creates no decision. Omitting the
+    argument keeps every historical result, file format and exception
+    exactly as before.
     """
     for value in (jobs, supply, trades, ledger, job_id, key):
         if not isinstance(value, str) or not value:
@@ -439,6 +451,9 @@ def commit(
                              "must be non-empty strings")
     if not _is_plain_int(at) or at < 0:
         raise ValueError("at must be a non-boolean non-negative integer")
+    if cancellations is not None and (
+            not isinstance(cancellations, str) or not cancellations):
+        raise ValueError("cancellations must be a non-empty string or None")
 
     job_real = os.path.realpath(jobs)
     supply_real = os.path.realpath(supply)
@@ -448,12 +463,20 @@ def commit(
     if len(business_reals) != 4:
         raise ValueError("jobs, supply, trades and ledger paths must be "
                          "distinct real paths")
+    cancellation_real = (os.path.realpath(cancellations)
+                         if cancellations is not None else None)
+    if cancellation_real is not None \
+            and cancellation_real in business_reals:
+        raise ValueError("cancellations must be a distinct real path")
     # Completion ledgers beside the snapshots are part of the trades
     # ledger's capacity envelope; they are discovered before locking and
     # shared in the same global order so a concurrent completion can
     # never deadlock against this commit.
     completion_reals = set(
         _market._discover_completion_paths(tuple(business_reals)))
+    locked_reals = business_reals | completion_reals
+    if cancellation_real is not None:
+        locked_reals.add(cancellation_real)
 
     store = _get_store(ledger)
     with store.lock:
@@ -461,7 +484,7 @@ def commit(
         # every caller, so concurrent commits can never deadlock; the
         # dispatch ledger lock is exclusive, the input snapshots shared.
         with contextlib.ExitStack() as stack:
-            for locked in sorted(business_reals | completion_reals):
+            for locked in sorted(locked_reals):
                 stack.enter_context(
                     _lock(locked, shared=(locked != ledger_real)))
 
@@ -483,12 +506,28 @@ def commit(
             if supply_raw is None:
                 raise FileNotFoundError(
                     f"supply file {supply_real!r} does not exist")
+            # The explicitly provided cancellation ledger is read under
+            # its shared lock in the same snapshot. Its moments feed the
+            # trades ledger's capacity envelope; the frozen references
+            # are cross-checked against the loaded trades right after.
+            cancel_records: dict[str, dict[str, Any]] = {}
+            if cancellation_real is not None:
+                from . import cancellation as _cancellation
+                cancel_records, _ckeys, _cevents, _craw = \
+                    _cancellation._load_cancellation_ledger(
+                        cancellation_real)
+            cancelled = {record["job_id"]: record["at"]
+                         for record in cancel_records.values()}
             cleared, _clear_keys, trades_raw = _market._load_clear_ledger(
                 trades_real, accepted, history,
-                completion_paths=sorted(completion_reals))
+                completion_paths=sorted(completion_reals),
+                cancelled=cancelled)
             if trades_raw is None:
                 raise FileNotFoundError(
                     f"clearing ledger {trades_real!r} does not exist")
+            if cancellation_real is not None:
+                _cancellation._validate_records(
+                    cancel_records, accepted, cleared)
             decisions, idempotency, events, old_bytes = _load_ledger(
                 ledger_real)
 
@@ -506,6 +545,8 @@ def commit(
             trade = cleared.get(job_id)
             if trade is None:
                 raise LookupError("job has no recorded trade")
+            if job_id in cancelled:
+                raise ValueError("a cancelled job cannot be committed")
             deadline = job["deadline"]
             if at > deadline:
                 raise TimeoutError("commit moment exceeds the job "
