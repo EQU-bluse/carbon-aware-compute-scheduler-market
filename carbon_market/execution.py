@@ -43,20 +43,16 @@ literals and exactly one trailing newline.
 
 from __future__ import annotations
 
-import contextlib
 import copy
-import fcntl
 import json
 import os
-import tempfile
-import threading
-from typing import Any, Iterator
+from typing import Any
 
 from . import dispatch as _dispatch
 from . import jobs as _jobs
 from . import market as _market
 from . import resources as _resources
-from ._jsonio import finite_loads
+from . import _lifecycle
 
 __all__ = ["plan", "record", "recover"]
 
@@ -78,57 +74,20 @@ _REQUEST_FIELDS = {
                "receipt", "at"),
     "recover": ("action", "job_id", "attempt", "at"),
 }
-_LOCK_SUFFIX = ".lock"
 
 
-class _Store:
-    def __init__(self, realpath: str) -> None:
-        self.realpath = realpath
-        self.lock = threading.Lock()
+# Thin module-level wrappers keep the private names the execution
+# ledger always exposed while the shared lifecycle machinery lives in
+# _lifecycle; tests that patch these names keep intercepting the layer.
+_get_store = _lifecycle.get_store
+_is_plain_int = _lifecycle.is_plain_int
 
 
-_stores_lock = threading.Lock()
-_stores: dict[str, _Store] = {}
+def _lock(realpath: str, *, shared: bool = False) -> Any:
+    return _lifecycle.file_lock(realpath, shared=shared)
 
 
-def _get_store(path: str) -> _Store:
-    realpath = os.path.realpath(path)
-    with _stores_lock:
-        store = _stores.get(realpath)
-        if store is None:
-            store = _Store(realpath)
-            _stores[realpath] = store
-        return store
-
-
-def _is_plain_int(value: object) -> bool:
-    # bool is a subclass of int and must be rejected.
-    return isinstance(value, int) and not isinstance(value, bool)
-
-
-@contextlib.contextmanager
-def _lock(realpath: str, *, shared: bool = False) -> Iterator[None]:
-    # As in the other registries, the companion lock file is never
-    # unlinked and an flock is released by the kernel on process exit,
-    # so equivalent real paths share one lock across threads and
-    # processes -- and across modules, since every layer uses the same
-    # suffix for the same file.
-    lock_path = realpath + _LOCK_SUFFIX
-    fd = os.open(lock_path, os.O_CREAT | os.O_RDWR, 0o666)
-    try:
-        fcntl.flock(fd, fcntl.LOCK_SH if shared else fcntl.LOCK_EX)
-        try:
-            yield
-        finally:
-            fcntl.flock(fd, fcntl.LOCK_UN)
-    finally:
-        os.close(fd)
-
-
-def _check_sorted_keys(mapping: dict[Any, Any], label: str) -> None:
-    keys = list(mapping)
-    if keys != sorted(keys):
-        raise ValueError(f"{label} must be ordered by key code point")
+_check_sorted_keys = _lifecycle.check_sorted_keys
 
 
 def _validate_receipt(receipt: object, sequence: tuple[str, ...],
@@ -480,92 +439,32 @@ def _load_ledger(
     realpath: str,
 ) -> tuple[dict[str, dict[str, dict[str, Any]]], dict[str, dict[str, Any]],
            dict[str, dict[str, Any]], bytes | None]:
-    try:
-        with open(realpath, "rb") as handle:
-            raw = handle.read()
-    except FileNotFoundError:
+    raw = _lifecycle.read_raw(realpath)
+    if raw is None:
         return {}, {}, {}, None
-    try:
-        text = raw.decode("utf-8")
-    except UnicodeDecodeError as exc:
-        raise ValueError(
-            f"execution ledger {realpath!r} is not valid UTF-8") from exc
-    try:
-        # Negative-zero and non-finite literals are format errors.
-        data = finite_loads(text)
-    except ValueError as exc:
-        raise ValueError(
-            f"execution ledger {realpath!r} is not valid JSON") from exc
-    plans, idempotency, events = _validate_ledger(data)
-    # As for the other registries, the ledger is accepted only in
-    # canonical compact form with a single trailing newline.
-    if raw != _canonical_bytes(plans, idempotency, events):
-        raise ValueError(
-            f"execution ledger {realpath!r} is not in canonical compact "
-            "form")
+    plans, idempotency, events = _lifecycle.parse_ledger(
+        raw, realpath, kind="execution", validate=_validate_ledger,
+        serialize=_canonical_bytes)
     return plans, idempotency, events, raw
 
 
-def _fsync_directory(directory: str) -> None:
-    dir_fd = os.open(directory, os.O_RDONLY)
-    try:
-        os.fsync(dir_fd)
-    finally:
-        os.close(dir_fd)
-
-
 def _rollback_file(realpath: str, directory: str, old_bytes: bytes | None,
-                   first: BaseException) -> None:
-    # Restore the exact pre-call bytes while the exclusive lock is held,
-    # or remove a ledger that did not exist beforehand, then sync the
-    # directory. A failed recovery chains after the original error.
-    try:
-        if old_bytes is None:
-            try:
-                os.unlink(realpath)
-            except FileNotFoundError:
-                pass
-        else:
-            fd, tmp_path = tempfile.mkstemp(
-                dir=directory, prefix=".execution-restore-", suffix=".tmp")
-            try:
-                with os.fdopen(fd, "wb") as handle:
-                    handle.write(old_bytes)
-                    handle.flush()
-                    os.fsync(handle.fileno())
-                os.replace(tmp_path, realpath)
-            except BaseException:
-                with contextlib.suppress(OSError):
-                    os.unlink(tmp_path)
-                raise
-        _fsync_directory(directory)
-    except OSError as recovery:
-        raise recovery from first
+                   first: BaseException,
+                   fsync_dir=_lifecycle.fsync_directory) -> None:
+    _lifecycle.rollback_file(realpath, directory, old_bytes, first,
+                             prefix=".execution-restore-",
+                             fsync_dir=fsync_dir)
+
+
+def _fsync_directory(directory: str) -> None:
+    _lifecycle.fsync_directory(directory)
 
 
 def _commit_file(realpath: str, payload: bytes,
                  old_bytes: bytes | None) -> None:
-    # One durable commit for the plan, the idempotency binding and the
-    # audit event: synced same-directory temporary, atomic replace and a
-    # directory fsync, restoring the pre-call bytes on any failure.
-    directory = os.path.dirname(realpath) or "."
-    fd, tmp_path = tempfile.mkstemp(
-        dir=directory, prefix=".execution-", suffix=".tmp")
-    try:
-        with os.fdopen(fd, "wb") as handle:
-            handle.write(payload)
-            handle.flush()
-            os.fsync(handle.fileno())
-        os.replace(tmp_path, realpath)
-    except BaseException:
-        with contextlib.suppress(OSError):
-            os.unlink(tmp_path)
-        raise
-    try:
-        _fsync_directory(directory)
-    except BaseException as first:
-        _rollback_file(realpath, directory, old_bytes, first)
-        raise
+    _lifecycle.commit_file(
+        realpath, payload, old_bytes, prefix=".execution-",
+        fsync_dir=_fsync_directory, rollback=_rollback_file)
 
 
 def _request(action: str, job_id: str, at: int, owner: str | None = None,
@@ -723,10 +622,9 @@ def plan(
         # Locks are taken in one resolved-real-path order shared by
         # every caller, so concurrent plans can never deadlock; the
         # execution ledger lock is exclusive, the input snapshots shared.
-        with contextlib.ExitStack() as stack:
-            for locked in sorted(business_reals | completion_reals):
-                stack.enter_context(
-                    _lock(locked, shared=(locked != ledger_real)))
+        with _lifecycle.lifecycle_locks(
+                business_reals | completion_reals,
+                exclusive=ledger_real, lock=_lock):
 
             accepted, job_map, job_events, job_raw = \
                 _jobs._load_submit_file(job_real)
