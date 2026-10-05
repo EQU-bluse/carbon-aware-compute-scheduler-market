@@ -26,19 +26,21 @@ structural tokens, non-ASCII written through and one trailing newline.
 and :func:`get` returns the region's latest version observed no later
 than the evaluation moment and not expired at it. The signal file is
 never rewritten by the read path.
+
+The persistence machinery -- per-real-path mutexes, the companion
+flock, canonical loading and the durable atomic commit with rollback --
+is the shared infrastructure of :mod:`carbon_market._lifecycle`; this
+module keeps only the signal ledger's own format, validation and
+wording.
 """
 
 from __future__ import annotations
 
-import contextlib
-import fcntl
 import json
 import os
-import tempfile
-import threading
-from typing import Any, Iterator
+from typing import Any
 
-from ._jsonio import finite_loads
+from . import _lifecycle
 
 __all__ = ["publish", "get"]
 
@@ -50,50 +52,14 @@ _RECORD_FIELDS = ("region", "version", "observed", "expires", "mix",
                   "unit_cost", "carbon_intensity")
 _ROOT_FIELDS = ("version", "history", "idempotency", "audit")
 _EVENT_FIELDS = ("key", "region", "version")
-_LOCK_SUFFIX = ".lock"
 
-
-class _Store:
-    def __init__(self, realpath: str) -> None:
-        self.realpath = realpath
-        self.lock = threading.Lock()
-
-
-_stores_lock = threading.Lock()
-_stores: dict[str, _Store] = {}
-
-
-def _get_store(path: str) -> _Store:
-    realpath = os.path.realpath(path)
-    with _stores_lock:
-        store = _stores.get(realpath)
-        if store is None:
-            store = _Store(realpath)
-            _stores[realpath] = store
-        return store
-
-
-def _is_plain_int(value: object) -> bool:
-    # bool is a subclass of int and must be rejected.
-    return isinstance(value, int) and not isinstance(value, bool)
-
-
-@contextlib.contextmanager
-def _process_lock(realpath: str, *, shared: bool = False) -> Iterator[None]:
-    # The companion lock file is never unlinked; the kernel releases the
-    # flock on process exit, so a leftover lock never blocks a later
-    # call. Equivalent real paths in different processes therefore share
-    # the same exclusive lock as the per-realpath in-process lock.
-    lock_path = realpath + _LOCK_SUFFIX
-    fd = os.open(lock_path, os.O_CREAT | os.O_RDWR, 0o666)
-    try:
-        fcntl.flock(fd, fcntl.LOCK_SH if shared else fcntl.LOCK_EX)
-        try:
-            yield
-        finally:
-            fcntl.flock(fd, fcntl.LOCK_UN)
-    finally:
-        os.close(fd)
+# The shared persistence infrastructure, bound to this module's names so
+# existing callers and fault-injection seams keep working.
+_Store = _lifecycle.Store
+_get_store = _lifecycle.get_store
+_is_plain_int = _lifecycle.is_plain_int
+_check_sorted_keys = _lifecycle.check_sorted_keys
+_process_lock = _lifecycle.file_lock
 
 
 def _normalize_mix(mix: object) -> dict[str, int]:
@@ -148,12 +114,6 @@ def _normalize_signal(signal: object) -> dict[str, Any]:
     }
     _check_values(normalized)
     return normalized
-
-
-def _check_sorted_keys(mapping: dict[Any, Any], label: str) -> None:
-    keys = list(mapping)
-    if keys != sorted(keys):
-        raise ValueError(f"{label} must be ordered by key code point")
 
 
 def _validate_structure(data: object) -> tuple[
@@ -281,73 +241,39 @@ def _serialize(
     return text.encode("utf-8")
 
 
+def _canonical_sections(
+    sections: tuple[dict[str, list[dict[str, Any]]], dict[str, str],
+                    dict[str, dict[str, Any]]],
+) -> bytes:
+    history, idempotency, events = sections
+    return _serialize(history, idempotency, events)
+
+
 def _load_file(realpath: str) -> tuple[
     dict[str, list[dict[str, Any]]], dict[str, str],
     dict[str, dict[str, Any]], bytes | None
 ]:
-    try:
-        with open(realpath, "rb") as handle:
-            raw = handle.read()
-    except FileNotFoundError:
-        return {}, {}, {}, None
-
-    try:
-        text = raw.decode("utf-8")
-    except UnicodeDecodeError as exc:
-        raise ValueError(
-            f"signal file {realpath!r} is not valid UTF-8") from exc
-    try:
-        # Negative-zero and non-finite literals are format errors.
-        data = finite_loads(text)
-    except ValueError as exc:
-        raise ValueError(
-            f"signal file {realpath!r} is not valid JSON") from exc
-    history, idempotency, events = _validate_structure(data)
     # Every read entry requires the on-disk bytes to be the canonical
     # form: fields and keys in their original order, compact JSON with
-    # non-ASCII written through and exactly one trailing newline.
-    if raw != _serialize(history, idempotency, events):
-        raise ValueError(
-            f"signal file {realpath!r} is not in canonical compact form")
+    # non-ASCII written through and exactly one trailing newline. A
+    # missing file maps to the empty initial state.
+    sections, raw = _lifecycle.load_canonical(
+        realpath, "signal file", _validate_structure, _canonical_sections)
+    if sections is None:
+        return {}, {}, {}, None
+    history, idempotency, events = sections
     return history, idempotency, events, raw
 
 
 def _fsync_directory(directory: str) -> None:
-    dir_fd = os.open(directory, os.O_RDONLY)
-    try:
-        os.fsync(dir_fd)
-    finally:
-        os.close(dir_fd)
+    _lifecycle.fsync_directory(directory)
 
 
 def _rollback_file(realpath: str, directory: str,
                    old_bytes: bytes | None, first: BaseException) -> None:
-    # Restore the exact pre-call bytes while the exclusive lock is held:
-    # stage them back over the replaced file, or remove a file that did
-    # not exist beforehand, then sync the directory. A failed recovery
-    # surfaces chained after the original error.
-    try:
-        if old_bytes is None:
-            try:
-                os.unlink(realpath)
-            except FileNotFoundError:
-                pass
-        else:
-            fd, tmp_path = tempfile.mkstemp(
-                dir=directory, prefix=".signals-restore-", suffix=".tmp")
-            try:
-                with os.fdopen(fd, "wb") as handle:
-                    handle.write(old_bytes)
-                    handle.flush()
-                    os.fsync(handle.fileno())
-                os.replace(tmp_path, realpath)
-            except BaseException:
-                with contextlib.suppress(OSError):
-                    os.unlink(tmp_path)
-                raise
-        _fsync_directory(directory)
-    except OSError as recovery:
-        raise recovery from first
+    _lifecycle.rollback_file(realpath, directory, old_bytes, first,
+                             prefix=".signals-restore-",
+                             fsync_dir=_fsync_directory)
 
 
 def _commit_file(realpath: str, payload: bytes,
@@ -357,24 +283,8 @@ def _commit_file(realpath: str, payload: bytes,
     # directory fsync. Any failure after the replace restores the
     # pre-call bytes, so an unsuccessful publish leaves the original file
     # byte-for-byte.
-    directory = os.path.dirname(realpath) or "."
-    fd, tmp_path = tempfile.mkstemp(
-        dir=directory, prefix=".signals-", suffix=".tmp")
-    try:
-        with os.fdopen(fd, "wb") as handle:
-            handle.write(payload)
-            handle.flush()
-            os.fsync(handle.fileno())
-        os.replace(tmp_path, realpath)
-    except BaseException:
-        with contextlib.suppress(OSError):
-            os.unlink(tmp_path)
-        raise
-    try:
-        _fsync_directory(directory)
-    except BaseException as first:
-        _rollback_file(realpath, directory, old_bytes, first)
-        raise
+    _lifecycle.commit_file(realpath, payload, old_bytes,
+                           prefix=".signals-", fsync_dir=_fsync_directory)
 
 
 def _publish_locked(

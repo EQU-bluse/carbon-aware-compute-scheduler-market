@@ -1,13 +1,14 @@
-"""Persistence infrastructure shared by the lifecycle ledgers.
+"""Persistence infrastructure shared by the persistent ledgers.
 
-The dispatch, execution and completion ledgers persist the same shape
-of document -- canonical compact JSON sections plus an idempotency map
-and an audit trail, committed one section set at a time -- and protect
-it the same way: one in-process mutex per resolved real path, a
-companion ``.lock`` file carrying ``flock`` shared/exclusive locks
-across processes, and a synced same-directory temporary file atomically
-renamed over the ledger with its directory fsynced and the pre-call
-bytes restored on failure.
+The dispatch, execution and completion ledgers and the live market
+inputs (the resource-supply registry and the signal ledger) persist the
+same shape of document -- canonical compact JSON sections plus an
+idempotency map and an audit trail, committed one section set at a
+time -- and protect it the same way: one in-process mutex per resolved
+real path, a companion ``.lock`` file carrying ``flock``
+shared/exclusive locks across processes, and a synced same-directory
+temporary file atomically renamed over the ledger with its directory
+fsynced and the pre-call bytes restored on failure.
 
 This module holds exactly that shared machinery:
 
