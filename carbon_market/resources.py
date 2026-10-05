@@ -28,16 +28,13 @@ file is not a supply file.
 from __future__ import annotations
 
 import contextlib
-import fcntl
 import json
 import os
-import tempfile
-import threading
-from typing import Any, Iterator
+from typing import Any
 
+from . import _lifecycle
 from . import jobs as _jobs
 from . import signals as _signals
-from ._jsonio import finite_loads
 
 __all__ = ["publish", "get", "feasible", "feasible_live"]
 
@@ -48,50 +45,15 @@ _RECORD_FIELDS = ("resource_id", "version", "region", "capacity", "start",
                   "end", "unit_cost", "carbon_intensity", "residency")
 _ROOT_FIELDS = ("version", "history", "idempotency", "audit")
 _EVENT_FIELDS = ("key", "resource_id", "version")
-_LOCK_SUFFIX = ".lock"
 
-
-class _Store:
-    def __init__(self, realpath: str) -> None:
-        self.realpath = realpath
-        self.lock = threading.Lock()
-
-
-_stores_lock = threading.Lock()
-_stores: dict[str, _Store] = {}
-
-
-def _get_store(path: str) -> _Store:
-    realpath = os.path.realpath(path)
-    with _stores_lock:
-        store = _stores.get(realpath)
-        if store is None:
-            store = _Store(realpath)
-            _stores[realpath] = store
-        return store
-
-
-def _is_plain_int(value: object) -> bool:
-    # bool is a subclass of int and must be rejected.
-    return isinstance(value, int) and not isinstance(value, bool)
-
-
-@contextlib.contextmanager
-def _process_lock(realpath: str, *, shared: bool = False) -> Iterator[None]:
-    # The companion lock file is never unlinked; the kernel releases the
-    # flock on process exit, so a leftover lock never blocks a later
-    # call. Equivalent real paths in different processes therefore share
-    # the same exclusive lock as the per-realpath in-process lock.
-    lock_path = realpath + _LOCK_SUFFIX
-    fd = os.open(lock_path, os.O_CREAT | os.O_RDWR, 0o666)
-    try:
-        fcntl.flock(fd, fcntl.LOCK_SH if shared else fcntl.LOCK_EX)
-        try:
-            yield
-        finally:
-            fcntl.flock(fd, fcntl.LOCK_UN)
-    finally:
-        os.close(fd)
+# The in-process mutex registry, the companion flock, the small input
+# checks and the synced atomic commit live in the shared lifecycle
+# infrastructure; the names are kept as the module's own seams.
+_Store = _lifecycle.Store
+_get_store = _lifecycle.get_store
+_is_plain_int = _lifecycle.is_plain_int
+_check_sorted_keys = _lifecycle.check_sorted_keys
+_process_lock = _lifecycle.file_lock
 
 
 def _check_values(resource: dict[str, Any]) -> None:
@@ -152,12 +114,6 @@ def _normalize_resource(resource: object) -> dict[str, Any]:
     _check_values(normalized)
     normalized["residency"] = list(normalized["residency"])
     return normalized
-
-
-def _check_sorted_keys(mapping: dict[Any, Any], label: str) -> None:
-    keys = list(mapping)
-    if keys != sorted(keys):
-        raise ValueError(f"{label} must be ordered by key code point")
 
 
 def _validate_structure(data: object) -> tuple[
@@ -272,53 +228,6 @@ def _validate_structure(data: object) -> tuple[
     return history, idempotency, events
 
 
-def _canonical_bytes(
-    history: dict[str, list[dict[str, Any]]],
-    idempotency: dict[str, str],
-    events: dict[str, dict[str, Any]],
-) -> bytes:
-    # The canonical wire form every reader accepts: compact UTF-8 JSON
-    # with non-ASCII written through, sections in their fixed field order
-    # and each section's primary keys in code-point order, terminated by
-    # exactly one newline. The round trip also rejects duplicate keys
-    # (json.loads keeps the last occurrence) and any escaping of
-    # non-ASCII characters that json.dumps would write through.
-    return _serialize(history, idempotency, events)
-
-
-def _load_file(realpath: str) -> tuple[
-    dict[str, list[dict[str, Any]]], dict[str, str],
-    dict[str, dict[str, Any]], bytes | None
-]:
-    try:
-        with open(realpath, "rb") as handle:
-            raw = handle.read()
-    except FileNotFoundError:
-        return {}, {}, {}, None
-
-    try:
-        text = raw.decode("utf-8")
-    except UnicodeDecodeError as exc:
-        raise ValueError(
-            f"supply file {realpath!r} is not valid UTF-8") from exc
-    try:
-        # Negative-zero and non-finite literals are format errors.
-        data = finite_loads(text)
-    except ValueError as exc:
-        raise ValueError(
-            f"supply file {realpath!r} is not valid JSON") from exc
-    history, idempotency, events = _validate_structure(data)
-    # Every read entry requires the on-disk bytes to be the canonical
-    # form: fields and keys in their original order, compact JSON with
-    # non-ASCII written through and exactly one trailing newline. Any
-    # extra whitespace, escaped non-ASCII character, reordered field or
-    # missing/duplicated final newline is a ValueError.
-    if raw != _canonical_bytes(history, idempotency, events):
-        raise ValueError(
-            f"supply file {realpath!r} is not in canonical compact form")
-    return history, idempotency, events, raw
-
-
 def _serialize(
     history: dict[str, list[dict[str, Any]]],
     idempotency: dict[str, str],
@@ -338,42 +247,49 @@ def _serialize(
     return text.encode("utf-8")
 
 
+def _canonical_bytes(
+    history: dict[str, list[dict[str, Any]]],
+    idempotency: dict[str, str],
+    events: dict[str, dict[str, Any]],
+) -> bytes:
+    # The canonical wire form every reader accepts: compact UTF-8 JSON
+    # with non-ASCII written through, sections in their fixed field order
+    # and each section's primary keys in code-point order, terminated by
+    # exactly one newline. The round trip also rejects duplicate keys
+    # (json.loads keeps the last occurrence) and any escaping of
+    # non-ASCII characters that json.dumps would write through.
+    return _serialize(history, idempotency, events)
+
+
+def _canonical_sections(
+    sections: tuple[dict[str, list[dict[str, Any]]], dict[str, str],
+                    dict[str, dict[str, Any]]],
+) -> bytes:
+    history, idempotency, events = sections
+    return _canonical_bytes(history, idempotency, events)
+
+
+def _load_file(realpath: str) -> tuple[
+    dict[str, list[dict[str, Any]]], dict[str, str],
+    dict[str, dict[str, Any]], bytes | None
+]:
+    sections, raw = _lifecycle.load_canonical(
+        realpath, "supply file", _validate_structure, _canonical_sections)
+    if sections is None:
+        return {}, {}, {}, None
+    history, idempotency, events = sections
+    return history, idempotency, events, raw
+
+
 def _fsync_directory(directory: str) -> None:
-    dir_fd = os.open(directory, os.O_RDONLY)
-    try:
-        os.fsync(dir_fd)
-    finally:
-        os.close(dir_fd)
+    _lifecycle.fsync_directory(directory)
 
 
 def _rollback_file(realpath: str, directory: str,
                    old_bytes: bytes | None, first: BaseException) -> None:
-    # Restore the exact pre-call bytes while the exclusive lock is held:
-    # stage them back over the replaced file, or remove a file that did
-    # not exist beforehand, then sync the directory. A failed recovery
-    # surfaces chained after the original error.
-    try:
-        if old_bytes is None:
-            try:
-                os.unlink(realpath)
-            except FileNotFoundError:
-                pass
-        else:
-            fd, tmp_path = tempfile.mkstemp(
-                dir=directory, prefix=".resources-restore-", suffix=".tmp")
-            try:
-                with os.fdopen(fd, "wb") as handle:
-                    handle.write(old_bytes)
-                    handle.flush()
-                    os.fsync(handle.fileno())
-                os.replace(tmp_path, realpath)
-            except BaseException:
-                with contextlib.suppress(OSError):
-                    os.unlink(tmp_path)
-                raise
-        _fsync_directory(directory)
-    except OSError as recovery:
-        raise recovery from first
+    _lifecycle.rollback_file(realpath, directory, old_bytes, first,
+                             prefix=".resources-restore-",
+                             fsync_dir=_fsync_directory)
 
 
 def _commit_file(realpath: str, payload: bytes,
@@ -383,24 +299,8 @@ def _commit_file(realpath: str, payload: bytes,
     # directory fsync. Any failure after the replace restores the
     # pre-call bytes, so an unsuccessful publish leaves the original file
     # byte-for-byte.
-    directory = os.path.dirname(realpath) or "."
-    fd, tmp_path = tempfile.mkstemp(
-        dir=directory, prefix=".resources-", suffix=".tmp")
-    try:
-        with os.fdopen(fd, "wb") as handle:
-            handle.write(payload)
-            handle.flush()
-            os.fsync(handle.fileno())
-        os.replace(tmp_path, realpath)
-    except BaseException:
-        with contextlib.suppress(OSError):
-            os.unlink(tmp_path)
-        raise
-    try:
-        _fsync_directory(directory)
-    except BaseException as first:
-        _rollback_file(realpath, directory, old_bytes, first)
-        raise
+    _lifecycle.commit_file(realpath, payload, old_bytes,
+                           prefix=".resources-", fsync_dir=_fsync_directory)
 
 
 def publish(
