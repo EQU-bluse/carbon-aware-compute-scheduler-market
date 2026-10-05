@@ -562,13 +562,17 @@ def _completion_capacity_envelope(
     trades: dict[str, dict[str, Any]],
     completed: dict[str, dict[str, Any]],
     history: dict[str, list[dict[str, Any]]],
+    cancelled: dict[str, dict[str, Any]] | None = None,
 ) -> None:
     # Replay every capacity-changing event per exact resource version:
     # a trade books its work at its evaluation moment, and the job's
     # completion releases that traded occupancy again at the completion
     # moment regardless of its migration history -- completion is the
-    # terminal event, after which a job occupies nothing. Releasing at
-    # the completion moment is conservative for jobs that migrated away
+    # terminal event, after which a job occupies nothing. A recorded
+    # cancellation likewise releases the traded occupancy at the
+    # cancellation moment: the job never entered dispatch, so nothing
+    # but the booking itself is given back. Releasing at the completion
+    # moment is conservative for jobs that migrated away
     # earlier (their source frees at the switch, which this trades-only
     # view cannot see): reuse between switch and completion stays
     # counted, reuse from the completion moment on is accepted. Releases
@@ -588,6 +592,11 @@ def _completion_capacity_envelope(
         if record is not None:
             events.setdefault(slot, []).append(
                 (record["at"], 0, trade["work"]))
+        if cancelled:
+            cancellation = cancelled.get(job_id)
+            if cancellation is not None:
+                events.setdefault(slot, []).append(
+                    (cancellation["at"], 0, trade["work"]))
     for slot, slot_events in events.items():
         running = 0
         # Releases (kind 0) before bookings (kind 1) at the same moment.
@@ -610,6 +619,7 @@ def _validate_clear_ledger(
     history: dict[str, list[dict[str, Any]]],
     signal_history: dict[str, list[dict[str, Any]]] | None = None,
     completed: dict[str, dict[str, Any]] | None = None,
+    cancelled: dict[str, dict[str, Any]] | None = None,
 ) -> tuple[dict[str, dict[str, Any]], dict[str, dict[str, Any]]]:
     if not isinstance(data, dict) or set(data.keys()) != set(_CLEAR_ROOT_FIELDS):
         raise ValueError("clearing ledger root must be an object with keys "
@@ -708,11 +718,13 @@ def _validate_clear_ledger(
         raise ValueError("every trade must be bound to an idempotency key")
 
     # Recorded bookings may not oversell any published version at any
-    # moment. Without a completion snapshot the historical aggregate is
-    # the same as before; with one, releases complete bookings opened
-    # and only the running envelope must stay within capacity.
-    if completed:
-        _completion_capacity_envelope(trades, completed, history)
+    # moment. Without a completion or cancellation snapshot the
+    # historical aggregate is the same as before; with one, releases
+    # complete bookings opened and only the running envelope must stay
+    # within capacity.
+    if completed or cancelled:
+        _completion_capacity_envelope(trades, completed or {}, history,
+                                      cancelled)
     else:
         booked: dict[tuple[str, int], int] = {}
         for trade in trades.values():
@@ -755,6 +767,7 @@ def _load_clear_ledger(
     history: dict[str, list[dict[str, Any]]],
     signal_history: dict[str, list[dict[str, Any]]] | None = None,
     completion_paths: list[str] | None = None,
+    cancelled: dict[str, dict[str, Any]] | None = None,
 ) -> tuple[dict[str, dict[str, Any]], dict[str, dict[str, Any]], bytes | None]:
     try:
         with open(realpath, "rb") as handle:
@@ -782,7 +795,7 @@ def _load_clear_ledger(
     completed = _load_completion_union(
         completion_paths or (), accepted, history)
     trades, idempotency = _validate_clear_ledger(
-        data, accepted, history, signal_history, completed)
+        data, accepted, history, signal_history, completed, cancelled)
     # As for the supply file, the ledger is accepted only in canonical
     # compact form with a single trailing newline.
     if raw != _canonical_clear_bytes(trades, idempotency):
@@ -861,6 +874,7 @@ def clear(
     key: str,
     at: int,
     completions: str | None = None,
+    cancellations: str | None = None,
 ) -> tuple[dict[str, object], bool]:
     """Clear one accepted job against the versioned supply idempotently.
 
@@ -900,6 +914,17 @@ def clear(
     leaving a ledger or temporary fragment. Invalid structure,
     references, ordering or canonical bytes raise ``ValueError``; other
     locking, read/write or sync failures raise ``OSError``.
+
+    When ``cancellations`` names a cancellation ledger, it is read as
+    part of the same snapshot under its shared lock: a trade whose job
+    was cancelled at a moment not later than ``at`` no longer deducts
+    capacity from its exact resource version (the running capacity
+    envelope accepts the reuse symmetrically), and a cancelled job is
+    refused a new trade with ``ValueError`` -- replaying the original
+    trade's idempotency key with an equivalent request still returns
+    the stored trade with ``False``, since a cancellation never
+    rewrites history. Omitting the argument keeps every result, file
+    format and exception exactly as before.
     """
     for value in (jobs, supply, ledger, job_id, key):
         if not isinstance(value, str) or not value:
@@ -910,6 +935,9 @@ def clear(
     if completions is not None and (
             not isinstance(completions, str) or not completions):
         raise ValueError("completions must be a non-empty string or None")
+    if cancellations is not None and (
+            not isinstance(cancellations, str) or not cancellations):
+        raise ValueError("cancellations must be a non-empty string or None")
 
     job_real = os.path.realpath(jobs)
     supply_real = os.path.realpath(supply)
@@ -919,6 +947,12 @@ def clear(
                        if completions is not None else None)
     if completion_real is not None and completion_real in business_paths:
         raise ValueError("completions must be a distinct real path")
+    cancellation_real = (os.path.realpath(cancellations)
+                         if cancellations is not None else None)
+    if cancellation_real is not None and (
+            cancellation_real in business_paths
+            or cancellation_real == completion_real):
+        raise ValueError("cancellations must be a distinct real path")
     # Completion ledgers beside the snapshots are part of the physical
     # ledger state and must be locked in the same global order; they are
     # discovered before any lock is taken, so a concurrent completion
@@ -929,6 +963,10 @@ def clear(
             not in completion_paths:
         completion_paths.append(completion_real)
     locked_paths = business_paths | set(completion_paths)
+    if cancellation_real is not None:
+        # The explicitly named cancellation ledger is part of the
+        # snapshot and is shared in the same global lock order.
+        locked_paths = locked_paths | {cancellation_real}
     if len({job_real, supply_real, ledger_real}) != 3:
         raise ValueError("jobs, supply and ledger paths must be distinct "
                          "real paths")
@@ -977,9 +1015,35 @@ def clear(
                 released_jobs = {
                     job for job, record in completion_union.items()
                     if record["at"] <= at}
+            # The explicitly named cancellation ledger is part of the
+            # same snapshot: its records release their trade's occupancy
+            # from the cancellation moment on and bar the job from any
+            # new trade. Omitting the argument keeps the historical
+            # result (every trade still occupies its booked version).
+            cancelled_by_job: dict[str, dict[str, Any]] = {}
+            if cancellation_real is not None:
+                from . import cancellation as _cancellation
+                cancellation_records, _cancel_keys, _cancel_events, \
+                    cancellation_raw = \
+                    _cancellation._load_cancellation_ledger(
+                        cancellation_real, accepted, history)
+                if cancellation_raw is None:
+                    raise FileNotFoundError(
+                        f"cancellation ledger {cancellation_real!r} does "
+                        "not exist")
+                cancelled_by_job = {
+                    record["job_id"]: record
+                    for record in cancellation_records.values()}
+                released_jobs |= {
+                    job for job, record in cancelled_by_job.items()
+                    if record["at"] <= at}
             trades, idempotency, old_bytes = _load_clear_ledger(
                 ledger_real, accepted, history,
-                completion_paths=completion_paths)
+                completion_paths=completion_paths,
+                cancelled=cancelled_by_job or None)
+            if cancellation_real is not None:
+                _cancellation._check_records_against_trades(
+                    cancellation_records, trades)
 
             job = accepted.get(job_id)
             if job is None:
@@ -994,13 +1058,16 @@ def clear(
             if job_id in trades:
                 raise ValueError("job is already traded under another "
                                  "idempotency key")
+            if job_id in cancelled_by_job:
+                raise ValueError("job is cancelled and cannot be traded "
+                                 "again")
 
             # Capacity already sold per exact resource version; replays
             # never re-enter this path, so every recorded trade counts
             # exactly once and bookings never cross versions. A job
-            # whose completion is already effective at the evaluation
-            # moment has released its booked occupancy, so its trade no
-            # longer deducts capacity.
+            # whose completion or cancellation is already effective at
+            # the evaluation moment has released its booked occupancy,
+            # so its trade no longer deducts capacity.
             sold: dict[tuple[str, int], int] = {}
             for traded_job, trade in trades.items():
                 if traded_job in released_jobs:
@@ -1077,6 +1144,7 @@ def clear_live(
     key: str,
     at: int,
     completions: str | None = None,
+    cancellations: str | None = None,
 ) -> tuple[dict[str, object], bool]:
     """Clear one accepted job against live signals idempotently.
 
@@ -1123,6 +1191,16 @@ def clear_live(
     other locking, read/write or sync failures raise ``OSError``. The
     existing :func:`match`, :func:`clear`, the ``resources`` interfaces,
     serving and HTTP behavior are unchanged.
+
+    When ``cancellations`` names a cancellation ledger it is read as
+    part of the same snapshot under its shared lock, exactly as in
+    :func:`clear`: a trade whose job was cancelled at a moment not
+    later than ``at`` no longer deducts capacity from its exact
+    resource version, and a cancelled job is refused a new trade with
+    ``ValueError`` -- replaying the original trade's idempotency key
+    with an equivalent request still returns the stored trade with
+    ``False``. Omitting the argument keeps every result, file format
+    and exception exactly as before.
     """
     for value in (jobs, supply, signals, ledger, job_id, key):
         if not isinstance(value, str) or not value:
@@ -1133,6 +1211,9 @@ def clear_live(
     if completions is not None and (
             not isinstance(completions, str) or not completions):
         raise ValueError("completions must be a non-empty string or None")
+    if cancellations is not None and (
+            not isinstance(cancellations, str) or not cancellations):
+        raise ValueError("cancellations must be a non-empty string or None")
 
     job_real = os.path.realpath(jobs)
     supply_real = os.path.realpath(supply)
@@ -1143,12 +1224,22 @@ def clear_live(
                        if completions is not None else None)
     if completion_real is not None and completion_real in business_paths:
         raise ValueError("completions must be a distinct real path")
+    cancellation_real = (os.path.realpath(cancellations)
+                         if cancellations is not None else None)
+    if cancellation_real is not None and (
+            cancellation_real in business_paths
+            or cancellation_real == completion_real):
+        raise ValueError("cancellations must be a distinct real path")
     completion_paths = _discover_completion_paths(
         (job_real, supply_real, signal_real, ledger_real))
     if completion_real is not None and completion_real \
             not in completion_paths:
         completion_paths.append(completion_real)
     locked_paths = business_paths | set(completion_paths)
+    if cancellation_real is not None:
+        # The explicitly named cancellation ledger is part of the
+        # snapshot and is shared in the same global lock order.
+        locked_paths = locked_paths | {cancellation_real}
     if len(business_paths) != 4:
         raise ValueError("jobs, supply, signals and ledger paths must be "
                          "distinct real paths")
@@ -1191,12 +1282,38 @@ def clear_live(
                 released_jobs = {
                     job for job, record in completion_union.items()
                     if record["at"] <= at}
+            # The explicitly named cancellation ledger is part of the
+            # same snapshot: its records release their trade's occupancy
+            # from the cancellation moment on and bar the job from any
+            # new trade. Omitting the argument keeps the historical
+            # result (every trade still occupies its booked version).
+            cancelled_by_job: dict[str, dict[str, Any]] = {}
+            if cancellation_real is not None:
+                from . import cancellation as _cancellation
+                cancellation_records, _cancel_keys, _cancel_events, \
+                    cancellation_raw = \
+                    _cancellation._load_cancellation_ledger(
+                        cancellation_real, accepted, history)
+                if cancellation_raw is None:
+                    raise FileNotFoundError(
+                        f"cancellation ledger {cancellation_real!r} does "
+                        "not exist")
+                cancelled_by_job = {
+                    record["job_id"]: record
+                    for record in cancellation_records.values()}
+                released_jobs |= {
+                    job for job, record in cancelled_by_job.items()
+                    if record["at"] <= at}
             # The ledger now accepts live trades, each freezing the
             # signal version it priced on; static trades validate as
             # before.
             trades, idempotency, old_bytes = _load_clear_ledger(
                 ledger_real, accepted, history, signal_history,
-                completion_paths=completion_paths)
+                completion_paths=completion_paths,
+                cancelled=cancelled_by_job or None)
+            if cancellation_real is not None:
+                _cancellation._check_records_against_trades(
+                    cancellation_records, trades)
 
             job = accepted.get(job_id)
             if job is None:
@@ -1211,13 +1328,16 @@ def clear_live(
             if job_id in trades:
                 raise ValueError("job is already traded under another "
                                  "idempotency key")
+            if job_id in cancelled_by_job:
+                raise ValueError("job is cancelled and cannot be traded "
+                                 "again")
 
             # Capacity already sold per exact resource version counts
             # every trade -- static and live alike -- so either clearing
             # path can oversell, and bookings never cross versions. A
-            # job whose completion is already effective at the moment
-            # has released its booked occupancy, so its trade no longer
-            # deducts capacity.
+            # job whose completion or cancellation is already effective
+            # at the moment has released its booked occupancy, so its
+            # trade no longer deducts capacity.
             sold: dict[tuple[str, int], int] = {}
             for traded_job, trade in trades.items():
                 if traded_job in released_jobs:
