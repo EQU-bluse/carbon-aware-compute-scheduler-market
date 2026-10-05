@@ -8,6 +8,7 @@ import urllib.parse
 from collections.abc import Callable
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from typing import NamedTuple
 
 from . import acceptance, audit, audit_proof, auth, completion, \
     metrics as metrics_mod, migration_batch, signal_ingest
@@ -76,30 +77,118 @@ _MAX_LIMIT = 1000
 # of the full validated response bytes. Weak tags, lists, wildcards and
 # surrounding whitespace are invalid requests.
 _ETAG_RE = re.compile(r'"[0-9a-f]{64}"')
-# The read-only conditional queries -- the checkpoint download, GET
-# /acceptance and GET /completions -- share one request pipeline (see
-# Handler._snapshot_query); each entry keeps only its own error names
-# here. "missing" is the absent ledger or checkpoint, "unknown" the
-# absent exact-lookup key (the checkpoint download has no exact lookup
-# and its snapshot read never raises KeyError), "invalid" the
-# non-canonical content and "unavailable" any other I/O failure.
-_CHECKPOINT_ERRORS = {
-    "missing": "checkpoint_not_found",
-    "invalid": "checkpoint_invalid",
-    "unavailable": "checkpoint_unavailable",
-}
-_ACCEPTANCE_ERRORS = {
-    "missing": "acceptance_not_found",
-    "unknown": "acceptance_key_not_found",
-    "invalid": "acceptance_invalid",
-    "unavailable": "acceptance_unavailable",
-}
-_COMPLETION_ERRORS = {
-    "missing": "completion_not_found",
-    "unknown": "completion_job_not_found",
-    "invalid": "completion_invalid",
-    "unavailable": "completion_unavailable",
-}
+# Every read-only GET entry runs one shared request pipeline (see
+# Handler._read_request): token identity, the entry's own query string
+# and -- for a conditional entry -- the If-None-Match header, the scope
+# decision, and only then the snapshot read and the response. What
+# remains per-entry is the parameter set, the scope target, the
+# snapshot read and the error names, kept in the tables below. Each
+# table maps an exception type to the entry's own status and public
+# error name; the first matching entry decides, so dedicated
+# subclasses come before their bases. "missing" is the absent ledger
+# or checkpoint, "unknown" the absent exact-lookup key, "invalid" the
+# non-canonical content and "unavailable" any other I/O failure; the
+# response never leaks a path, a token or a system message.
+_ErrorTable = tuple[tuple[type[BaseException], HTTPStatus, str], ...]
+_CHECKPOINT_ERRORS: _ErrorTable = (
+    (FileNotFoundError, HTTPStatus.NOT_FOUND, "checkpoint_not_found"),
+    (ValueError, HTTPStatus.CONFLICT, "checkpoint_invalid"),
+    (OSError, HTTPStatus.SERVICE_UNAVAILABLE, "checkpoint_unavailable"),
+)
+_ACCEPTANCE_ERRORS: _ErrorTable = (
+    (FileNotFoundError, HTTPStatus.NOT_FOUND, "acceptance_not_found"),
+    (KeyError, HTTPStatus.NOT_FOUND, "acceptance_key_not_found"),
+    (ValueError, HTTPStatus.CONFLICT, "acceptance_invalid"),
+    (OSError, HTTPStatus.SERVICE_UNAVAILABLE, "acceptance_unavailable"),
+)
+_COMPLETION_ERRORS: _ErrorTable = (
+    (FileNotFoundError, HTTPStatus.NOT_FOUND, "completion_not_found"),
+    (KeyError, HTTPStatus.NOT_FOUND, "completion_job_not_found"),
+    (ValueError, HTTPStatus.CONFLICT, "completion_invalid"),
+    (OSError, HTTPStatus.SERVICE_UNAVAILABLE, "completion_unavailable"),
+)
+_AUDIT_ERRORS: _ErrorTable = (
+    (FileNotFoundError, HTTPStatus.NOT_FOUND, "audit_not_found"),
+    (ValueError, HTTPStatus.CONFLICT, "audit_invalid"),
+    (OSError, HTTPStatus.SERVICE_UNAVAILABLE, "audit_unavailable"),
+)
+_PROOF_ERRORS: _ErrorTable = (
+    (FileNotFoundError, HTTPStatus.NOT_FOUND, "proof_not_found"),
+    (ValueError, HTTPStatus.CONFLICT, "proof_invalid"),
+    (OSError, HTTPStatus.SERVICE_UNAVAILABLE, "proof_unavailable"),
+)
+_MIGRATION_BATCHES_ERRORS: _ErrorTable = (
+    (FileNotFoundError, HTTPStatus.NOT_FOUND,
+     "migration_batches_not_found"),
+    (KeyError, HTTPStatus.NOT_FOUND, "migration_batch_not_found"),
+    (ValueError, HTTPStatus.CONFLICT, "migration_batches_invalid"),
+    (OSError, HTTPStatus.SERVICE_UNAVAILABLE,
+     "migration_batches_unavailable"),
+)
+_MIGRATION_EVENTS_ERRORS: _ErrorTable = (
+    (FileNotFoundError, HTTPStatus.NOT_FOUND,
+     "migration_batches_not_found"),
+    (ValueError, HTTPStatus.CONFLICT, "migration_batches_invalid"),
+    (OSError, HTTPStatus.SERVICE_UNAVAILABLE,
+     "migration_batches_unavailable"),
+)
+# The read-only consumer queries share the scope-stage table (the
+# persisted subscription read) and keep their own fetch-stage tables.
+_CONSUMER_SCOPE_ERRORS: _ErrorTable = (
+    (KeyError, HTTPStatus.NOT_FOUND, "migration_consumer_not_found"),
+    (migration_batch.ConsumerLedgerInvalid, HTTPStatus.CONFLICT,
+     "migration_consumers_invalid"),
+    (FileNotFoundError, HTTPStatus.NOT_FOUND,
+     "migration_consumers_not_found"),
+    (OSError, HTTPStatus.SERVICE_UNAVAILABLE,
+     "migration_consumers_unavailable"),
+)
+_CONSUMER_STATUS_ERRORS: _ErrorTable = (
+    (KeyError, HTTPStatus.NOT_FOUND, "migration_consumer_not_found"),
+    (LookupError, HTTPStatus.CONFLICT, "migration_consumer_checkpoint"),
+    (migration_batch.CoordinationLedgerInvalid, HTTPStatus.CONFLICT,
+     "migration_batches_invalid"),
+    (migration_batch.ConsumerLedgerInvalid, HTTPStatus.CONFLICT,
+     "migration_consumers_invalid"),
+    (migration_batch.CoordinationLedgerMissing, HTTPStatus.NOT_FOUND,
+     "migration_batches_not_found"),
+    (migration_batch.ConsumersLedgerMissing, HTTPStatus.NOT_FOUND,
+     "migration_consumers_not_found"),
+    (FileNotFoundError, HTTPStatus.NOT_FOUND,
+     "migration_consumers_not_found"),
+    (ValueError, HTTPStatus.BAD_REQUEST, "invalid_request"),
+    (OSError, HTTPStatus.SERVICE_UNAVAILABLE,
+     "migration_consumers_unavailable"),
+)
+_CONSUMER_DEAD_LETTERS_ERRORS: _ErrorTable = (
+    (KeyError, HTTPStatus.NOT_FOUND, "migration_consumer_not_found"),
+    (migration_batch.ConsumerLedgerInvalid, HTTPStatus.CONFLICT,
+     "migration_consumers_invalid"),
+    (migration_batch.ConsumersLedgerMissing, HTTPStatus.NOT_FOUND,
+     "migration_consumers_not_found"),
+    (FileNotFoundError, HTTPStatus.NOT_FOUND,
+     "migration_consumers_not_found"),
+    (ValueError, HTTPStatus.BAD_REQUEST, "invalid_request"),
+    (OSError, HTTPStatus.SERVICE_UNAVAILABLE,
+     "migration_consumers_unavailable"),
+)
+
+
+class _Response(NamedTuple):
+    """One decided success response of the read-only pipeline.
+
+    ``kind`` is "json" to serialize ``payload`` as the endpoint's
+    compact UTF-8 JSON, "bytes" to serve the already-serialized
+    ``payload`` verbatim, or "raw" to serve ``payload`` verbatim with
+    the strong ``etag`` header -- a "raw" response whose ``payload``
+    is None is the empty 304 of a conditional hit.
+    """
+
+    kind: str
+    payload: object
+    etag: str = ""
+
+
 # The process metrics classify requests by the public fixed path with
 # the query string removed. Only these routes can open their own
 # dimension; every other path -- disabled entries included -- is
@@ -770,87 +859,22 @@ class Handler(BaseHTTPRequestHandler):
         # never opens a later stage's files.
         coordination = getattr(self.server, "migration_batches")
         consumers = getattr(self.server, "migration_consumers")
-        authorized, record = self._authorize()
-        if not authorized:
-            return
-        try:
-            params = _parse_migration_consumer_status_params(query)
-        except ValueError:
-            self._bad_request()
-            return
-        consumer = params["consumer"]
-        now = int(params["now"])
 
-        # Operation- and stage-scoped tokens can never read a consumer;
-        # an unrestricted key scope reads any subscription. A key-scoped
-        # token reads the consumer's fixed subscription from the
-        # consumer ledger at the scope stage, exactly like a pull or
-        # ack: only a fixed-batch subscription naming an allowed batch
-        # passes, while a cross-batch or job-only range needs all three
-        # scopes unrestricted. The data-plane coordination and business
-        # ledgers open only after the scope is allowed.
-        if record is not None and (record.ops is not None
-                                   or record.stages is not None):
-            self._json(HTTPStatus.FORBIDDEN, {"error": "forbidden"})
-            return
-        if record is not None and record.keys is not None:
-            try:
-                subscription = migration_batch.consumer_subscription(
-                    coordination, consumers, consumer)
-            except KeyError:
-                self._json(HTTPStatus.NOT_FOUND,
-                           {"error": "migration_consumer_not_found"})
-                return
-            except migration_batch.ConsumerLedgerInvalid:
-                self._json(HTTPStatus.CONFLICT,
-                           {"error": "migration_consumers_invalid"})
-                return
-            except FileNotFoundError:
-                self._json(HTTPStatus.NOT_FOUND,
-                           {"error": "migration_consumers_not_found"})
-                return
-            except OSError:
-                self._json(HTTPStatus.SERVICE_UNAVAILABLE,
-                           {"error": "migration_consumers_unavailable"})
-                return
-            batch_key = subscription["key"]
-            if batch_key is None or batch_key not in record.keys:
-                self._json(HTTPStatus.FORBIDDEN, {"error": "forbidden"})
-                return
+        def fetch(params: dict[str, str],
+                  _condition: str | None) -> _Response:
+            return _Response(
+                "bytes",
+                migration_batch.consumer_status_response(
+                    coordination, consumers, params["consumer"],
+                    int(params["now"])))
 
-        try:
-            payload = migration_batch.consumer_status_response(
-                coordination, consumers, consumer, now)
-        except KeyError:
-            self._json(HTTPStatus.NOT_FOUND,
-                       {"error": "migration_consumer_not_found"})
-        except LookupError:
-            # The confirmed cursor points at an event the current
-            # stream truncated, rewrote or reused: a stream regression.
-            self._json(HTTPStatus.CONFLICT,
-                       {"error": "migration_consumer_checkpoint"})
-        except migration_batch.CoordinationLedgerInvalid:
-            self._json(HTTPStatus.CONFLICT,
-                       {"error": "migration_batches_invalid"})
-        except migration_batch.ConsumerLedgerInvalid:
-            self._json(HTTPStatus.CONFLICT,
-                       {"error": "migration_consumers_invalid"})
-        except migration_batch.CoordinationLedgerMissing:
-            self._json(HTTPStatus.NOT_FOUND,
-                       {"error": "migration_batches_not_found"})
-        except migration_batch.ConsumersLedgerMissing:
-            self._json(HTTPStatus.NOT_FOUND,
-                       {"error": "migration_consumers_not_found"})
-        except FileNotFoundError:
-            self._json(HTTPStatus.NOT_FOUND,
-                       {"error": "migration_consumers_not_found"})
-        except ValueError:
-            self._json(HTTPStatus.BAD_REQUEST, {"error": "invalid_request"})
-        except OSError:
-            self._json(HTTPStatus.SERVICE_UNAVAILABLE,
-                       {"error": "migration_consumers_unavailable"})
-        else:
-            self._bytes(HTTPStatus.OK, payload)
+        self._read_request(
+            query, parse=_parse_migration_consumer_status_params,
+            conditional=False,
+            scope=lambda record, params: self._consumer_scope(
+                record, params["consumer"]),
+            fetch=fetch, scope_errors=_CONSUMER_SCOPE_ERRORS,
+            fetch_errors=_CONSUMER_STATUS_ERRORS)
 
     def _migration_consumer_dead_letters(self, query: str) -> None:
         # Read-only dead-letter query: identity, parameters, the
@@ -861,74 +885,24 @@ class Handler(BaseHTTPRequestHandler):
         # still never opens a later stage's files.
         coordination = getattr(self.server, "migration_batches")
         consumers = getattr(self.server, "migration_consumers")
-        authorized, record = self._authorize()
-        if not authorized:
-            return
-        try:
-            params = _parse_migration_dead_letters_params(query)
-        except ValueError:
-            self._bad_request()
-            return
-        consumer = params["consumer"]
-        cursor = int(params["cursor"]) if "cursor" in params else None
-        limit = int(params["limit"]) if "limit" in params else 100
 
-        # Same scope order as status: operation- and stage-scoped
-        # tokens are rejected before the subscription is read; a
-        # key-scoped token reads the fixed subscription and passes only
-        # a fixed-batch range naming an allowed batch.
-        if record is not None and (record.ops is not None
-                                   or record.stages is not None):
-            self._json(HTTPStatus.FORBIDDEN, {"error": "forbidden"})
-            return
-        if record is not None and record.keys is not None:
-            try:
-                subscription = migration_batch.consumer_subscription(
-                    coordination, consumers, consumer)
-            except KeyError:
-                self._json(HTTPStatus.NOT_FOUND,
-                           {"error": "migration_consumer_not_found"})
-                return
-            except migration_batch.ConsumerLedgerInvalid:
-                self._json(HTTPStatus.CONFLICT,
-                           {"error": "migration_consumers_invalid"})
-                return
-            except FileNotFoundError:
-                self._json(HTTPStatus.NOT_FOUND,
-                           {"error": "migration_consumers_not_found"})
-                return
-            except OSError:
-                self._json(HTTPStatus.SERVICE_UNAVAILABLE,
-                           {"error": "migration_consumers_unavailable"})
-                return
-            batch_key = subscription["key"]
-            if batch_key is None or batch_key not in record.keys:
-                self._json(HTTPStatus.FORBIDDEN, {"error": "forbidden"})
-                return
+        def fetch(params: dict[str, str],
+                  _condition: str | None) -> _Response:
+            cursor = int(params["cursor"]) if "cursor" in params else None
+            limit = int(params["limit"]) if "limit" in params else 100
+            return _Response(
+                "bytes",
+                migration_batch.consumer_dead_letters_response(
+                    coordination, consumers, params["consumer"],
+                    cursor=cursor, limit=limit))
 
-        try:
-            payload = migration_batch.consumer_dead_letters_response(
-                coordination, consumers, consumer, cursor=cursor,
-                limit=limit)
-        except KeyError:
-            self._json(HTTPStatus.NOT_FOUND,
-                       {"error": "migration_consumer_not_found"})
-        except migration_batch.ConsumerLedgerInvalid:
-            self._json(HTTPStatus.CONFLICT,
-                       {"error": "migration_consumers_invalid"})
-        except migration_batch.ConsumersLedgerMissing:
-            self._json(HTTPStatus.NOT_FOUND,
-                       {"error": "migration_consumers_not_found"})
-        except FileNotFoundError:
-            self._json(HTTPStatus.NOT_FOUND,
-                       {"error": "migration_consumers_not_found"})
-        except ValueError:
-            self._json(HTTPStatus.BAD_REQUEST, {"error": "invalid_request"})
-        except OSError:
-            self._json(HTTPStatus.SERVICE_UNAVAILABLE,
-                       {"error": "migration_consumers_unavailable"})
-        else:
-            self._bytes(HTTPStatus.OK, payload)
+        self._read_request(
+            query, parse=_parse_migration_dead_letters_params,
+            conditional=False,
+            scope=lambda record, params: self._consumer_scope(
+                record, params["consumer"]),
+            fetch=fetch, scope_errors=_CONSUMER_SCOPE_ERRORS,
+            fetch_errors=_CONSUMER_DEAD_LETTERS_ERRORS)
 
     def _authorize(self) -> tuple[bool, auth.Record | None]:
         # Authorization comes first: an unauthorized request learns nothing
@@ -988,7 +962,7 @@ class Handler(BaseHTTPRequestHandler):
 
     @staticmethod
     def _scope_allows(record: auth.Record | None, exact: str | None) -> bool:
-        # The shared scope rule of the conditional queries: an exact
+        # The shared scope rule of the snapshot queries: an exact
         # lookup requires unrestricted operation and stage scopes and a
         # key scope that is unrestricted or names the requested target;
         # a paginated query -- and the checkpoint download, which never
@@ -1001,24 +975,64 @@ class Handler(BaseHTTPRequestHandler):
             return record.keys is None or exact in record.keys
         return record.keys is None
 
-    def _snapshot_query(
-            self, query: str,
+    @staticmethod
+    def _scope_filters(record: auth.Record | None,
+                       params: dict[str, str]) -> bool:
+        # The audit and proof rule: the validated filters must satisfy
+        # the token's operation, stage and history-key scopes.
+        return record is None or auth.scope_allows(record, params)
+
+    @staticmethod
+    def _scope_unrestricted(record: auth.Record | None,
+                            _params: dict[str, str]) -> bool:
+        # The metrics rule: every audit axis -- operation, stage and
+        # history key -- has to be a wildcard.
+        return record is None or (record.ops is None
+                                  and record.stages is None
+                                  and record.keys is None)
+
+    def _consumer_scope(self, record: auth.Record | None,
+                        consumer: str) -> bool:
+        # The shared scope decision of the read-only consumer queries:
+        # operation- and stage-scoped tokens can never read a consumer;
+        # an unrestricted key scope reads any subscription. A
+        # key-scoped token reads the consumer's fixed subscription from
+        # the consumer ledger at this scope stage and passes only a
+        # fixed-batch subscription naming an allowed batch, while a
+        # cross-batch or job-only range needs all three scopes
+        # unrestricted. The data-plane coordination and business
+        # ledgers open only after the scope is allowed.
+        if record is None:
+            return True
+        if record.ops is not None or record.stages is not None:
+            return False
+        if record.keys is None:
+            return True
+        subscription = migration_batch.consumer_subscription(
+            getattr(self.server, "migration_batches"),
+            getattr(self.server, "migration_consumers"), consumer)
+        batch_key = subscription["key"]
+        return batch_key is not None and batch_key in record.keys
+
+    def _read_request(
+            self, query: str, *,
             parse: Callable[[str], dict[str, str]],
-            target: Callable[[dict[str, str]], str | None],
-            fetch: Callable[[dict[str, str], str | None],
-                            tuple[bytes | None, str]],
-            errors: dict[str, str]) -> None:
-        # The shared pipeline of the read-only conditional queries (the
-        # checkpoint download, GET /acceptance and GET /completions):
-        # authorize, validate the entry's own query string and the
-        # conditional header, decide the scope, and only then open the
-        # snapshot -- a failure at one stage never reaches a later
+            conditional: bool,
+            scope: Callable[[auth.Record | None, dict[str, str]], bool],
+            fetch: Callable[[dict[str, str], str | None], _Response],
+            scope_errors: _ErrorTable,
+            fetch_errors: _ErrorTable) -> None:
+        # The shared pipeline of every read-only GET entry: token
+        # identity first, then the entry's own query string and -- for
+        # a conditional entry -- the If-None-Match header, then the
+        # scope decision, and only then the snapshot read and the
+        # response. A failure at one stage never reaches a later
         # stage's files. ``parse`` validates the query string into the
-        # entry's parameter dict; ``target`` maps the parameters to the
-        # exact-lookup key (None for a paginated or parameterless
-        # query); ``fetch`` reads the validated snapshot under its lock
-        # and returns (body, etag) with body None on a conditional hit;
-        # ``errors`` carries the entry's own error names.
+        # entry's parameter dict; ``scope`` decides whether the
+        # identified token may run the query (a consumer query reads
+        # the small persisted subscription its decision needs, mapped
+        # through ``scope_errors``); ``fetch`` reads the validated
+        # snapshot under its lock and returns the decided response.
         authorized, record = self._authorize()
         if not authorized:
             return
@@ -1027,237 +1041,190 @@ class Handler(BaseHTTPRequestHandler):
         except ValueError:
             self._json(HTTPStatus.BAD_REQUEST, {"error": "invalid_request"})
             return
-        ok, condition = self._condition()
-        if not ok:
-            return
+        condition: str | None = None
+        if conditional:
+            ok, condition = self._condition()
+            if not ok:
+                return
         # Scope checks follow parameter validation and precede any
         # ledger or checkpoint access: a forbidden request never opens
         # a file and never learns about records or the configuration.
-        if not self._scope_allows(record, target(params)):
+        try:
+            allowed = scope(record, params)
+        except Exception as exc:
+            self._map_error(exc, scope_errors)
+            return
+        if not allowed:
             self._json(HTTPStatus.FORBIDDEN, {"error": "forbidden"})
             return
         try:
-            body, etag = fetch(params, condition)
-        except FileNotFoundError:
-            # Never leak the configured path or a system message.
-            self._json(HTTPStatus.NOT_FOUND, {"error": errors["missing"]})
-        except KeyError:
-            self._json(HTTPStatus.NOT_FOUND, {"error": errors["unknown"]})
-        except ValueError:
-            self._json(HTTPStatus.CONFLICT, {"error": errors["invalid"]})
-        except OSError:
-            self._json(HTTPStatus.SERVICE_UNAVAILABLE,
-                       {"error": errors["unavailable"]})
+            response = fetch(params, condition)
+        except Exception as exc:
+            self._map_error(exc, fetch_errors)
+            return
+        self._respond(response)
+
+    def _map_error(self, exc: Exception, table: _ErrorTable) -> None:
+        # Map one business failure to the entry's own status and error
+        # name -- the first table entry whose type matches decides, and
+        # the response never carries a path, a token or a system
+        # message. An exception no entry matches propagates unchanged.
+        for exc_type, status, name in table:
+            if isinstance(exc, exc_type):
+                self._json(status, {"error": name})
+                return
+        raise exc
+
+    def _respond(self, response: _Response) -> None:
+        # Emit one decided success response. For a raw snapshot the
+        # 304/200 decision was made under the snapshot's lock against
+        # the same serialized bytes a 200 carries, so a concurrent
+        # write can never mix an old tag with a new body.
+        if response.kind == "json":
+            self._json(HTTPStatus.OK, response.payload)
+        elif response.kind == "bytes":
+            self._bytes(HTTPStatus.OK, response.payload)
+        elif response.payload is None:
+            self._raw(HTTPStatus.NOT_MODIFIED, b"", response.etag)
         else:
-            # The 304 decision was made under the snapshot's lock
-            # against the same serialized bytes a 200 carries, so a
-            # concurrent write can never mix an old tag with a new
-            # body.
-            if body is None:
-                self._raw(HTTPStatus.NOT_MODIFIED, b"", etag)
-            else:
-                self._raw(HTTPStatus.OK, body, etag)
+            self._raw(HTTPStatus.OK, response.payload, response.etag)
 
     def _audit(self, query: str) -> None:
-        authorized, record = self._authorize()
-        if not authorized:
-            return
+        def fetch(params: dict[str, str],
+                  _condition: str | None) -> _Response:
+            kwargs: dict[str, object] = {}
+            for name in ("cursor", "op", "stage", "key"):
+                if name in params:
+                    kwargs[name] = params[name]
+            if "limit" in params:
+                kwargs["limit"] = int(params["limit"])
+            return _Response("json", audit.search(
+                getattr(self.server, "audit_path"), **kwargs))
 
-        try:
-            params = _parse_audit_params(query)
-        except ValueError:
-            self._json(HTTPStatus.BAD_REQUEST, {"error": "invalid_request"})
-            return
-
-        # Scope checks follow parameter validation and precede any access
-        # to the journal: a forbidden request never opens the audit file
-        # and never learns about records, token names or the configuration.
-        if record is not None and not auth.scope_allows(record, params):
-            self._json(HTTPStatus.FORBIDDEN, {"error": "forbidden"})
-            return
-
-        kwargs: dict[str, object] = {}
-        for name in ("cursor", "op", "stage", "key"):
-            if name in params:
-                kwargs[name] = params[name]
-        if "limit" in params:
-            kwargs["limit"] = int(params["limit"])
-
-        try:
-            result = audit.search(getattr(self.server, "audit_path"), **kwargs)
-        except FileNotFoundError:
-            # Never leak the configured path or the system message.
-            self._json(HTTPStatus.NOT_FOUND, {"error": "audit_not_found"})
-        except ValueError:
-            self._json(HTTPStatus.CONFLICT, {"error": "audit_invalid"})
-        except OSError:
-            self._json(HTTPStatus.SERVICE_UNAVAILABLE,
-                       {"error": "audit_unavailable"})
-        else:
-            self._json(HTTPStatus.OK, result)
+        self._read_request(
+            query, parse=_parse_audit_params, conditional=False,
+            scope=self._scope_filters, fetch=fetch,
+            scope_errors=(), fetch_errors=_AUDIT_ERRORS)
 
     def _metrics(self) -> None:
-        # The read-only process snapshot reuses the audit entry's
-        # verification order: header presence and identity first
-        # (401/503/403), then this entry's parameter and scope checks,
-        # and only then is the snapshot read. The entry takes no
-        # parameters, so any query string -- even an empty one after a
-        # bare '?' -- is an invalid request.
-        authorized, record = self._authorize()
-        if not authorized:
-            return
-        if "?" in self.path:
-            self._json(HTTPStatus.BAD_REQUEST, {"error": "invalid_request"})
-            return
-        # A metrics token must be unrestricted on every audit axis:
-        # operation, stage and history key all have to be wildcards.
-        if record is not None and (record.ops is not None
-                                   or record.stages is not None
-                                   or record.keys is not None):
-            self._json(HTTPStatus.FORBIDDEN, {"error": "forbidden"})
-            return
-        # The snapshot is taken before the response is sent (and this
-        # request counted), so a successful GET /metrics never appears
-        # in its own snapshot but is counted exactly once afterwards and
-        # shows up in the next one.
-        store = getattr(self.server, "metrics")
-        self._json(HTTPStatus.OK, store.snapshot())
+        # The entry takes no parameters, so any query string -- even an
+        # empty one after a bare '?' -- is an invalid request.
+        def parse(_query: str) -> dict[str, str]:
+            if "?" in self.path:
+                raise ValueError("unexpected query string")
+            return {}
+
+        def fetch(_params: dict[str, str],
+                  _condition: str | None) -> _Response:
+            # The snapshot is taken before the response is sent (and
+            # this request counted), so a successful GET /metrics never
+            # appears in its own snapshot but is counted exactly once
+            # afterwards and shows up in the next one.
+            store = getattr(self.server, "metrics")
+            return _Response("json", store.snapshot())
+
+        self._read_request(
+            "", parse=parse, conditional=False,
+            scope=self._scope_unrestricted, fetch=fetch,
+            scope_errors=(), fetch_errors=())
 
     def _proof(self, query: str) -> None:
-        authorized, record = self._authorize()
-        if not authorized:
-            return
-
-        try:
-            params = _parse_proof_params(query)
-        except ValueError:
-            self._json(HTTPStatus.BAD_REQUEST, {"error": "invalid_request"})
-            return
-
-        # Same order as the plain audit query: scopes are checked against
-        # the validated filters before any file is opened.
-        if record is not None and not auth.scope_allows(record, params):
-            self._json(HTTPStatus.FORBIDDEN, {"error": "forbidden"})
-            return
-
-        kwargs: dict[str, object] = {}
-        for name in ("cursor", "op", "stage", "key"):
-            if name in params:
-                kwargs[name] = params[name]
-        if "limit" in params:
-            kwargs["limit"] = int(params["limit"])
-
-        try:
-            proof = audit_proof.export(
+        def fetch(params: dict[str, str],
+                  _condition: str | None) -> _Response:
+            kwargs: dict[str, object] = {}
+            for name in ("cursor", "op", "stage", "key"):
+                if name in params:
+                    kwargs[name] = params[name]
+            if "limit" in params:
+                kwargs["limit"] = int(params["limit"])
+            return _Response("json", audit_proof.export(
                 getattr(self.server, "audit_path"),
                 getattr(self.server, "audit_checkpoint"),
                 params["generation"],
                 final=params.get("final") == "true",
-                **kwargs)
-        except FileNotFoundError:
-            # A missing journal or checkpoint parent directory; the
-            # configured paths never leak into the response.
-            self._json(HTTPStatus.NOT_FOUND, {"error": "proof_not_found"})
-        except ValueError:
-            self._json(HTTPStatus.CONFLICT, {"error": "proof_invalid"})
-        except OSError:
-            self._json(HTTPStatus.SERVICE_UNAVAILABLE,
-                       {"error": "proof_unavailable"})
-        else:
-            self._json(HTTPStatus.OK, proof)
+                **kwargs))
+
+        self._read_request(
+            query, parse=_parse_proof_params, conditional=False,
+            scope=self._scope_filters, fetch=fetch,
+            scope_errors=(), fetch_errors=_PROOF_ERRORS)
 
     def _checkpoint(self, query: str) -> None:
         # The snapshot entry takes no query parameters; any query string
         # fails the same "unknown, repeated or empty parameter" parsing
         # used by the other endpoints, and the snapshot is always the
         # one checkpoint file fixed at startup.
-        def fetch(_params: dict[str, str], condition: str | None):
+        def fetch(_params: dict[str, str],
+                  condition: str | None) -> _Response:
             body, etag = audit_proof.read_snapshot(
                 getattr(self.server, "audit_checkpoint"))
             # The 304 decision uses the ETag of the same validated bytes
             # a 200 would serve, so a concurrent export can never mix an
             # old tag with a new body.
             if condition == etag:
-                return None, etag
-            return body, etag
+                return _Response("raw", None, etag)
+            return _Response("raw", body, etag)
 
-        self._snapshot_query(query, lambda q: _parse_query(q, ()),
-                             lambda _params: None, fetch,
-                             _CHECKPOINT_ERRORS)
+        self._read_request(
+            query, parse=lambda q: _parse_query(q, ()), conditional=True,
+            scope=lambda record, _params: self._scope_allows(record, None),
+            fetch=fetch, scope_errors=(), fetch_errors=_CHECKPOINT_ERRORS)
 
     def _acceptance(self, query: str) -> None:
         ledger_dir = getattr(self.server, "acceptance_dir")
 
-        def fetch(params: dict[str, str], condition: str | None):
+        def fetch(params: dict[str, str],
+                  condition: str | None) -> _Response:
             if "key" in params:
-                return acceptance.get_response(
+                body, etag = acceptance.get_response(
                     ledger_dir, params["key"], condition)
-            kwargs: dict[str, object] = {}
-            for name in ("cursor", "state"):
-                if name in params:
-                    kwargs[name] = params[name]
-            if "limit" in params:
-                kwargs["limit"] = int(params["limit"])
-            return acceptance.search_response(
-                ledger_dir, condition=condition, **kwargs)
+            else:
+                kwargs: dict[str, object] = {}
+                for name in ("cursor", "state"):
+                    if name in params:
+                        kwargs[name] = params[name]
+                if "limit" in params:
+                    kwargs["limit"] = int(params["limit"])
+                body, etag = acceptance.search_response(
+                    ledger_dir, condition=condition, **kwargs)
+            return _Response("raw", body, etag)
 
-        self._snapshot_query(query, _parse_acceptance_params,
-                             lambda params: params.get("key"), fetch,
-                             _ACCEPTANCE_ERRORS)
+        self._read_request(
+            query, parse=_parse_acceptance_params, conditional=True,
+            scope=lambda record, params: self._scope_allows(
+                record, params.get("key")),
+            fetch=fetch, scope_errors=(), fetch_errors=_ACCEPTANCE_ERRORS)
 
     def _completions(self, query: str) -> None:
         ledger = getattr(self.server, "completions_path")
 
-        def fetch(params: dict[str, str], condition: str | None):
+        def fetch(params: dict[str, str],
+                  condition: str | None) -> _Response:
             if "job" in params:
-                return completion.get_response(
+                body, etag = completion.get_response(
                     ledger, params["job"], condition)
-            kwargs: dict[str, object] = {}
-            for name in ("cursor", "outcome", "exceeded"):
-                if name in params:
-                    kwargs[name] = params[name]
-            if "limit" in params:
-                kwargs["limit"] = int(params["limit"])
-            return completion.search_response(
-                ledger, condition=condition, **kwargs)
+            else:
+                kwargs: dict[str, object] = {}
+                for name in ("cursor", "outcome", "exceeded"):
+                    if name in params:
+                        kwargs[name] = params[name]
+                if "limit" in params:
+                    kwargs["limit"] = int(params["limit"])
+                body, etag = completion.search_response(
+                    ledger, condition=condition, **kwargs)
+            return _Response("raw", body, etag)
 
-        self._snapshot_query(query, _parse_completions_params,
-                             lambda params: params.get("job"), fetch,
-                             _COMPLETION_ERRORS)
+        self._read_request(
+            query, parse=_parse_completions_params, conditional=True,
+            scope=lambda record, params: self._scope_allows(
+                record, params.get("job")),
+            fetch=fetch, scope_errors=(), fetch_errors=_COMPLETION_ERRORS)
 
     def _migration_batches(self, query: str) -> None:
         ledger = getattr(self.server, "migration_batches")
-        authorized, record = self._authorize()
-        if not authorized:
-            return
 
-        try:
-            params = _parse_migration_batches_params(query)
-        except ValueError:
-            self._json(HTTPStatus.BAD_REQUEST, {"error": "invalid_request"})
-            return
-
-        # Scope checks follow parameter validation and precede any
-        # ledger access: an exact lookup requires unrestricted operation
-        # and stage scopes and a key scope that is unrestricted or names
-        # the requested batch; a paginated query requires all three
-        # scopes unrestricted. A forbidden request never opens the
-        # coordination ledger or a business ledger.
-        if record is not None:
-            if record.ops is not None or record.stages is not None:
-                self._json(HTTPStatus.FORBIDDEN, {"error": "forbidden"})
-                return
-            if "key" in params:
-                if record.keys is not None \
-                        and params["key"] not in record.keys:
-                    self._json(
-                        HTTPStatus.FORBIDDEN, {"error": "forbidden"})
-                    return
-            elif record.keys is not None:
-                self._json(HTTPStatus.FORBIDDEN, {"error": "forbidden"})
-                return
-
-        try:
+        def fetch(params: dict[str, str],
+                  _condition: str | None) -> _Response:
             if "key" in params:
                 # The exact lookup returns only the batch snapshot; the
                 # shared locks cover the coordination file, the business
@@ -1271,84 +1238,50 @@ class Handler(BaseHTTPRequestHandler):
                 if "limit" in params:
                     kwargs["limit"] = int(params["limit"])
                 body = migration_batch.search_response(ledger, **kwargs)
-        except FileNotFoundError:
-            # The fixed coordination ledger itself is missing. Never
-            # leak its path or a system message.
-            self._json(HTTPStatus.NOT_FOUND,
-                       {"error": "migration_batches_not_found"})
-        except KeyError:
-            # A canonical coordination ledger that lacks the key.
-            self._json(HTTPStatus.NOT_FOUND,
-                       {"error": "migration_batch_not_found"})
-        except ValueError:
-            # Non-canonical content, a broken reference or a referenced
-            # business ledger that is missing.
-            self._json(HTTPStatus.CONFLICT,
-                       {"error": "migration_batches_invalid"})
-        except OSError:
-            self._json(HTTPStatus.SERVICE_UNAVAILABLE,
-                       {"error": "migration_batches_unavailable"})
-        else:
-            self._bytes(HTTPStatus.OK, body)
+            return _Response("bytes", body)
+
+        # An exact lookup requires unrestricted operation and stage
+        # scopes and a key scope that is unrestricted or names the
+        # requested batch; a paginated query requires all three scopes
+        # unrestricted.
+        self._read_request(
+            query, parse=_parse_migration_batches_params,
+            conditional=False,
+            scope=lambda record, params: self._scope_allows(
+                record, params.get("key")),
+            fetch=fetch, scope_errors=(),
+            fetch_errors=_MIGRATION_BATCHES_ERRORS)
 
     def _migration_batch_events(self, query: str) -> None:
         ledger = getattr(self.server, "migration_batches")
-        authorized, record = self._authorize()
-        if not authorized:
-            return
 
-        try:
-            params = _parse_migration_events_params(query)
-        except ValueError:
-            self._json(HTTPStatus.BAD_REQUEST, {"error": "invalid_request"})
-            return
-
-        # Same scope order as the snapshot query and before any file is
-        # opened. A batch-key filter needs unrestricted operation and
-        # stage scopes and a key scope that is unrestricted or names the
-        # requested batch; cross-batch reads need all three scopes
-        # unrestricted. The job filter alone never lifts the
-        # cross-batch requirement.
-        if record is not None:
-            if record.ops is not None or record.stages is not None:
-                self._json(HTTPStatus.FORBIDDEN, {"error": "forbidden"})
-                return
+        def fetch(params: dict[str, str],
+                  _condition: str | None) -> _Response:
+            kwargs: dict[str, object] = {}
+            if "cursor" in params:
+                kwargs["cursor"] = int(params["cursor"])
+            if "limit" in params:
+                kwargs["limit"] = int(params["limit"])
             if "key" in params:
-                if record.keys is not None \
-                        and params["key"] not in record.keys:
-                    self._json(
-                        HTTPStatus.FORBIDDEN, {"error": "forbidden"})
-                    return
-            elif record.keys is not None:
-                self._json(HTTPStatus.FORBIDDEN, {"error": "forbidden"})
-                return
+                kwargs["key"] = params["key"]
+            if "job" in params:
+                kwargs["job_id"] = params["job"]
+            return _Response("bytes",
+                             migration_batch.events_response(
+                                 ledger, **kwargs))
 
-        kwargs: dict[str, object] = {}
-        if "cursor" in params:
-            kwargs["cursor"] = int(params["cursor"])
-        if "limit" in params:
-            kwargs["limit"] = int(params["limit"])
-        if "key" in params:
-            kwargs["key"] = params["key"]
-        if "job" in params:
-            kwargs["job_id"] = params["job"]
-        try:
-            body = migration_batch.events_response(ledger, **kwargs)
-        except FileNotFoundError:
-            # The fixed coordination ledger itself is missing; never
-            # leak its path or a system message.
-            self._json(HTTPStatus.NOT_FOUND,
-                       {"error": "migration_batches_not_found"})
-        except ValueError:
-            # Non-canonical content, a broken reference or a referenced
-            # business ledger that is missing.
-            self._json(HTTPStatus.CONFLICT,
-                       {"error": "migration_batches_invalid"})
-        except OSError:
-            self._json(HTTPStatus.SERVICE_UNAVAILABLE,
-                       {"error": "migration_batches_unavailable"})
-        else:
-            self._bytes(HTTPStatus.OK, body)
+        # Same scope rule as the snapshot query: a batch-key filter
+        # needs unrestricted operation and stage scopes and a key scope
+        # that is unrestricted or names the requested batch;
+        # cross-batch reads need all three scopes unrestricted. The job
+        # filter alone never lifts the cross-batch requirement.
+        self._read_request(
+            query, parse=_parse_migration_events_params,
+            conditional=False,
+            scope=lambda record, params: self._scope_allows(
+                record, params.get("key")),
+            fetch=fetch, scope_errors=(),
+            fetch_errors=_MIGRATION_EVENTS_ERRORS)
 
     def _raw(self, status: HTTPStatus, body: bytes, etag: str) -> None:
         # The snapshot bytes are served verbatim -- the original UTF-8
