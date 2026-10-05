@@ -42,21 +42,18 @@ from __future__ import annotations
 
 import contextlib
 import copy
-import fcntl
 import hashlib
 import json
 import os
-import tempfile
-import threading
-from typing import Any, Iterator
+from typing import Any
 
+from . import _lifecycle
 from . import dispatch as _dispatch
 from . import execution as _execution
 from . import jobs as _jobs
 from . import market as _market
 from . import resources as _resources
 from . import signals as _signals
-from ._jsonio import finite_loads
 
 __all__ = ["complete", "get", "search", "get_response", "search_response"]
 
@@ -70,60 +67,19 @@ _OUTCOMES = ("succeeded", "failed")
 _EVENT_FIELDS = ("key", "request", "result")
 _REQUEST_FIELDS = ("job_id", "at", "outcome", "actual_cost",
                    "actual_carbon")
-_LOCK_SUFFIX = ".lock"
 _DEFAULT_LIMIT = 100
 _MAX_LIMIT = 1000
 _EXCEEDED_FILTERS = ("cost", "carbon", "any", "none")
 _HEX_DIGITS = frozenset("0123456789abcdef")
 
-
-class _Store:
-    def __init__(self, realpath: str) -> None:
-        self.realpath = realpath
-        self.lock = threading.Lock()
-
-
-_stores_lock = threading.Lock()
-_stores: dict[str, _Store] = {}
-
-
-def _get_store(path: str) -> _Store:
-    realpath = os.path.realpath(path)
-    with _stores_lock:
-        store = _stores.get(realpath)
-        if store is None:
-            store = _Store(realpath)
-            _stores[realpath] = store
-        return store
-
-
-def _is_plain_int(value: object) -> bool:
-    # bool is a subclass of int and must be rejected.
-    return isinstance(value, int) and not isinstance(value, bool)
-
-
-@contextlib.contextmanager
-def _lock(realpath: str, *, shared: bool = False) -> Iterator[None]:
-    # As in the other ledgers, the companion lock file is never unlinked
-    # and an flock is released by the kernel on process exit, so
-    # equivalent real paths share one lock across threads, processes and
-    # modules.
-    lock_path = realpath + _LOCK_SUFFIX
-    fd = os.open(lock_path, os.O_CREAT | os.O_RDWR, 0o666)
-    try:
-        fcntl.flock(fd, fcntl.LOCK_SH if shared else fcntl.LOCK_EX)
-        try:
-            yield
-        finally:
-            fcntl.flock(fd, fcntl.LOCK_UN)
-    finally:
-        os.close(fd)
-
-
-def _check_sorted_keys(mapping: dict[Any, Any], label: str) -> None:
-    keys = list(mapping)
-    if keys != sorted(keys):
-        raise ValueError(f"{label} must be ordered by key code point")
+# The in-process mutex registry, the companion flock, the small input
+# checks and the synced atomic commit live in the shared lifecycle
+# infrastructure; the names are kept as the module's own seams.
+_Store = _lifecycle.Store
+_get_store = _lifecycle.get_store
+_is_plain_int = _lifecycle.is_plain_int
+_check_sorted_keys = _lifecycle.check_sorted_keys
+_lock = _lifecycle.file_lock
 
 
 def _validate_selection(value: object) -> dict[str, Any]:
@@ -332,65 +288,37 @@ def _load_completion_ledger(
     history: dict[str, list[dict[str, Any]]] | None = None,
 ) -> tuple[dict[str, dict[str, Any]], dict[str, dict[str, Any]],
            dict[str, dict[str, Any]], bytes | None]:
-    try:
-        with open(realpath, "rb") as handle:
-            raw = handle.read()
-    except FileNotFoundError:
+    def validate(
+        data: object,
+    ) -> tuple[dict[str, dict[str, Any]], dict[str, dict[str, Any]],
+               dict[str, dict[str, Any]]]:
+        return _validate_ledger(data, accepted, history)
+
+    def canonical(
+        sections: tuple[dict[str, dict[str, Any]],
+                        dict[str, dict[str, Any]],
+                        dict[str, dict[str, Any]]],
+    ) -> bytes:
+        records, idempotency, events = sections
+        return _canonical_bytes(records, idempotency, events)
+
+    sections, raw = _lifecycle.load_canonical(
+        realpath, "completion ledger", validate, canonical)
+    if sections is None:
         return {}, {}, {}, None
-    try:
-        text = raw.decode("utf-8")
-    except UnicodeDecodeError as exc:
-        raise ValueError(
-            f"completion ledger {realpath!r} is not valid UTF-8") from exc
-    try:
-        # Negative-zero and non-finite literals are format errors.
-        data = finite_loads(text)
-    except ValueError as exc:
-        raise ValueError(
-            f"completion ledger {realpath!r} is not valid JSON") from exc
-    records, idempotency, events = _validate_ledger(data, accepted, history)
-    if raw != _canonical_bytes(records, idempotency, events):
-        raise ValueError(
-            f"completion ledger {realpath!r} is not in canonical compact "
-            "form")
+    records, idempotency, events = sections
     return records, idempotency, events, raw
 
 
 def _fsync_directory(directory: str) -> None:
-    dir_fd = os.open(directory, os.O_RDONLY)
-    try:
-        os.fsync(dir_fd)
-    finally:
-        os.close(dir_fd)
+    _lifecycle.fsync_directory(directory)
 
 
 def _rollback_file(realpath: str, directory: str, old_bytes: bytes | None,
                    first: BaseException) -> None:
-    # Restore the exact pre-call bytes while the exclusive lock is held,
-    # or remove a ledger that did not exist beforehand, then sync the
-    # directory. A failed recovery chains after the original error.
-    try:
-        if old_bytes is None:
-            try:
-                os.unlink(realpath)
-            except FileNotFoundError:
-                pass
-        else:
-            fd, tmp_path = tempfile.mkstemp(
-                dir=directory, prefix=".completion-restore-", suffix=".tmp")
-            try:
-                with os.fdopen(fd, "wb") as handle:
-                    handle.write(old_bytes)
-                    handle.flush()
-                    os.fsync(handle.fileno())
-                os.replace(tmp_path, realpath)
-            except BaseException:
-                with contextlib.suppress(OSError):
-                    os.unlink(tmp_path)
-                raise
-        _fsync_directory(directory)
-    except OSError as recovery:
-        raise recovery from first
+    _lifecycle.rollback_file(realpath, directory, old_bytes, first,
+                             prefix=".completion-restore-",
+                             fsync_dir=_fsync_directory)
 
 
 def _commit_file(realpath: str, payload: bytes,
@@ -400,24 +328,9 @@ def _commit_file(realpath: str, payload: bytes,
     # directory fsync, restoring the pre-call bytes on any failure, so a
     # failed call leaves neither a fragment nor half an event and an
     # interruption observes only the pre- or post-commit bytes.
-    directory = os.path.dirname(realpath) or "."
-    fd, tmp_path = tempfile.mkstemp(
-        dir=directory, prefix=".completion-", suffix=".tmp")
-    try:
-        with os.fdopen(fd, "wb") as handle:
-            handle.write(payload)
-            handle.flush()
-            os.fsync(handle.fileno())
-        os.replace(tmp_path, realpath)
-    except BaseException:
-        with contextlib.suppress(OSError):
-            os.unlink(tmp_path)
-        raise
-    try:
-        _fsync_directory(directory)
-    except BaseException as first:
-        _rollback_file(realpath, directory, old_bytes, first)
-        raise
+    _lifecycle.commit_file(realpath, payload, old_bytes,
+                           prefix=".completion-",
+                           fsync_dir=_fsync_directory)
 
 
 def _record_for_job(
