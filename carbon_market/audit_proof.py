@@ -173,15 +173,14 @@ checkpoint.
 from __future__ import annotations
 
 import contextlib
-import fcntl
 import hashlib
 import json
 import os
 import re
 import tempfile
-import threading
-from typing import Any, Iterator
+from typing import Any
 
+from . import _lifecycle
 from . import audit
 from ._jsonio import finite_loads, strict_loads
 
@@ -260,39 +259,14 @@ class BundleMismatchError(ValueError):
 _MismatchError = BundleMismatchError
 
 
-class _CheckpointStore:
-    def __init__(self, realpath: str) -> None:
-        self.realpath = realpath
-        self.lock = threading.Lock()
-
-
-_stores_lock = threading.Lock()
-_stores: dict[str, _CheckpointStore] = {}
-
-
-def _get_store(realpath: str) -> _CheckpointStore:
-    with _stores_lock:
-        store = _stores.get(realpath)
-        if store is None:
-            store = _CheckpointStore(realpath)
-            _stores[realpath] = store
-        return store
-
-
-@contextlib.contextmanager
-def _file_lock(realpath: str, *, shared: bool = False) -> Iterator[None]:
-    # Same flock discipline as the journal: the companion lock file is
-    # never unlinked and the kernel releases the flock on process exit.
-    lock_path = realpath + ".lock"
-    fd = os.open(lock_path, os.O_CREAT | os.O_RDWR, 0o666)
-    try:
-        fcntl.flock(fd, fcntl.LOCK_SH if shared else fcntl.LOCK_EX)
-        try:
-            yield
-        finally:
-            fcntl.flock(fd, fcntl.LOCK_UN)
-    finally:
-        os.close(fd)
+# The in-process mutex registry and the companion flock are the shared
+# lifecycle infrastructure's; the names stay as this module's seams so
+# the acceptance ledger and the journal-side readers keep their existing
+# call sites.
+_Store = _lifecycle.Store
+_get_store = _lifecycle.get_store
+_file_lock = _lifecycle.file_lock
+_stores = _lifecycle._stores
 
 
 def _is_digest(value: object) -> bool:

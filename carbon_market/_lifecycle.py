@@ -1,10 +1,10 @@
 """Persistence infrastructure shared by the persistent ledgers.
 
-The dispatch, execution and completion ledgers and the live market
-inputs (the resource-supply registry and the signal ledger) persist the
-same shape of document -- canonical compact JSON sections plus an
-idempotency map and an audit trail, committed one section set at a
-time -- and protect it the same way: one in-process mutex per resolved
+Every persistent ledger -- the dispatch, execution and completion
+ledgers, the live market inputs (the resource-supply registry and the
+signal ledger), and the audit, audit-proof, jobs, market, rebalance,
+execution-sync, migration-batch, recover-all and signal-ingest ledgers
+-- protects its file the same way: one in-process mutex per resolved
 real path, a companion ``.lock`` file carrying ``flock``
 shared/exclusive locks across processes, and a synced same-directory
 temporary file atomically renamed over the ledger with its directory

@@ -19,13 +19,12 @@ files are never upgraded.
 from __future__ import annotations
 
 import contextlib
-import fcntl
 import json
 import os
 import tempfile
-import threading
-from typing import Any, Iterator
+from typing import Any
 
+from . import _lifecycle
 from ._jsonio import finite_loads, strict_loads
 
 __all__ = ["register", "submit", "get"]
@@ -45,27 +44,13 @@ _SUBMIT_REQUIRED_FIELDS = frozenset(_SUBMIT_FIELDS)
 _SUBMIT_JOB_FIELDS = _SUBMIT_FIELDS + ("state",)
 _SUBMIT_ROOT_FIELDS = ("version", "jobs", "idempotency", "audit")
 _SUBMIT_EVENT_FIELDS = ("key", "job_id", "result")
-_LOCK_SUFFIX = ".lock"
 
-
-class _Store:
-    def __init__(self, realpath: str) -> None:
-        self.realpath = realpath
-        self.lock = threading.Lock()
-
-
-_stores_lock = threading.Lock()
-_stores: dict[str, _Store] = {}
-
-
-def _get_store(path: str) -> _Store:
-    realpath = os.path.realpath(path)
-    with _stores_lock:
-        store = _stores.get(realpath)
-        if store is None:
-            store = _Store(realpath)
-            _stores[realpath] = store
-        return store
+# The in-process mutex registry and the companion flock live in the
+# shared lifecycle infrastructure; the names are kept as the module's
+# own seams.
+_Store = _lifecycle.Store
+_get_store = _lifecycle.get_store
+_process_lock = _lifecycle.file_lock
 
 
 def _is_plain_int(value: object) -> bool:
@@ -267,24 +252,6 @@ def register(
 # ---------------------------------------------------------------------------
 # Version 2: complete scheduling-constraint jobs
 # ---------------------------------------------------------------------------
-
-
-@contextlib.contextmanager
-def _process_lock(realpath: str, *, shared: bool = False) -> Iterator[None]:
-    # The companion lock file is never unlinked; the kernel releases the
-    # flock on process exit, so a leftover lock never blocks a later
-    # call. Equivalent real paths in different processes therefore share
-    # the same exclusive lock as the per-realpath in-process lock.
-    lock_path = realpath + _LOCK_SUFFIX
-    fd = os.open(lock_path, os.O_CREAT | os.O_RDWR, 0o666)
-    try:
-        fcntl.flock(fd, fcntl.LOCK_SH if shared else fcntl.LOCK_EX)
-        try:
-            yield
-        finally:
-            fcntl.flock(fd, fcntl.LOCK_UN)
-    finally:
-        os.close(fd)
 
 
 def _normalize_region_list(value: object, label: str) -> list[str]:

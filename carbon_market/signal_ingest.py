@@ -74,15 +74,14 @@ are unchanged. Only the standard library is used.
 from __future__ import annotations
 
 import contextlib
-import fcntl
 import hashlib
 import hmac
 import json
 import os
 import tempfile
-import threading
-from typing import Any, Iterator
+from typing import Any
 
+from . import _lifecycle
 from . import signals as _signals
 from ._jsonio import finite_loads
 
@@ -96,49 +95,17 @@ _RECEIPT_FIELDS = ("source", "key_id", "sequence", "region",
                    "signal_version", "signature", "state")
 _STATES = ("pending", "active")
 _HEX_DIGITS = frozenset("0123456789abcdef")
-_LOCK_SUFFIX = ".lock"
 # The idempotency keys published into the signal ledger all share this
 # prefix, so an authenticated publication is recognizable and can never
 # collide with a caller-chosen key of the plain publish entry point.
 _IDEM_PREFIX = "signal-ingest:"
 
-
-class _Store:
-    def __init__(self, realpath: str) -> None:
-        self.realpath = realpath
-        self.lock = threading.Lock()
-
-
-_stores_lock = threading.Lock()
-_stores: dict[str, _Store] = {}
-
-
-def _get_store(path: str) -> _Store:
-    realpath = os.path.realpath(path)
-    with _stores_lock:
-        store = _stores.get(realpath)
-        if store is None:
-            store = _Store(realpath)
-            _stores[realpath] = store
-        return store
-
-
-@contextlib.contextmanager
-def _file_lock(realpath: str, *, shared: bool = False) -> Iterator[None]:
-    # Same companion-lock discipline as signals._process_lock: the lock
-    # file is never unlinked and an flock is released by the kernel on
-    # process exit, so equivalent real paths share one lock across
-    # processes.
-    lock_path = realpath + _LOCK_SUFFIX
-    fd = os.open(lock_path, os.O_CREAT | os.O_RDWR, 0o666)
-    try:
-        fcntl.flock(fd, fcntl.LOCK_SH if shared else fcntl.LOCK_EX)
-        try:
-            yield
-        finally:
-            fcntl.flock(fd, fcntl.LOCK_UN)
-    finally:
-        os.close(fd)
+# The in-process mutex registry and the companion flock live in the
+# shared lifecycle infrastructure -- the same lock identity the signal
+# ledger itself uses; the names are kept as the module's own seams.
+_Store = _lifecycle.Store
+_get_store = _lifecycle.get_store
+_file_lock = _lifecycle.file_lock
 
 
 def _is_plain_int(value: object) -> bool:

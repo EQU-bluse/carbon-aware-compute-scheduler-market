@@ -49,13 +49,12 @@ from __future__ import annotations
 
 import contextlib
 import copy
-import fcntl
 import json
 import os
 import tempfile
-import threading
-from typing import Any, Iterator
+from typing import Any
 
+from . import _lifecycle
 from . import dispatch as _dispatch
 from . import execution as _execution
 from ._jsonio import finite_loads
@@ -71,49 +70,18 @@ _EVENT_FIELDS = ("key", "batch")
 _PLAN_TERMINAL = ("completed", "failed", "interrupted")
 _BATCH_STATUSES = ("pending", "completed")
 _ITEM_STATUSES = ("pending", "applied")
-_LOCK_SUFFIX = ".lock"
 
-
-class _Store:
-    def __init__(self, realpath: str) -> None:
-        self.realpath = realpath
-        self.lock = threading.Lock()
-
-
-_stores_lock = threading.Lock()
-_stores: dict[str, _Store] = {}
-
-
-def _get_store(path: str) -> _Store:
-    realpath = os.path.realpath(path)
-    with _stores_lock:
-        store = _stores.get(realpath)
-        if store is None:
-            store = _Store(realpath)
-            _stores[realpath] = store
-        return store
+# The in-process mutex registry and the companion flock live in the
+# shared lifecycle infrastructure; the names are kept as the module's
+# own seams.
+_Store = _lifecycle.Store
+_get_store = _lifecycle.get_store
+_lock = _lifecycle.file_lock
 
 
 def _is_plain_int(value: object) -> bool:
     # bool is a subclass of int and must be rejected.
     return isinstance(value, int) and not isinstance(value, bool)
-
-
-@contextlib.contextmanager
-def _lock(realpath: str, *, shared: bool = False) -> Iterator[None]:
-    # As in the other ledgers, the companion lock file is never unlinked
-    # and an flock is released by the kernel on process exit, so
-    # equivalent real paths share one lock across threads and processes.
-    lock_path = realpath + _LOCK_SUFFIX
-    fd = os.open(lock_path, os.O_CREAT | os.O_RDWR, 0o666)
-    try:
-        fcntl.flock(fd, fcntl.LOCK_SH if shared else fcntl.LOCK_EX)
-        try:
-            yield
-        finally:
-            fcntl.flock(fd, fcntl.LOCK_UN)
-    finally:
-        os.close(fd)
 
 
 def _check_sorted_keys(mapping: dict[Any, Any], label: str) -> None:

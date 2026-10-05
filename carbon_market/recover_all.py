@@ -51,13 +51,12 @@ from __future__ import annotations
 
 import contextlib
 import copy
-import fcntl
 import json
 import os
 import tempfile
-import threading
-from typing import Any, Iterator
+from typing import Any
 
+from . import _lifecycle
 from . import jobs as _jobs
 from . import migrate as _migrate
 from . import offers as _offers
@@ -75,71 +74,18 @@ _HISTORY_FIELDS = ("version", "key", "snapshots")
 _STATUSES = ("pending", "failed", "completed")
 
 
-class _Store:
-    def __init__(self, realpath: str) -> None:
-        self.realpath = realpath
-        self.lock = threading.Lock()
-
-
-_stores_lock = threading.Lock()
-_stores: dict[str, _Store] = {}
-
-
-def _get_store(path: str) -> _Store:
-    realpath = os.path.realpath(path)
-    with _stores_lock:
-        store = _stores.get(realpath)
-        if store is None:
-            store = _Store(realpath)
-            _stores[realpath] = store
-        return store
-
-
-@contextlib.contextmanager
-def _file_lock(realpath: str) -> Iterator[None]:
-    # Cross-process mutual exclusion via a kernel exclusive lock: flock
-    # serializes holders of the same lock file across processes, and the
-    # kernel releases it automatically when the holding process exits --
-    # even on a crash -- so a leftover lock file never blocks anyone. The
-    # file itself is deliberately never unlinked: removing it while another
-    # process waits on the old inode would split the lock domain. Any
-    # failure to open or lock surfaces as OSError.
-    lock_path = realpath + ".lock"
-    fd = os.open(lock_path, os.O_CREAT | os.O_RDWR, 0o666)
-    try:
-        fcntl.flock(fd, fcntl.LOCK_EX)
-        try:
-            yield
-        finally:
-            fcntl.flock(fd, fcntl.LOCK_UN)
-    finally:
-        os.close(fd)
-
-
-@contextlib.contextmanager
-def _history_file_lock(
-    history_realpath: str, *, shared: bool = False
-) -> Iterator[None]:
-    # The history file has its own companion lock (``history + ".lock"``),
-    # separate from the coordination file's lock. recover_all.run holds it
-    # exclusively around the whole validate/append/atomic-replace sequence
-    # (directory sync included), while carbon_market.history's read-only
-    # queries hold it shared only while opening and reading. A racing query
-    # therefore observes either the complete pre-write history or the
-    # complete post-write one, never a truncated or half-replaced file. As
-    # with _file_lock the kernel releases the flock on process exit, so a
-    # leftover lock file can never block anyone, and open/lock failures
-    # surface unchanged as OSError.
-    lock_path = history_realpath + ".lock"
-    fd = os.open(lock_path, os.O_CREAT | os.O_RDWR, 0o666)
-    try:
-        fcntl.flock(fd, fcntl.LOCK_SH if shared else fcntl.LOCK_EX)
-        try:
-            yield
-        finally:
-            fcntl.flock(fd, fcntl.LOCK_UN)
-    finally:
-        os.close(fd)
+# The in-process mutex registry and the companion flock live in the
+# shared lifecycle infrastructure; the names are kept as the module's
+# own seams. ``_file_lock`` guards the coordination file and
+# ``_history_file_lock`` the companion history file (``history +
+# ".lock"``) -- the history readers in carbon_market.history,
+# history_copy and history_recovery take the same lock through this
+# module, so equivalent real paths share one lock across modules,
+# threads and processes, and the kernel releases it on process exit.
+_Store = _lifecycle.Store
+_get_store = _lifecycle.get_store
+_file_lock = _lifecycle.file_lock
+_history_file_lock = _lifecycle.file_lock
 
 
 def _is_plain_int(value: object) -> bool:
