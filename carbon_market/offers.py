@@ -1,14 +1,12 @@
-"""Persistent, thread-safe capacity-offer registry."""
+"""Persistent, thread- and process-safe capacity-offer registry."""
 
 from __future__ import annotations
 
-import contextlib
 import json
 import os
-import tempfile
-import threading
 from typing import Any
 
+from . import _lifecycle
 from ._jsonio import strict_loads
 
 __all__ = ["register"]
@@ -19,25 +17,12 @@ _OFFER_FIELDS = ("resource_id", "region", "capacity_wh",
 _REQUIRED_FIELDS = frozenset(_OFFER_FIELDS)
 _ROOT_FIELDS = ("version", "offers", "idempotency")
 
-
-class _Store:
-    def __init__(self, realpath: str) -> None:
-        self.realpath = realpath
-        self.lock = threading.Lock()
-
-
-_stores_lock = threading.Lock()
-_stores: dict[str, _Store] = {}
-
-
-def _get_store(path: str) -> _Store:
-    realpath = os.path.realpath(path)
-    with _stores_lock:
-        store = _stores.get(realpath)
-        if store is None:
-            store = _Store(realpath)
-            _stores[realpath] = store
-        return store
+# The in-process mutex registry and the companion flock live in the
+# shared lifecycle infrastructure; the names are kept as the module's
+# own seams.
+_Store = _lifecycle.Store
+_get_store = _lifecycle.get_store
+_process_lock = _lifecycle.file_lock
 
 
 def _is_plain_int(value: object) -> bool:
@@ -137,25 +122,37 @@ def _validate_structure(
 
 def _load(
     realpath: str,
-) -> tuple[dict[str, dict[str, Any]], dict[str, dict[str, str]]]:
+) -> tuple[dict[str, dict[str, Any]], dict[str, dict[str, str]],
+           bytes | None]:
+    # Read the raw bytes as well as the parsed registry: a successful
+    # commit that fails while syncing the directory restores exactly
+    # these bytes, and a missing file maps to the empty initial state
+    # with nothing to restore.
     try:
-        with open(realpath, encoding="utf-8") as handle:
-            text = handle.read()
+        with open(realpath, "rb") as handle:
+            raw = handle.read()
     except FileNotFoundError:
-        return {}, {}
+        return {}, {}, None
 
+    try:
+        text = raw.decode("utf-8")
+    except UnicodeDecodeError as exc:
+        raise ValueError(
+            f"registry file {realpath!r} is not valid UTF-8") from exc
     try:
         data = strict_loads(text)
     except ValueError as exc:
         raise ValueError(f"registry file {realpath!r} is not valid JSON") from exc
-    return _validate_structure(data)
+    offers, idempotency = _validate_structure(data)
+    return offers, idempotency, raw
 
 
-def _atomic_write(
-    realpath: str,
+def _serialize(
     offers: dict[str, dict[str, Any]],
     idempotency: dict[str, dict[str, str]],
-) -> None:
+) -> bytes:
+    # Compact UTF-8 JSON, non-ASCII written through, each section's
+    # primary keys in code-point order, terminated by exactly one newline.
     payload = {
         "version": _VERSION,
         "offers": {name: offers[name] for name in sorted(offers)},
@@ -163,26 +160,25 @@ def _atomic_write(
     }
     text = json.dumps(payload, ensure_ascii=False, separators=(",", ":"),
                       allow_nan=False) + "\n"
+    return text.encode("utf-8")
 
-    directory = os.path.dirname(realpath) or "."
-    fd, tmp_path = tempfile.mkstemp(dir=directory, prefix=".offers-",
-                                    suffix=".tmp")
-    try:
-        with os.fdopen(fd, "w", encoding="utf-8", newline="") as handle:
-            handle.write(text)
-            handle.flush()
-            os.fsync(handle.fileno())
-        os.replace(tmp_path, realpath)
-    except BaseException:
-        with contextlib.suppress(OSError):
-            os.unlink(tmp_path)
-        raise
 
-    dir_fd = os.open(directory, os.O_RDONLY)
-    try:
-        os.fsync(dir_fd)
-    finally:
-        os.close(dir_fd)
+def _fsync_directory(directory: str) -> None:
+    _lifecycle.fsync_directory(directory)
+
+
+def _commit_file(
+    realpath: str,
+    payload: bytes,
+    old_bytes: bytes | None,
+) -> None:
+    # One durable commit for the record and the idempotency binding:
+    # same-directory temporary, fsync, atomic replace and a directory
+    # fsync. Any failure after the replace restores the pre-call bytes,
+    # so an unsuccessful registration leaves the original file
+    # byte-for-byte, or no file at all when there was none beforehand.
+    _lifecycle.commit_file(realpath, payload, old_bytes,
+                           prefix=".offers-", fsync_dir=_fsync_directory)
 
 
 def register(
@@ -196,6 +192,17 @@ def register(
     region, capacity_wh, unit_cost (micro-units per Wh) and carbon_intensity
     (g/kWh); ``created`` is ``True`` for a new registration and ``False``
     when the idempotency key replays an identical offer.
+
+    Calls serialize across threads and processes per resolved real path:
+    the read, the idempotency/resource checks and the durable commit run
+    in one critical section guarded by the per-path mutex and a
+    companion ``flock`` file, so concurrent registrations can never lose
+    updates or interleave their writes. A missing parent directory
+    raises ``FileNotFoundError``; an invalid existing file (encoding,
+    JSON or structure) raises ``ValueError``; any locking or I/O failure
+    raises ``OSError``. A failed commit restores the exact pre-call
+    bytes -- or leaves no file when there was none -- so other callers
+    only ever observe the complete old or the complete new registry.
     """
     if not isinstance(path, str):
         raise ValueError("path must be a string")
@@ -206,28 +213,33 @@ def register(
 
     store = _get_store(path)
     with store.lock:
-        offers, idempotency = _load(store.realpath)
-        record: dict[str, object] = {
-            "resource_id": resource_id,
-            "region": region,
-            "capacity_wh": capacity_wh,
-            "unit_cost": unit_cost,
-            "carbon_intensity": carbon_intensity,
-        }
+        # Opening the companion lock in a missing directory surfaces as
+        # FileNotFoundError before the data file is created. Equivalent
+        # string paths resolve to one real path, hence one flock.
+        with _process_lock(store.realpath):
+            offers, idempotency, old_bytes = _load(store.realpath)
+            record: dict[str, object] = {
+                "resource_id": resource_id,
+                "region": region,
+                "capacity_wh": capacity_wh,
+                "unit_cost": unit_cost,
+                "carbon_intensity": carbon_intensity,
+            }
 
-        existing_entry = idempotency.get(idempotency_key)
-        if existing_entry is not None:
-            existing = offers[existing_entry["resource_id"]]
-            if existing != record:
-                raise ValueError("idempotency key was already used with a "
-                                 "different offer")
-            return dict(existing), False
+            existing_entry = idempotency.get(idempotency_key)
+            if existing_entry is not None:
+                existing = offers[existing_entry["resource_id"]]
+                if existing != record:
+                    raise ValueError("idempotency key was already used with a "
+                                     "different offer")
+                return dict(existing), False
 
-        if resource_id in offers:
-            raise ValueError("resource_id is already registered under "
-                             "another idempotency key")
+            if resource_id in offers:
+                raise ValueError("resource_id is already registered under "
+                                 "another idempotency key")
 
-        offers[resource_id] = record
-        idempotency[idempotency_key] = {"resource_id": resource_id}
-        _atomic_write(store.realpath, offers, idempotency)
-        return dict(record), True
+            offers[resource_id] = record
+            idempotency[idempotency_key] = {"resource_id": resource_id}
+            _commit_file(store.realpath,
+                         _serialize(offers, idempotency), old_bytes)
+            return dict(record), True
