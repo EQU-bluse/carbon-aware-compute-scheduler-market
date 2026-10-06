@@ -1,13 +1,14 @@
-"""Persistent, thread-safe capacity-offer registry."""
+"""Persistent, thread- and process-safe capacity-offer registry."""
 
 from __future__ import annotations
 
 import contextlib
+import fcntl
 import json
 import os
 import tempfile
 import threading
-from typing import Any
+from typing import Any, Iterator
 
 from ._jsonio import strict_loads
 
@@ -38,6 +39,29 @@ def _get_store(path: str) -> _Store:
             store = _Store(realpath)
             _stores[realpath] = store
         return store
+
+
+@contextlib.contextmanager
+def _file_lock(realpath: str) -> Iterator[None]:
+    """Hold an exclusive advisory lock on the registry's sidecar lock file.
+
+    The in-process ``_Store.lock`` only serializes threads of one process;
+    this ``flock`` serializes every process that resolves to the same real
+    file, so concurrent registrars cannot lose each other's updates. The
+    lock file is never unlinked: removing it could let two processes hold
+    locks on different inodes for the same registry. A missing parent
+    directory surfaces as ``FileNotFoundError`` from ``os.open`` and any
+    locking failure surfaces as ``OSError``, matching register's contract.
+    """
+    fd = os.open(realpath + ".lock", os.O_RDWR | os.O_CREAT, 0o644)
+    try:
+        fcntl.flock(fd, fcntl.LOCK_EX)
+        try:
+            yield
+        finally:
+            fcntl.flock(fd, fcntl.LOCK_UN)
+    finally:
+        os.close(fd)
 
 
 def _is_plain_int(value: object) -> bool:
@@ -205,7 +229,7 @@ def register(
         _normalize_offer(offer)
 
     store = _get_store(path)
-    with store.lock:
+    with store.lock, _file_lock(store.realpath):
         offers, idempotency = _load(store.realpath)
         record: dict[str, object] = {
             "resource_id": resource_id,
