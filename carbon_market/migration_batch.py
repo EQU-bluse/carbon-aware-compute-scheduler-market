@@ -325,7 +325,7 @@ class _Snapshot:
         if signal_raw is None:
             raise FileNotFoundError(
                 f"signal file {reals['signals']!r} does not exist")
-        cleared, _clear_keys, trades_raw = _rebalance._market.\
+        cleared, _clear_keys, _clear_batches, trades_raw = _rebalance._market.\
             _load_clear_ledger(
                 reals["trades"], accepted, history, signal_history,
                 completion_paths=_rebalance._market.

@@ -417,7 +417,7 @@ def cancel(
             # clearing sees with this cancellation ledger in hand, so a
             # booking that reused capacity this ledger released stays
             # valid here.
-            cleared, _clear_keys, trades_raw = _market._load_clear_ledger(
+            cleared, _clear_keys, _clear_batches, trades_raw = _market._load_clear_ledger(
                 trades_real, accepted, history,
                 completion_paths=sorted(completion_reals),
                 cancelled=cancelled_by_job or None)

@@ -484,7 +484,7 @@ def complete(
             envelope_paths = list(sibling_completions)
             if os.path.exists(completion_real):
                 envelope_paths.append(completion_real)
-            cleared, _clear_keys, trades_raw = _market._load_clear_ledger(
+            cleared, _clear_keys, _clear_batches, trades_raw = _market._load_clear_ledger(
                 trades_real, accepted, history, signal_history,
                 completion_paths=envelope_paths)
             if trades_raw is None:

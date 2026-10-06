@@ -651,7 +651,7 @@ def plan(
             if supply_raw is None:
                 raise FileNotFoundError(
                     f"supply file {supply_real!r} does not exist")
-            cleared, _clear_keys, trades_raw = _market._load_clear_ledger(
+            cleared, _clear_keys, _clear_batches, trades_raw = _market._load_clear_ledger(
                 trades_real, accepted, history,
                 completion_paths=sorted(completion_reals))
             if trades_raw is None:

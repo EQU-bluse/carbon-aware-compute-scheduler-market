@@ -935,7 +935,7 @@ def evaluate(
                             released_jobs.add(completion_record["job_id"])
             # Live trades freeze signal versions, so the signal history
             # resolves their references; static trades validate as before.
-            cleared, _clear_keys, trades_raw = _market._load_clear_ledger(
+            cleared, _clear_keys, _clear_batches, trades_raw = _market._load_clear_ledger(
                 trades_real, accepted, history, signal_history,
                 completion_paths=(completion_siblings
                                   + ([completion_real]
@@ -2358,7 +2358,7 @@ def apply(
             if completion_real is not None \
                     and completion_real not in envelope_paths:
                 envelope_paths.append(completion_real)
-            cleared, _clear_keys, trades_raw = _market._load_clear_ledger(
+            cleared, _clear_keys, _clear_batches, trades_raw = _market._load_clear_ledger(
                 trades_real, accepted, history, signal_history,
                 completion_paths=envelope_paths)
             if trades_raw is None:
@@ -2796,7 +2796,7 @@ def _load_snapshot_layers(
     if signal_raw is None:
         raise FileNotFoundError(
             f"signal file {signal_real!r} does not exist")
-    cleared, _clear_keys, trades_raw = _market._load_clear_ledger(
+    cleared, _clear_keys, _clear_batches, trades_raw = _market._load_clear_ledger(
         trades_real, accepted, history, signal_history,
         completion_paths=completion_paths or [])
     if trades_raw is None:
