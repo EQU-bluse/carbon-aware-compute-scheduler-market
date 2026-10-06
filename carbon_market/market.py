@@ -16,7 +16,7 @@ from . import resources as _resources
 from . import signals as _signals
 from ._jsonio import finite_loads, strict_loads
 
-__all__ = ["match", "clear", "clear_live"]
+__all__ = ["match", "clear", "clear_live", "clear_live_batch"]
 
 _VERSION = 1
 _MATCH_FIELDS = ("job_id", "resource_id")
@@ -1383,3 +1383,685 @@ def clear_live(
                           _canonical_clear_bytes(trades, idempotency),
                           old_bytes)
             return copy.deepcopy(trade), True
+
+
+# ---------------------------------------------------------------------------
+# Batch live clearing: one consistent snapshot, one global selection
+# ---------------------------------------------------------------------------
+
+_BATCH_VERSION = 1
+_BATCH_SIDECAR_SUFFIX = ".batches"
+_BATCH_ROOT_FIELDS = ("version", "batches")
+_BATCH_RECORD_FIELDS = ("key", "at", "jobs", "allocated", "unallocated",
+                        "snapshot")
+_BATCH_SELECTION_FIELDS = ("resource_id", "version")
+
+
+def _batch_trade_key(key: str, job_id: str) -> str:
+    # Every clearing-ledger trade is bound to exactly one idempotency
+    # key, so a batch derives one sub-key per allocated job from its
+    # batch key. The JSON pair encoding is injective: distinct
+    # (batch key, job id) pairs never produce the same sub-key.
+    return json.dumps([key, job_id], ensure_ascii=False,
+                      separators=(",", ":"))
+
+
+def _check_batch_ids(
+    value: object,
+    label: str,
+    *,
+    allow_empty: bool,
+    normalized: bool,
+) -> list[str]:
+    if not isinstance(value, list):
+        raise ValueError(f"{label} must be a list")
+    if not value and not allow_empty:
+        raise ValueError(f"{label} must be a non-empty list")
+    seen: set[str] = set()
+    result: list[str] = []
+    for job_id in value:
+        if not isinstance(job_id, str) or not job_id:
+            raise ValueError(f"{label} must be non-empty strings")
+        if job_id in seen:
+            raise ValueError(f"{label} must be distinct")
+        seen.add(job_id)
+        result.append(job_id)
+    if normalized and result != sorted(result):
+        raise ValueError(f"{label} must be ordered by code point")
+    return result
+
+
+def _validate_batch_ledger(data: object) -> dict[str, dict[str, Any]]:
+    if not isinstance(data, dict) \
+            or set(data.keys()) != set(_BATCH_ROOT_FIELDS):
+        raise ValueError("batch ledger root must be an object with keys "
+                         "version and batches")
+    version = data["version"]
+    if not _is_plain_int(version) or version != _BATCH_VERSION:
+        raise ValueError("unsupported batch ledger version")
+    batches_raw = data["batches"]
+    if not isinstance(batches_raw, dict):
+        raise ValueError("batches must be an object")
+    _check_sorted_keys(batches_raw, "batches")
+
+    batches: dict[str, dict[str, Any]] = {}
+    for key, record in batches_raw.items():
+        if not isinstance(key, str) or not key:
+            raise ValueError("batch keys must be non-empty strings")
+        if not isinstance(record, dict) \
+                or set(record.keys()) != set(_BATCH_RECORD_FIELDS):
+            raise ValueError("batch record has invalid fields")
+        if record["key"] != key:
+            raise ValueError("batch record key does not match its map key")
+        at = record["at"]
+        if not _is_plain_int(at) or at < 0:
+            raise ValueError("batch record at must be a non-boolean "
+                             "non-negative integer")
+        jobs = _check_batch_ids(record["jobs"], "batch record jobs",
+                                allow_empty=False, normalized=True)
+        job_set = set(jobs)
+        allocated_raw = record["allocated"]
+        if not isinstance(allocated_raw, dict):
+            raise ValueError("batch record allocated must be an object")
+        _check_sorted_keys(allocated_raw, "batch record allocated")
+        allocated: dict[str, dict[str, Any]] = {}
+        for job_id, selection in allocated_raw.items():
+            if job_id not in job_set:
+                raise ValueError("batch record allocation must reference a "
+                                 "requested job")
+            if not isinstance(selection, dict) \
+                    or set(selection.keys()) != set(_BATCH_SELECTION_FIELDS):
+                raise ValueError("batch record allocation has invalid "
+                                 "fields")
+            resource_id = selection["resource_id"]
+            selection_version = selection["version"]
+            if not isinstance(resource_id, str) or not resource_id:
+                raise ValueError("batch record allocation resource_id must "
+                                 "be a non-empty string")
+            if not _is_plain_int(selection_version) \
+                    or selection_version < 1:
+                raise ValueError("batch record allocation version must be "
+                                 "a positive integer")
+            allocated[job_id] = {"resource_id": resource_id,
+                                 "version": selection_version}
+        unallocated = _check_batch_ids(record["unallocated"],
+                                       "batch record unallocated",
+                                       allow_empty=True, normalized=True)
+        if set(allocated) & set(unallocated):
+            raise ValueError("batch record must not allocate and skip one "
+                             "job")
+        if set(allocated) | set(unallocated) != job_set:
+            raise ValueError("batch record must dispose of every requested "
+                             "job")
+        snapshot = _check_batch_ids(record["snapshot"],
+                                    "batch record snapshot",
+                                    allow_empty=True, normalized=True)
+        if not set(allocated) <= set(snapshot):
+            raise ValueError("batch record allocations must appear in the "
+                             "trades snapshot")
+        batches[key] = {
+            "key": key,
+            "at": at,
+            "jobs": jobs,
+            "allocated": allocated,
+            "unallocated": unallocated,
+            "snapshot": snapshot,
+        }
+    return batches
+
+
+def _canonical_batch_bytes(batches: dict[str, dict[str, Any]]) -> bytes:
+    payload = {
+        "version": _BATCH_VERSION,
+        "batches": {key: {
+            "key": record["key"],
+            "at": record["at"],
+            "jobs": list(record["jobs"]),
+            "allocated": {job_id: {
+                "resource_id": selection["resource_id"],
+                "version": selection["version"],
+            } for job_id, selection in sorted(record["allocated"].items())},
+            "unallocated": list(record["unallocated"]),
+            "snapshot": list(record["snapshot"]),
+        } for key, record in sorted(batches.items())},
+    }
+    text = json.dumps(payload, ensure_ascii=False, separators=(",", ":"),
+                      allow_nan=False) + "\n"
+    return text.encode("utf-8")
+
+
+def _load_batch_ledger(
+    realpath: str,
+) -> tuple[dict[str, dict[str, Any]], bytes | None]:
+    try:
+        with open(realpath, "rb") as handle:
+            raw = handle.read()
+    except FileNotFoundError:
+        return {}, None
+    try:
+        text = raw.decode("utf-8")
+    except UnicodeDecodeError as exc:
+        raise ValueError(
+            f"batch ledger {realpath!r} is not valid UTF-8") from exc
+    try:
+        # Negative-zero and non-finite literals are format errors.
+        data = finite_loads(text)
+    except ValueError as exc:
+        raise ValueError(
+            f"batch ledger {realpath!r} is not valid JSON") from exc
+    batches = _validate_batch_ledger(data)
+    # As for the clearing ledger, the batch ledger is accepted only in
+    # canonical compact form with a single trailing newline.
+    if raw != _canonical_batch_bytes(batches):
+        raise ValueError(
+            f"batch ledger {realpath!r} is not in canonical compact form")
+    return batches, raw
+
+
+def _check_batch_ledger_against_trades(
+    batches: dict[str, dict[str, Any]],
+    trades: dict[str, dict[str, Any]],
+) -> None:
+    # The batch ledger is only ever a view over the append-only clearing
+    # ledger: every snapshot trade must still be recorded, and every
+    # recorded allocation must still name its trade's exact selection.
+    for record in batches.values():
+        for job_id in record["snapshot"]:
+            if job_id not in trades:
+                raise ValueError("batch ledger snapshot must reference "
+                                 "recorded trades")
+        for job_id, selection in record["allocated"].items():
+            trade = trades[job_id]
+            if trade["resource_id"] != selection["resource_id"] \
+                    or trade["version"] != selection["version"]:
+                raise ValueError("batch record does not match its trade "
+                                 "selection")
+
+
+def _batch_result(
+    key: str,
+    record: dict[str, Any],
+    trades: dict[str, dict[str, Any]],
+) -> dict[str, Any]:
+    # The result freezes the complete trades snapshot the batch was
+    # committed with; trades later requests add never alter what a
+    # replay returns.
+    snapshot = {job_id: copy.deepcopy(trades[job_id])
+                for job_id in record["snapshot"]}
+    return {
+        "key": key,
+        "at": record["at"],
+        "trades": snapshot,
+        "unallocated": list(record["unallocated"]),
+    }
+
+
+def _live_batch_candidates(
+    job: dict[str, Any],
+    history: dict[str, list[dict[str, Any]]],
+    signal_history: dict[str, list[dict[str, Any]]],
+    sold: dict[tuple[str, int], int],
+    at: int,
+) -> list[dict[str, Any]]:
+    # The live feasibility rules of clear_live for one job: the highest
+    # supply version valid at the moment, region, residency, deadline
+    # coverage, the remaining capacity of the exact resource version, a
+    # live signal for the region and the job's budgets. Candidates are
+    # ordered by signal carbon intensity, signal unit cost and resource
+    # id.
+    work = job["work"]
+    regions = set(job["regions"])
+    residency = set(job["residency"])
+    candidates: list[dict[str, Any]] = []
+    for records in history.values():
+        active: dict[str, Any] | None = None
+        for record in records:
+            if record["start"] <= at <= record["end"]:
+                active = record
+        if active is None:
+            continue
+        if active["region"] not in regions:
+            continue
+        remaining = active["capacity"] - sold.get(
+            (active["resource_id"], active["version"]), 0)
+        if remaining < work:
+            continue
+        if not residency <= set(active["residency"]):
+            continue
+        if active["end"] < job["deadline"]:
+            continue
+        # Latest unexpired observation for the region; without one the
+        # resource is simply not a live candidate.
+        signal = None
+        for signal_record in signal_history.get(active["region"], ()):
+            if signal_record["observed"] <= at \
+                    <= signal_record["expires"]:
+                signal = signal_record
+        if signal is None:
+            continue
+        total_cost = work * signal["unit_cost"]
+        total_carbon = work * signal["carbon_intensity"]
+        if total_cost > job["max_cost"] \
+                or total_carbon > job["carbon_cap"]:
+            continue
+        signal_copy = dict(signal)
+        signal_copy["mix"] = dict(signal["mix"])
+        candidates.append({
+            "resource": dict(active),
+            "signal": signal_copy,
+            "total_cost": total_cost,
+            "total_carbon": total_carbon,
+        })
+    candidates.sort(key=lambda entry: (
+        entry["signal"]["carbon_intensity"],
+        entry["signal"]["unit_cost"],
+        entry["resource"]["resource_id"]))
+    return candidates
+
+
+def _select_batch(
+    works: list[int],
+    options: list[list[dict[str, Any]]],
+    remaining: dict[tuple[str, int], int],
+) -> list[int]:
+    """The unique optimum of the batch objective, as candidate indexes.
+
+    ``works`` and ``options`` are indexed by the jobs sorted by job id;
+    ``remaining`` maps each candidate's exact resource version to the
+    capacity the committed trades leave on it. The returned list gives
+    the chosen candidate index per job, -1 for an unallocated job. The
+    objective, compared lexicographically: maximize the total allocated
+    work, then the number of allocated jobs, then minimize the total
+    added carbon, then the total added cost, and finally take the
+    lexicographically smallest sequence of (resource id, version) over
+    the jobs in job-id order, an unallocated job sorting after every
+    allocation. The final criterion makes the optimum unique, so the
+    input order of the job ids can never influence the result.
+    """
+    n = len(works)
+    # Suffix sums over the jobs that still have a candidate: the
+    # optimistic bound on the work any completion can still add.
+    suffix_work = [0] * (n + 1)
+    for i in range(n - 1, -1, -1):
+        suffix_work[i] = suffix_work[i + 1] + (works[i] if options[i] else 0)
+    free_total = sum(remaining.values())
+    used: dict[tuple[str, int], int] = {}
+    chosen = [-1] * n
+    best_key: tuple[Any, ...] | None = None
+    best_chosen: list[int] | None = None
+
+    def dfs(i: int, work_sum: int, count: int, carbon: int, cost: int,
+            free: int) -> None:
+        nonlocal best_key, best_chosen
+        if best_key is not None:
+            bound = (-(work_sum + min(suffix_work[i], free)),
+                     -(count + min(n - i, free)))
+            if bound > (best_key[0], best_key[1]):
+                return
+            if bound == (best_key[0], best_key[1]) \
+                    and (carbon, cost) > (best_key[2], best_key[3]):
+                return
+        if i == n:
+            sequence = tuple(
+                (0, options[j][chosen[j]]["resource"]["resource_id"],
+                 options[j][chosen[j]]["resource"]["version"])
+                if chosen[j] >= 0 else (1,)
+                for j in range(n))
+            key = (-work_sum, -count, carbon, cost, sequence)
+            if best_key is None or key < best_key:
+                best_key = key
+                best_chosen = list(chosen)
+            return
+        for index, entry in enumerate(options[i]):
+            resource = entry["resource"]
+            slot = (resource["resource_id"], resource["version"])
+            if used.get(slot, 0) + works[i] > remaining[slot]:
+                continue
+            used[slot] = used.get(slot, 0) + works[i]
+            chosen[i] = index
+            dfs(i + 1, work_sum + works[i], count + 1,
+                carbon + entry["total_carbon"],
+                cost + entry["total_cost"], free - works[i])
+            chosen[i] = -1
+            used[slot] -= works[i]
+        dfs(i + 1, work_sum, count, carbon, cost, free)
+
+    dfs(0, 0, 0, 0, 0, free_total)
+    # The all-unallocated assignment is always feasible, so the search
+    # always settles on an optimum.
+    assert best_chosen is not None
+    return best_chosen
+
+
+def clear_live_batch(
+    jobs: str,
+    supply: str,
+    signals: str,
+    ledger: str,
+    job_ids: list[str],
+    key: str,
+    at: int,
+    completions: str | None = None,
+    cancellations: str | None = None,
+) -> tuple[dict[str, object], bool]:
+    """Clear a batch of accepted jobs against live signals atomically.
+
+    This is the batch counterpart of :func:`clear_live` and shares the
+    same clearing ledger: trades booked by either single-job call or by
+    a batch deduct capacity from the same resource versions. ``jobs``,
+    ``supply``, ``signals`` and ``ledger`` paths and the batch ``key``
+    must be non-empty strings, ``job_ids`` a non-empty list of distinct
+    non-empty job id strings and ``at`` a non-boolean non-negative
+    integer evaluation moment; the four paths must also resolve to
+    distinct real locations, and the optional completion and
+    cancellation ledgers to distinct ones again. An empty list, a
+    duplicate or invalid job id, an invalid moment, an empty key or
+    colliding resolved paths raise ``ValueError`` before a business
+    file is read.
+
+    The acceptance file, the supply file, the live signal file, the
+    clearing ledger and the batch request ledger are read as one
+    snapshot under the same locks and in the same resolved real-path
+    order as :func:`clear_live` -- the ledger lock exclusive, every
+    other lock shared -- so a concurrent single-job or batch clearing
+    only ever observes the complete state before or after a commit and
+    the two can never oversell, double-book or deadlock. Every
+    requested job must be accepted, not yet traded under any other
+    request and not terminated under the existing lifecycle rules (a
+    recorded completion or, when ``cancellations`` is given, a recorded
+    cancellation): an unknown job raises ``KeyError``, a traded or
+    terminated one ``ValueError``, and in every case the whole batch
+    fails without leaving a partial result.
+
+    Feasibility follows :func:`clear_live` exactly: each resource's
+    highest supply version valid at ``at``, region and data residency,
+    deadline coverage, the job's cost and carbon budgets priced on the
+    region's latest unexpired signal, and the remaining capacity of the
+    exact resource version after the committed trades (and the releases
+    of jobs completed or cancelled no later than ``at``, when the
+    corresponding ledger is given). The batch then chooses one global
+    assignment: each job takes at most one resource version, the new
+    work booked on a version never exceeds its remaining capacity, and
+    the result maximizes first the total allocated work, then the
+    number of allocated jobs, then minimizes the total added carbon and
+    the total added cost; remaining ties are broken by the
+    lexicographically smallest sequence of resource id and version over
+    the jobs sorted by job id, so the input order of ``job_ids`` never
+    influences the outcome. A job that loses the capacity race, lacks
+    a live signal or has no feasible resource is simply unallocated --
+    never an error.
+
+    Returns ``(result, created)``. The result carries the batch ``key``,
+    the evaluation moment ``at``, the complete trades snapshot ordered
+    by job id -- every trade recorded in the clearing ledger as of the
+    commit, including pre-existing ones -- and the sorted list of
+    unallocated job ids. Each new trade is an ordinary live trade
+    freezing its selected resource version and signal version, bound to
+    a derived idempotency sub-key of the batch key, so ``clear``,
+    ``clear_live`` and every downstream reader observe them exactly
+    like single-job trades. The first success commits all new trades
+    with their idempotency bindings and audit events to the clearing
+    ledger and the batch request binding -- the full request, the
+    allocations and the snapshot -- to the batch ledger beside it, both
+    durable together or not at all; a batch that allocates nothing
+    still persists its replayable binding, and a commit failure
+    restores the pre-call content of both files. Replaying the same
+    batch key with an equivalent complete request -- the same job id
+    set in any order and the same moment -- returns the original result
+    with ``False`` without reselecting or rewriting a byte; the same
+    key with a changed request raises ``ValueError``.
+
+    Missing input files or a missing ledger parent raise
+    ``FileNotFoundError`` without leaving a ledger or temporary
+    fragment; invalid structure, references, ordering or non-canonical
+    bytes in any ledger raise ``ValueError``; other locking, read/write
+    or sync failures raise ``OSError``. The existing :func:`match`,
+    :func:`clear`, :func:`clear_live`, dispatch, execution and
+    migration readers keep their exact behavior over the shared
+    clearing ledger, and omitting ``completions`` or ``cancellations``
+    keeps the historical capacity accounting of :func:`clear_live`.
+    """
+    for value in (jobs, supply, signals, ledger, key):
+        if not isinstance(value, str) or not value:
+            raise ValueError("jobs, supply, signals, ledger and key must "
+                             "be non-empty strings")
+    requested_ids = _check_batch_ids(job_ids, "job_ids", allow_empty=False,
+                                     normalized=False)
+    sorted_ids = sorted(requested_ids)
+    if not _is_plain_int(at) or at < 0:
+        raise ValueError("at must be a non-boolean non-negative integer")
+    if completions is not None and (
+            not isinstance(completions, str) or not completions):
+        raise ValueError("completions must be a non-empty string or None")
+    if cancellations is not None and (
+            not isinstance(cancellations, str) or not cancellations):
+        raise ValueError("cancellations must be a non-empty string or None")
+
+    job_real = os.path.realpath(jobs)
+    supply_real = os.path.realpath(supply)
+    signal_real = os.path.realpath(signals)
+    ledger_real = os.path.realpath(ledger)
+    business_paths = {job_real, supply_real, signal_real, ledger_real}
+    if len(business_paths) != 4:
+        raise ValueError("jobs, supply, signals and ledger paths must be "
+                         "distinct real paths")
+    completion_real = (os.path.realpath(completions)
+                       if completions is not None else None)
+    if completion_real is not None and completion_real in business_paths:
+        raise ValueError("completions must be a distinct real path")
+    cancellation_real = (os.path.realpath(cancellations)
+                         if cancellations is not None else None)
+    if cancellation_real is not None and (
+            cancellation_real in business_paths
+            or cancellation_real == completion_real):
+        raise ValueError("cancellations must be a distinct real path")
+    # The batch request ledger lives beside the clearing ledger under a
+    # derived name; it must never alias a business path either.
+    batch_real = ledger_real + _BATCH_SIDECAR_SUFFIX
+    if batch_real in business_paths or batch_real == completion_real \
+            or batch_real == cancellation_real:
+        raise ValueError("batch ledger path must be a distinct real path")
+    # Completion ledgers beside the snapshots are discovered before any
+    # lock is taken, exactly as in clear_live.
+    completion_paths = _discover_completion_paths(
+        (job_real, supply_real, signal_real, ledger_real))
+    if completion_real is not None and completion_real \
+            not in completion_paths:
+        completion_paths.append(completion_real)
+    locked_paths = business_paths | set(completion_paths)
+    if cancellation_real is not None:
+        # The explicitly named cancellation ledger is part of the
+        # snapshot and is shared in the same global lock order.
+        locked_paths = locked_paths | {cancellation_real}
+
+    store = _get_store(ledger)
+    with store.lock:
+        # Locks are taken in one resolved-real-path order shared by
+        # every caller, so concurrent clears can never deadlock; the
+        # ledger lock is exclusive, every other lock shared. The batch
+        # ledger is only ever touched under these locks, so it needs no
+        # lock of its own.
+        with contextlib.ExitStack() as stack:
+            for locked in sorted(locked_paths):
+                stack.enter_context(
+                    _clear_lock(locked, shared=(locked != ledger_real)))
+
+            accepted, job_map, job_events, job_raw = \
+                _jobs._load_submit_file(job_real)
+            if job_raw is None:
+                raise FileNotFoundError(
+                    f"acceptance file {job_real!r} does not exist")
+            if job_raw != _jobs._serialize_submit_file(
+                    accepted, job_map, job_events):
+                raise ValueError(
+                    f"acceptance file {job_real!r} is not in canonical "
+                    "compact form")
+            history, _supply_map, _supply_events, supply_raw = \
+                _resources._load_file(supply_real)
+            if supply_raw is None:
+                raise FileNotFoundError(
+                    f"supply file {supply_real!r} does not exist")
+            signal_history, _signal_map, _signal_events, signal_raw = \
+                _signals._load_file(signal_real)
+            if signal_raw is None:
+                raise FileNotFoundError(
+                    f"signal file {signal_real!r} does not exist")
+            completion_union = _load_completion_union(
+                completion_paths, accepted, history) \
+                if completion_paths else {}
+            released_jobs: set[str] = set()
+            if completion_real is not None:
+                released_jobs = {
+                    job for job, record in completion_union.items()
+                    if record["at"] <= at}
+            # The explicitly named cancellation ledger is part of the
+            # same snapshot: its records release their trade's occupancy
+            # from the cancellation moment on and bar the job from any
+            # new trade. Omitting the argument keeps the historical
+            # result (every trade still occupies its booked version).
+            cancelled_by_job: dict[str, dict[str, Any]] = {}
+            if cancellation_real is not None:
+                from . import cancellation as _cancellation
+                cancellation_records, _cancel_keys, _cancel_events, \
+                    cancellation_raw = \
+                    _cancellation._load_cancellation_ledger(
+                        cancellation_real, accepted, history)
+                if cancellation_raw is None:
+                    raise FileNotFoundError(
+                        f"cancellation ledger {cancellation_real!r} does "
+                        "not exist")
+                cancelled_by_job = {
+                    record["job_id"]: record
+                    for record in cancellation_records.values()}
+                released_jobs |= {
+                    job for job, record in cancelled_by_job.items()
+                    if record["at"] <= at}
+            trades, idempotency, old_bytes = _load_clear_ledger(
+                ledger_real, accepted, history, signal_history,
+                completion_paths=completion_paths,
+                cancelled=cancelled_by_job or None)
+            if cancellation_real is not None:
+                _cancellation._check_records_against_trades(
+                    cancellation_records, trades)
+            batches, batch_old_bytes = _load_batch_ledger(batch_real)
+            _check_batch_ledger_against_trades(batches, trades)
+
+            for job_id in sorted_ids:
+                if job_id not in accepted:
+                    raise KeyError(job_id)
+
+            stored = batches.get(key)
+            if stored is not None:
+                if stored["jobs"] != sorted_ids or stored["at"] != at:
+                    raise ValueError("batch idempotency key was already "
+                                     "used with a different request")
+                return _batch_result(key, stored, trades), False
+
+            for job_id in sorted_ids:
+                if job_id in trades:
+                    raise ValueError("job is already traded under another "
+                                     "request")
+                if job_id in cancelled_by_job \
+                        or job_id in completion_union:
+                    raise ValueError("job is already terminated and cannot "
+                                     "be traded")
+
+            # Capacity already sold per exact resource version counts
+            # every trade -- static, live and batch alike -- and a job
+            # whose completion or cancellation is already effective at
+            # the moment has released its booked occupancy, exactly as
+            # in clear_live.
+            sold: dict[tuple[str, int], int] = {}
+            for traded_job, trade in trades.items():
+                if traded_job in released_jobs:
+                    continue
+                slot = (trade["resource_id"], trade["version"])
+                sold[slot] = sold.get(slot, 0) + trade["work"]
+
+            works = [accepted[job_id]["work"] for job_id in sorted_ids]
+            options = [
+                _live_batch_candidates(
+                    accepted[job_id], history, signal_history, sold, at)
+                for job_id in sorted_ids]
+            remaining: dict[tuple[str, int], int] = {}
+            for entries in options:
+                for entry in entries:
+                    resource = entry["resource"]
+                    slot = (resource["resource_id"], resource["version"])
+                    if slot not in remaining:
+                        remaining[slot] = resource["capacity"] \
+                            - sold.get(slot, 0)
+            chosen = _select_batch(works, options, remaining)
+
+            allocated: dict[str, dict[str, Any]] = {}
+            unallocated: list[str] = []
+            new_trades: dict[str, dict[str, Any]] = {}
+            for i, job_id in enumerate(sorted_ids):
+                index = chosen[i]
+                if index < 0:
+                    unallocated.append(job_id)
+                    continue
+                entry = options[i][index]
+                resource = entry["resource"]
+                resource_id = resource["resource_id"]
+                version = resource["version"]
+                # A batch trade freezes the single selected candidate:
+                # the decision is the global assignment, so the snapshot
+                # records exactly the resource version and signal version
+                # the job was priced on.
+                new_trades[job_id] = {
+                    "job_id": job_id,
+                    "at": at,
+                    "work": works[i],
+                    "resource_id": resource_id,
+                    "version": version,
+                    "candidates": [entry],
+                    "selection": {"resource_id": resource_id,
+                                  "version": version},
+                }
+                allocated[job_id] = {"resource_id": resource_id,
+                                     "version": version}
+
+            derived: dict[str, str] = {}
+            for job_id in allocated:
+                sub_key = _batch_trade_key(key, job_id)
+                if sub_key in idempotency:
+                    raise ValueError("batch idempotency key collides with "
+                                     "an existing clearing key")
+                derived[sub_key] = job_id
+
+            trades.update(new_trades)
+            for sub_key, job_id in derived.items():
+                idempotency[sub_key] = {"job_id": job_id, "at": at}
+            batches[key] = {
+                "key": key,
+                "at": at,
+                "jobs": sorted_ids,
+                "allocated": allocated,
+                "unallocated": unallocated,
+                "snapshot": sorted(trades),
+            }
+
+            if new_trades:
+                # The trades commit comes first; a failed batch-binding
+                # commit restores the pre-call clearing ledger, so the
+                # pair is only ever observed entirely before or entirely
+                # after the call.
+                _commit_clear(ledger_real,
+                              _canonical_clear_bytes(trades, idempotency),
+                              old_bytes)
+                try:
+                    _commit_clear(batch_real,
+                                  _canonical_batch_bytes(batches),
+                                  batch_old_bytes)
+                except BaseException as first:
+                    _rollback_clear(ledger_real,
+                                    os.path.dirname(ledger_real) or ".",
+                                    old_bytes, first)
+                    raise
+            else:
+                # Even a batch that allocates nothing persists its
+                # replayable binding; the clearing ledger is untouched.
+                _commit_clear(batch_real, _canonical_batch_bytes(batches),
+                              batch_old_bytes)
+            return _batch_result(key, batches[key], trades), True
